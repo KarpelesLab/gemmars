@@ -4,18 +4,74 @@
 use crate::config::TextConfig;
 use crate::kernels::*;
 use crate::prof::{self, Cat};
+use crate::quant::{quantize_bf16, QMatrix};
 use crate::safetensors::ModelFiles;
 use anyhow::{bail, Context, Result};
 
+/// Weight precision for the streamed (linear) weights.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quant {
+    Bf16,
+    Q8,
+}
+
+/// A linear layer's weight `[n_out, n_in]`, either borrowed bf16 or quantized int8.
+pub enum Lin<'a> {
+    Bf16(&'a [u16]),
+    Q8(QMatrix),
+}
+
+impl Lin<'_> {
+    pub fn bytes(&self) -> usize {
+        match self {
+            Lin::Bf16(w) => w.len() * 2,
+            Lin::Q8(m) => m.bytes(),
+        }
+    }
+}
+
+/// Fused matmuls over one shared input: all jobs must have the same precision.
+fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {
+    if jobs.is_empty() {
+        return;
+    }
+    if jobs.iter().all(|(l, _, _)| matches!(l, Lin::Bf16(_))) {
+        let mut v: Vec<(&[u16], usize, &mut [f32])> = jobs
+            .iter_mut()
+            .map(|(l, n, y)| match l {
+                Lin::Bf16(w) => (*w, *n, &mut **y),
+                _ => unreachable!(),
+            })
+            .collect();
+        matmul_multi(&mut v, n_in, x, t);
+    } else {
+        let mut v: Vec<(&QMatrix, &mut [f32])> = jobs
+            .iter_mut()
+            .map(|(l, n, y)| match l {
+                Lin::Q8(m) => {
+                    debug_assert_eq!(m.n_out, *n);
+                    (m, &mut **y)
+                }
+                Lin::Bf16(_) => panic!("mixed precision in fused matmul"),
+            })
+            .collect();
+        matmul_q8_multi(&mut v, x, t);
+    }
+}
+
+fn linear(l: &Lin, n_out: usize, n_in: usize, x: &[f32], t: usize, y: &mut [f32]) {
+    linear_multi(&mut [(l, n_out, y)], n_in, x, t);
+}
+
 struct PleLayer<'a> {
-    gate: &'a [u16], // [P, H]
-    proj: &'a [u16], // [H, P]
+    gate: Lin<'a>,   // [P, H]
+    proj: Lin<'a>,   // [H, P]
     norm: &'a [u16], // [H]
 }
 
 struct PleGlobal<'a> {
     embed: &'a [u16], // [V, L*P]
-    proj: &'a [u16],  // [L*P, H]
+    proj: Lin<'a>,    // [L*P, H]
     norm: &'a [u16],  // [P]
 }
 
@@ -27,26 +83,28 @@ pub struct Layer<'a> {
     pub own_kv: bool,
     pub k_eq_v: bool,
     pub inter: usize,
-    q: &'a [u16],
-    k: Option<&'a [u16]>,
-    v: Option<&'a [u16]>,
-    o: &'a [u16],
+    q: Lin<'a>,
+    k: Option<Lin<'a>>,
+    v: Option<Lin<'a>>,
+    o: Lin<'a>,
     q_norm: &'a [u16],
     k_norm: Option<&'a [u16]>,
     ln_in: &'a [u16],
     ln_post_attn: &'a [u16],
     ln_pre_ffn: &'a [u16],
     ln_post_ffn: &'a [u16],
-    gate: &'a [u16],
-    up: &'a [u16],
-    down: &'a [u16],
+    gate: Lin<'a>,
+    up: Lin<'a>,
+    down: Lin<'a>,
     ple: Option<PleLayer<'a>>,
     layer_scalar: f32,
 }
 
 pub struct Model<'a> {
     pub cfg: TextConfig,
-    embed: &'a [u16], // [V, H], also the LM head
+    pub quant: Quant,
+    embed: &'a [u16], // [V, H] for lookups
+    head: Lin<'a>,    // tied LM head (same values as `embed`)
     ple: Option<PleGlobal<'a>>,
     pub layers: Vec<Layer<'a>>,
     final_norm: &'a [u16],
@@ -93,7 +151,6 @@ impl LayerCache {
 }
 
 /// Mutable decoding state: KV caches and the current position.
-#[allow(dead_code)]
 pub struct Session {
     caches: Vec<Option<LayerCache>>,
     pub pos: usize,
@@ -111,7 +168,7 @@ impl Session {
 }
 
 impl<'a> Model<'a> {
-    pub fn load(cfg: TextConfig, files: &'a ModelFiles) -> Result<Self> {
+    pub fn load(cfg: TextConfig, files: &'a ModelFiles, quant: Quant) -> Result<Self> {
         let prefix = if files.has("model.language_model.embed_tokens.weight") {
             "model.language_model."
         } else if files.has("model.embed_tokens.weight") {
@@ -132,13 +189,22 @@ impl<'a> Model<'a> {
             }
             files.bf16(&full)
         };
+        // A streamed linear weight: borrowed bf16 or quantized on load.
+        let lin = |name: &str, n_out: usize, n_in: usize| -> Result<Lin<'a>> {
+            let w = get(name, &[n_out, n_in])?;
+            Ok(match quant {
+                Quant::Bf16 => Lin::Bf16(w),
+                Quant::Q8 => Lin::Q8(quantize_bf16(w, n_out, n_in)),
+            })
+        };
 
         let embed = get("embed_tokens.weight", &[cfg.vocab_size, h])?;
+        let head = lin("embed_tokens.weight", cfg.vocab_size, h)?;
         let final_norm = get("norm.weight", &[h])?;
         let ple = if cfg.has_ple() {
             Some(PleGlobal {
                 embed: get("embed_tokens_per_layer.weight", &[cfg.vocab_size_per_layer_input, nl * p])?,
-                proj: get("per_layer_model_projection.weight", &[nl * p, h])?,
+                proj: lin("per_layer_model_projection.weight", nl * p, h)?,
                 norm: get("per_layer_projection_norm.weight", &[p])?,
             })
         } else {
@@ -149,6 +215,7 @@ impl<'a> Model<'a> {
         for l in 0..nl {
             let lp = format!("layers.{l}.");
             let g = |n: &str, s: &[usize]| get(&format!("{lp}{n}"), s);
+            let gl = |n: &str, n_out: usize, n_in: usize| lin(&format!("{lp}{n}"), n_out, n_in);
             let sliding = cfg.is_sliding(l);
             let hd = cfg.layer_head_dim(l);
             let n_kv = cfg.layer_n_kv(l);
@@ -157,8 +224,8 @@ impl<'a> Model<'a> {
             let inter = cfg.layer_intermediate(l);
             let (k, v, k_norm) = if own_kv {
                 (
-                    Some(g("self_attn.k_proj.weight", &[n_kv * hd, h])?),
-                    if k_eq_v { None } else { Some(g("self_attn.v_proj.weight", &[n_kv * hd, h])?) },
+                    Some(gl("self_attn.k_proj.weight", n_kv * hd, h)?),
+                    if k_eq_v { None } else { Some(gl("self_attn.v_proj.weight", n_kv * hd, h)?) },
                     Some(g("self_attn.k_norm.weight", &[hd])?),
                 )
             } else {
@@ -166,8 +233,8 @@ impl<'a> Model<'a> {
             };
             let ple_l = if cfg.has_ple() {
                 Some(PleLayer {
-                    gate: g("per_layer_input_gate.weight", &[p, h])?,
-                    proj: g("per_layer_projection.weight", &[h, p])?,
+                    gate: gl("per_layer_input_gate.weight", p, h)?,
+                    proj: gl("per_layer_projection.weight", h, p)?,
                     norm: g("post_per_layer_input_norm.weight", &[h])?,
                 })
             } else {
@@ -185,19 +252,19 @@ impl<'a> Model<'a> {
                 own_kv,
                 k_eq_v,
                 inter,
-                q: g("self_attn.q_proj.weight", &[nh * hd, h])?,
+                q: gl("self_attn.q_proj.weight", nh * hd, h)?,
                 k,
                 v,
-                o: g("self_attn.o_proj.weight", &[h, nh * hd])?,
+                o: gl("self_attn.o_proj.weight", h, nh * hd)?,
                 q_norm: g("self_attn.q_norm.weight", &[hd])?,
                 k_norm,
                 ln_in: g("input_layernorm.weight", &[h])?,
                 ln_post_attn: g("post_attention_layernorm.weight", &[h])?,
                 ln_pre_ffn: g("pre_feedforward_layernorm.weight", &[h])?,
                 ln_post_ffn: g("post_feedforward_layernorm.weight", &[h])?,
-                gate: g("mlp.gate_proj.weight", &[inter, h])?,
-                up: g("mlp.up_proj.weight", &[inter, h])?,
-                down: g("mlp.down_proj.weight", &[h, inter])?,
+                gate: gl("mlp.gate_proj.weight", inter, h)?,
+                up: gl("mlp.up_proj.weight", inter, h)?,
+                down: gl("mlp.down_proj.weight", h, inter)?,
                 ple: ple_l,
                 layer_scalar,
             });
@@ -208,7 +275,23 @@ impl<'a> Model<'a> {
         let inv_freq_sliding = rope_inv_freq(cfg.head_dim, rs.theta, rs.proportion);
         let inv_freq_full = rope_inv_freq(cfg.global_head_dim, rf.theta, rf.proportion);
 
-        Ok(Self { cfg, embed, ple, layers, final_norm, inv_freq_sliding, inv_freq_full })
+        Ok(Self { cfg, quant, embed, head, ple, layers, final_norm, inv_freq_sliding, inv_freq_full })
+    }
+
+    /// Bytes of linear weights streamed per decoded token.
+    pub fn streamed_bytes(&self) -> usize {
+        let mut n = self.head.bytes();
+        if let Some(p) = &self.ple {
+            n += p.proj.bytes();
+        }
+        for l in &self.layers {
+            n += l.q.bytes() + l.o.bytes() + l.gate.bytes() + l.up.bytes() + l.down.bytes();
+            n += l.k.as_ref().map_or(0, |x| x.bytes()) + l.v.as_ref().map_or(0, |x| x.bytes());
+            if let Some(p) = &l.ple {
+                n += p.gate.bytes() + p.proj.bytes();
+            }
+        }
+        n
     }
 
     pub fn new_session(&self) -> Session {
@@ -248,7 +331,7 @@ impl<'a> Model<'a> {
         let pli: Option<Vec<f32>> = self.ple.as_ref().map(|ple| {
             let p = cfg.hidden_size_per_layer_input;
             let mut proj = vec![0f32; t * nl * p];
-            matmul(ple.proj, nl * p, h, &x, t, &mut proj);
+            linear(&ple.proj, nl * p, h, &x, t, &mut proj);
             let s_proj = (h as f32).powf(-0.5);
             let s_emb = (p as f32).sqrt();
             let s_out = std::f32::consts::FRAC_1_SQRT_2;
@@ -282,7 +365,7 @@ impl<'a> Model<'a> {
         let mut last = vec![0f32; h];
         rmsnorm(&x[(t - 1) * h..], Some(self.final_norm), eps, &mut last);
         let mut logits = vec![0f32; cfg.vocab_size];
-        matmul(self.embed, cfg.vocab_size, h, &last, 1, &mut logits);
+        linear(&self.head, cfg.vocab_size, h, &last, 1, &mut logits);
         if let Some(cap) = cfg.final_logit_softcapping {
             let cap = cap as f32;
             for_chunks(&mut logits, 8192, true, |_, c| {
@@ -326,14 +409,14 @@ impl<'a> Model<'a> {
         let mut k = vec![0f32; if layer.own_kv { t * n_kv * hd } else { 0 }];
         let mut v = vec![0f32; if layer.own_kv && !layer.k_eq_v { t * n_kv * hd } else { 0 }];
         {
-            let mut jobs: Vec<(&[u16], usize, &mut [f32])> = vec![(layer.q, nh * hd, &mut q[..])];
+            let mut jobs: Vec<(&Lin, usize, &mut [f32])> = vec![(&layer.q, nh * hd, &mut q[..])];
             if layer.own_kv {
-                jobs.push((layer.k.unwrap(), n_kv * hd, &mut k[..]));
+                jobs.push((layer.k.as_ref().unwrap(), n_kv * hd, &mut k[..]));
                 if !layer.k_eq_v {
-                    jobs.push((layer.v.unwrap(), n_kv * hd, &mut v[..]));
+                    jobs.push((layer.v.as_ref().unwrap(), n_kv * hd, &mut v[..]));
                 }
             }
-            matmul_multi(&mut jobs, h, &hn, t);
+            linear_multi(&mut jobs, h, &hn, t);
         }
         for_chunks(&mut q, hd, par, |i, qh| {
             let ti = i / nh;
@@ -361,7 +444,7 @@ impl<'a> Model<'a> {
         attention(&q, cache, nh, t, start, window, &mut att);
 
         let mut o = vec![0f32; t * h];
-        matmul(layer.o, h, nh * hd, &att, t, &mut o);
+        linear(&layer.o, h, nh * hd, &att, t, &mut o);
         rmsnorm_rows_inplace(&mut o, h, Some(layer.ln_post_attn), eps);
         add_inplace(x, &o);
 
@@ -370,10 +453,10 @@ impl<'a> Model<'a> {
         let inter = layer.inter;
         let mut g = vec![0f32; t * inter];
         let mut u = vec![0f32; t * inter];
-        matmul_multi(&mut [(layer.gate, inter, &mut g[..]), (layer.up, inter, &mut u[..])], h, &hn, t);
+        linear_multi(&mut [(&layer.gate, inter, &mut g[..]), (&layer.up, inter, &mut u[..])], h, &hn, t);
         gelu_mul(&mut g, &u);
         let mut d = o; // reuse buffer [t, h]
-        matmul(layer.down, h, inter, &g, t, &mut d);
+        linear(&layer.down, h, inter, &g, t, &mut d);
         rmsnorm_rows_inplace(&mut d, h, Some(layer.ln_post_ffn), eps);
         add_inplace(x, &d);
 
@@ -382,7 +465,7 @@ impl<'a> Model<'a> {
             let p = cfg.hidden_size_per_layer_input;
             let nl = cfg.num_hidden_layers;
             let mut gp = vec![0f32; t * p];
-            matmul(pw.gate, p, h, x, t, &mut gp);
+            linear(&pw.gate, p, h, x, t, &mut gp);
             for_chunks(&mut gp, p, par, |ti, row| {
                 let inp = &pli[(ti * nl + l) * p..(ti * nl + l + 1) * p];
                 for (r, &i) in row.iter_mut().zip(inp) {
@@ -390,7 +473,7 @@ impl<'a> Model<'a> {
                 }
             });
             let mut pr = d;
-            matmul(pw.proj, h, p, &gp, t, &mut pr);
+            linear(&pw.proj, h, p, &gp, t, &mut pr);
             rmsnorm_rows_inplace(&mut pr, h, Some(pw.norm), eps);
             add_inplace(x, &pr);
         }

@@ -10,6 +10,9 @@ mod prof;
 #[path = "../pool.rs"]
 #[allow(dead_code)]
 mod pool;
+#[path = "../quant.rs"]
+#[allow(dead_code)]
+mod quant;
 
 use rayon::prelude::*;
 use std::time::Instant;
@@ -70,6 +73,7 @@ fn main() {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        if std::env::var("VARIANTS").is_err() { println!("(set VARIANTS=1 for single-thread kernel variants)"); } else {
         println!("\nsingle-thread kernel variants, t=1 (GB/s):");
         let rows = n_out;
         {
@@ -174,6 +178,32 @@ fn main() {
             andshl!("ANDSHL R1 A4", 4);
             andshl!("ANDSHL R1 A8", 8);
             andshl!("ANDSHL R1 A16", 16);
+        }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Prefill GEMM kernel compute ceiling: single thread, operands resident in L1 / L2.
+        for (name, rows, k, toks) in [("L1: 8 rows x 512 k x 8 tok", 8usize, 512usize, 8usize), ("L2: 8 rows x 4096 k x 64 tok", 8, 4096, 64), ("L2: 64 rows x 2560 k x 64 tok", 64, 2560, 64)] {
+            let wq: Vec<u16> = (0..rows * k).map(|i| 0x3f80 ^ (i as u16 & 0x3f)).collect();
+            let xt: Vec<f32> = vec![0.5f32; toks * k]; // packed [tile][k][8]
+            let mut y = vec![0f32; toks * rows];
+            let flops_per_pass = 2.0 * rows as f64 * k as f64 * toks as f64;
+            let passes = (2e10 / flops_per_pass).max(1.0) as usize;
+            let t0 = Instant::now();
+            for _ in 0..passes {
+                let mut r = 0;
+                while r + 8 <= rows {
+                    for tile in 0..toks / 8 {
+                        unsafe {
+                            kernels::simd::gemm_8x8::<u16>(wq.as_ptr().add(r * k), k, xt.as_ptr().add(tile * k * 8), y.as_mut_ptr(), rows, r, tile * 8, 8);
+                        }
+                    }
+                    r += 8;
+                }
+            }
+            std::hint::black_box(&y);
+            println!("gemm_8x8 1 thread {name}: {:.0} GFLOP/s", flops_per_pass * passes as f64 / t0.elapsed().as_secs_f64() / 1e9);
         }
     }
     println!("\nbf16 matmul, t=32 (f32 conversion path), GFLOP/s:");

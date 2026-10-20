@@ -53,6 +53,7 @@ Useful flags:
 | `--raw` | feed the prompt as-is after `<bos>`, no chat template |
 | `--max-tokens N` | cap on generated tokens |
 | `--threads N` | worker threads (default: all cores) |
+| `--quant q8` | quantize streamed weights to int8 at load (blocks of 32, f32 scales); ~1.8x less memory traffic |
 | `--mmap` | map weights from disk instead of copying them into RAM |
 | `--profile` | per-operation timing and bandwidth breakdown |
 | `--dump-logits FILE` | write the logits for the last prompt token (for reference checks) |
@@ -67,15 +68,19 @@ faults on the first pass.
 Decode is memory-bandwidth bound: every generated token streams all dense weights once.
 On an M5 Max (18 cores, ~280 GB/s measured CPU read bandwidth):
 
-| Model | Weights per token | Decode | Prefill (3k-token prompt) |
-|---|---|---|---|
-| E2B-it | 4.6 GB | ~46 tok/s (≈230 GB/s) | ~230 tok/s |
-| E4B-it | 9.3 GB | ~25 tok/s (≈245 GB/s) | ~115 tok/s |
+| Model | Precision | Weights per token | Decode | Prefill (3k-token prompt) |
+|---|---|---|---|---|
+| E2B-it | bf16 | 4.6 GB | ~46 tok/s (≈230 GB/s) | ~280 tok/s |
+| E2B-it | `--quant q8` | 2.6 GB | ~71 tok/s | ~255 tok/s |
+| E4B-it | bf16 | 9.3 GB | ~25 tok/s (≈245 GB/s) | ~135 tok/s |
+| E4B-it | `--quant q8` | 5.2 GB | ~40 tok/s | ~135 tok/s |
 
-The bf16 matmul kernels reach the machine's bandwidth ceiling with 12 threads
+The matmul kernels reach the machine's bandwidth ceiling with 12 threads
 (`cargo run --release --bin membench` prints the raw numbers for your machine), so decode
-is as fast as bf16 weights allow; optional int8 weights would be the next ~2x. Prefill runs
-an 8x8 outer-product GEMM at roughly 1.3 TFLOP/s, about half of the f32 FMA peak.
+speed is set by bytes per token: Q8 cuts them by 1.8x. Prefill is compute-bound on an 8x8
+outer-product GEMM at roughly 1.3 TFLOP/s (about 55% of the measured f32 FMA peak; a 12-token
+tile was tried and lost to register pressure), and Q8 prefill dequantizes to f32 and uses the
+same kernel, so prompt processing speed is independent of precision.
 
 ## How it works
 
@@ -85,6 +90,9 @@ an 8x8 outer-product GEMM at roughly 1.3 TFLOP/s, about half of the f32 FMA peak
   prefers few long streams); prefill packs activations into 8-token panels and runs an 8-row x 8-token
   outer-product kernel that broadcasts bf16 weights by lane. Also RMSNorm, GELU (tanh approximation via
   a fast exp), RoPE tables, softmax.
+- `quant.rs`: Q8 block quantization (32 weights per f32 scale) of weights at load time and of
+  activations per matmul; the decode kernel uses int8 SDOT over four blocks at a time. On E2B/E4B the
+  KL divergence of the output distribution from the float32 reference is about 1e-5 nats.
 - `pool.rs`: a spin-waiting thread pool with an atomic work counter. Dispatch costs about a microsecond,
   which matters because a decode step issues ~200 small parallel regions.
 - `model.rs`: the Gemma 4 decoder: scaled embeddings, per-layer embeddings (PLE), QK-norm, sliding /

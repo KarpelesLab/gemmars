@@ -4,11 +4,12 @@ mod kernels;
 mod model;
 mod pool;
 mod prof;
+mod quant;
 mod safetensors;
 mod sampler;
 
 use anyhow::{bail, Context, Result};
-use model::{Model, Session};
+use model::{Model, Quant, Session};
 use sampler::Sampler;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
@@ -30,6 +31,7 @@ struct Args {
     threads: Option<usize>,
     preload: bool,
     mmap: bool,
+    quant: Quant,
     profile: bool,
     dump_logits: Option<PathBuf>,
     show_tokens: bool,
@@ -53,6 +55,7 @@ fn usage() -> ! {
          \x20 --seed N             RNG seed\n\
          \x20 --threads N          worker threads (default: all cores)\n\
          \x20 --mmap               map weights from disk instead of copying into RAM\n\
+         \x20 --quant bf16|q8      weight precision for streamed matmuls (default bf16)\n\
          \x20 --preload            with --mmap, touch all weight pages before starting\n\
          \x20 --profile            print per-operation timing breakdown\n\
          \x20 --prefill-chunk N    tokens per prefill chunk (default 256)\n\
@@ -78,6 +81,7 @@ fn parse_args() -> Result<Args> {
         threads: None,
         preload: false,
         mmap: false,
+        quant: Quant::Bf16,
         profile: false,
         dump_logits: None,
         show_tokens: false,
@@ -101,6 +105,13 @@ fn parse_args() -> Result<Args> {
             "--threads" | "-j" => a.threads = Some(val()?.parse()?),
             "--preload" => a.preload = true,
             "--mmap" => a.mmap = true,
+            "--quant" => {
+                a.quant = match val()?.as_str() {
+                    "bf16" => Quant::Bf16,
+                    "q8" | "int8" => Quant::Q8,
+                    other => bail!("unknown quantization {other} (use bf16 or q8)"),
+                }
+            }
             "--profile" => a.profile = true,
             "--prefill-chunk" => a.prefill_chunk = val()?.parse()?,
             "--dump-logits" => a.dump_logits = Some(PathBuf::from(val()?)),
@@ -205,15 +216,17 @@ fn run(args: Args) -> Result<()> {
     let cfg = config::TextConfig::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
-    let model = Model::load(cfg, &files)?;
+    let model = Model::load(cfg, &files, args.quant)?;
     let tok = Tokenizer::from_file(args.model.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     eprintln!(
-        "[loaded {} layers, hidden {}, {:.1} GB of weights ({}), {} threads, {:.2}s]",
+        "[loaded {} layers, hidden {}, {:.1} GB checkpoint ({}), {:?} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
         model.cfg.num_hidden_layers,
         model.cfg.hidden_size,
         files.total_bytes() as f64 / 1e9,
         if args.mmap { "mmap" } else { "in RAM" },
+        model.quant,
+        model.streamed_bytes() as f64 / 1e9,
         pool::threads(),
         t0.elapsed().as_secs_f64()
     );
