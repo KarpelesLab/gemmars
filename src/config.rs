@@ -221,3 +221,105 @@ pub fn load_eos_ids(dir: &Path) -> Vec<u32> {
     }
     vec![1, 106]
 }
+
+/// `model_type` from the root of config.json (e.g. "gemma4", "qwen3_5").
+pub fn model_type(dir: &Path) -> Result<String> {
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+    raw.get("model_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| raw.get("text_config").and_then(|t| t.get("model_type")).and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .context("config.json has no model_type")
+}
+
+fn d4() -> usize {
+    4
+}
+fn d128() -> usize {
+    128
+}
+fn d16() -> usize {
+    16
+}
+fn d32() -> usize {
+    32
+}
+fn d_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QwenRope {
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f64>,
+}
+
+/// Qwen3.5 / Qwen3.8 dense hybrid text config (Gated DeltaNet + gated full attention).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct QwenConfig {
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    #[serde(default = "d256")]
+    pub head_dim: usize,
+    #[serde(default = "d_eps")]
+    pub rms_norm_eps: f64,
+    pub vocab_size: usize,
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+    #[serde(default = "d4")]
+    pub full_attention_interval: usize,
+    #[serde(default = "d4")]
+    pub linear_conv_kernel_dim: usize,
+    #[serde(default = "d128")]
+    pub linear_key_head_dim: usize,
+    #[serde(default = "d128")]
+    pub linear_value_head_dim: usize,
+    #[serde(default = "d16")]
+    pub linear_num_key_heads: usize,
+    #[serde(default = "d32")]
+    pub linear_num_value_heads: usize,
+    #[serde(default)]
+    pub rope_parameters: Option<QwenRope>,
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f64>,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+    #[serde(default = "d_true")]
+    pub attn_output_gate: bool,
+}
+
+impl QwenConfig {
+    pub fn load(dir: &Path) -> Result<Self> {
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+        let text = raw.get("text_config").cloned().unwrap_or(raw);
+        let mut cfg: QwenConfig = serde_json::from_value(text).context("parse qwen text config")?;
+        if cfg.layer_types.is_none() {
+            let k = cfg.full_attention_interval.max(1);
+            cfg.layer_types = Some(
+                (0..cfg.num_hidden_layers)
+                    .map(|i| if (i + 1) % k == 0 { "full_attention" } else { "linear_attention" }.to_string())
+                    .collect(),
+            );
+        }
+        if cfg.layer_types.as_ref().unwrap().len() != cfg.num_hidden_layers {
+            bail!("layer_types length mismatch");
+        }
+        Ok(cfg)
+    }
+    pub fn is_full(&self, l: usize) -> bool {
+        self.layer_types.as_ref().unwrap()[l] == "full_attention"
+    }
+    pub fn rope_theta(&self) -> f64 {
+        self.rope_parameters.as_ref().map(|r| r.rope_theta).unwrap_or(10_000_000.0)
+    }
+    /// Number of rotated dimensions per head (partial RoPE).
+    pub fn rotary_dim(&self) -> usize {
+        let f = self.rope_parameters.as_ref().and_then(|r| r.partial_rotary_factor).or(self.partial_rotary_factor).unwrap_or(1.0);
+        (self.head_dim as f64 * f) as usize
+    }
+}

@@ -1129,6 +1129,35 @@ pub fn rmsnorm_rows_inplace(x: &mut [f32], n: usize, w: Option<&[u16]>, eps: f32
     for_chunks(x, n, par, |_, xi| rmsnorm_inplace(xi, w, eps));
 }
 
+/// RMSNorm with precomputed f32 weights (e.g. zero-centered `1 + w`): out = x * rsqrt(mean(x^2)+eps) * w.
+pub fn rmsnorm_f32w(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
+    let n = x.len();
+    let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32 + eps;
+    let r = ss.powf(-0.5);
+    for i in 0..n {
+        out[i] = x[i] * r * w[i];
+    }
+}
+
+pub fn rmsnorm_f32w_rows(x: &[f32], n: usize, w: &[f32], eps: f32, out: &mut [f32]) {
+    let _timer = prof::start(Cat::Norm);
+    let par = x.len() > 4 * n;
+    for_chunks(out, n, par, |i, o| rmsnorm_f32w(&x[i * n..(i + 1) * n], w, eps, o));
+}
+
+/// a[i] = silu(a[i]) * b[i]
+pub fn silu_mul(a: &mut [f32], b: &[f32]) {
+    let _timer = prof::start(Cat::Elementwise);
+    let par = a.len() >= PAR_MIN;
+    let chunk = if par { par_chunk(a.len()) } else { a.len() };
+    for_chunks(a, chunk, par, |i, c| {
+        for (ai, &bi) in c.iter_mut().zip(&b[i * chunk..]) {
+            let x = *ai;
+            *ai = x / (1.0 + fast_exp(-x)) * bi;
+        }
+    });
+}
+
 /// Runs `f(index, chunk)` over fixed-size chunks, in parallel only when asked.
 pub fn for_chunks<F>(x: &mut [f32], size: usize, par: bool, f: F)
 where

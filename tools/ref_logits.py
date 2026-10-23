@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reference check against HuggingFace transformers (float32, CPU).
 
-usage: ref_logits.py MODEL_DIR PROMPT_TEXT_FILE OURS_LOGITS.bin [--generate N]
+usage: ref_logits.py MODEL_DIR PROMPT_TEXT_FILE OURS_LOGITS.bin [--generate N] [--bf16]
 
 PROMPT_TEXT_FILE holds the exact templated text (including <bos>) that gemmars tokenized.
 Prints token ids, compares our logits with the reference and optionally greedy-generates.
@@ -15,6 +15,7 @@ def main():
     gen = 0
     if "--generate" in sys.argv:
         gen = int(sys.argv[sys.argv.index("--generate") + 1])
+    dtype = torch.bfloat16 if "--bf16" in sys.argv else torch.float32
     from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
     tok = AutoTokenizer.from_pretrained(model_dir)
     text = open(text_file).read()
@@ -22,7 +23,7 @@ def main():
     print("ref ids:", ids[0].tolist())
     t0 = time.time()
     cfg = AutoConfig.from_pretrained(model_dir)
-    model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=dtype)
     model.eval()
     print(f"loaded {type(model).__name__} in {time.time()-t0:.1f}s")
     with torch.no_grad():

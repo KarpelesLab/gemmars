@@ -2,6 +2,7 @@ mod chat;
 mod config;
 mod audio;
 mod drafter;
+mod hf;
 mod kernels;
 mod media;
 mod mm_config;
@@ -9,11 +10,13 @@ mod model;
 mod pool;
 mod prof;
 mod quant;
+mod qwen;
 mod safetensors;
 mod sampler;
 mod vision;
 
 use anyhow::{bail, Context, Result};
+use chat::ChatFormat;
 use model::{Model, Quant, Session};
 use sampler::argmax;
 use sampler::Sampler;
@@ -48,11 +51,16 @@ struct Args {
     audios: Vec<PathBuf>,
     dump_mm: Option<PathBuf>,
     max_soft_tokens: usize,
+    cache_dir: Option<PathBuf>,
+    download_only: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: gemmars --model DIR [options]\n\
+        "usage: gemmars --model DIR|org/name [options]\n\
+         \n\
+         A HuggingFace repo id is fetched into the cache (~/.cache/gemmars/hub or $GEMMARS_CACHE)\n\
+         on first use; downloads resume. Set HF_TOKEN for gated repos.\n\
          \n\
          options:\n\
          \x20 --prompt TEXT        single prompt (default: read from stdin)\n\
@@ -77,6 +85,8 @@ fn usage() -> ! {
          \x20 --audio FILE         attach an audio clip (repeatable; WAV/MP3/FLAC/AAC/OGG via oxideav)\n\
          \x20 --max-soft-tokens N  image soft-token budget: 70, 140, 280 (default), 560 or 1120\n\
          \x20 --dump-mm PREFIX     write multimodal soft tokens / patches as f32 files (for reference checks)\n\
+         \x20 --cache-dir DIR      where fetched models are cached\n\
+         \x20 --download-only      fetch the model (and drafter) and exit\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
          \x20 --show-tokens        print token ids"
     );
@@ -110,6 +120,8 @@ fn parse_args() -> Result<Args> {
         audios: Vec::new(),
         dump_mm: None,
         max_soft_tokens: 0,
+        cache_dir: None,
+        download_only: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -145,6 +157,8 @@ fn parse_args() -> Result<Args> {
             "--audio" => a.audios.push(PathBuf::from(val()?)),
             "--dump-mm" => a.dump_mm = Some(PathBuf::from(val()?)),
             "--max-soft-tokens" => a.max_soft_tokens = val()?.parse()?,
+            "--cache-dir" => a.cache_dir = Some(PathBuf::from(val()?)),
+            "--download-only" => a.download_only = true,
             "--dump-logits" => a.dump_logits = Some(PathBuf::from(val()?)),
             "--show-tokens" => a.show_tokens = true,
             "-h" | "--help" => usage(),
@@ -263,7 +277,7 @@ fn mm_overrides(ids: &[u32], feats: &[MmFeature], hidden: usize) -> Result<Vec<(
 }
 
 /// Prefill in chunks with multimodal overrides; returns the hidden states of the last chunk.
-fn prefill_mm(model: &Model, sess: &mut Session, ids: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
+fn prefill_mm<M: TextLm>(model: &M, sess: &mut M::Sess, ids: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
     let mut hs = Vec::new();
     let mut start = 0;
     for c in ids.chunks(chunk.max(1)) {
@@ -285,29 +299,82 @@ fn prefill(model: &Model, sess: &mut Session, ids: &[u32], chunk: usize) -> Vec<
     logits
 }
 
+/// Common surface of the model families (Gemma 4, Qwen 3.5/3.8) used by the generation loops.
+trait TextLm {
+    type Sess;
+    fn new_session(&self) -> Self::Sess;
+    fn hidden_size(&self) -> usize;
+    fn forward_hidden_mm(&self, sess: &mut Self::Sess, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32>;
+    fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32>;
+    fn forward(&self, sess: &mut Self::Sess, tokens: &[u32]) -> Vec<f32> {
+        let h = self.hidden_size();
+        let hs = self.forward_hidden_mm(sess, tokens, &[]);
+        self.logits(&hs[hs.len() - h..], 1)
+    }
+}
+
+impl TextLm for Model<'_> {
+    type Sess = Session;
+    fn new_session(&self) -> Session {
+        Model::new_session(self)
+    }
+    fn hidden_size(&self) -> usize {
+        self.cfg.hidden_size
+    }
+    fn forward_hidden_mm(&self, sess: &mut Session, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        Model::forward_hidden_mm(self, sess, tokens, mm)
+    }
+    fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        Model::logits(self, hidden, t)
+    }
+}
+
+impl TextLm for qwen::QwenModel<'_> {
+    type Sess = qwen::QwenSession;
+    fn new_session(&self) -> qwen::QwenSession {
+        qwen::QwenModel::new_session(self)
+    }
+    fn hidden_size(&self) -> usize {
+        self.cfg.hidden_size
+    }
+    fn forward_hidden_mm(&self, sess: &mut qwen::QwenSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        qwen::QwenModel::forward_hidden_mm(self, sess, tokens, mm)
+    }
+    fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        qwen::QwenModel::logits(self, hidden, t)
+    }
+}
+
 /// Incremental stdout printer: prints the stable decoded prefix of the token list.
 struct Printer {
     printed: usize,
+    soc: u32,
+    eoc: u32,
 }
 
 impl Printer {
-    const SOC: u32 = 100; // <|channel>  (start of thinking)
-    const EOC: u32 = 101; // <channel|>  (end of thinking)
-
-    fn new() -> Self {
-        Self { printed: 0 }
+    fn new(fmt: &dyn ChatFormat, think: bool) -> Self {
+        let (soc, eoc) = fmt.think_ids();
+        if fmt.starts_in_thinking(think) {
+            let mut lock = std::io::stdout().lock();
+            let _ = lock.write_all(b"\x1b[2m");
+            let _ = lock.flush();
+        }
+        Self { printed: 0, soc, eoc }
     }
 
     fn on_token(&mut self, id: u32) {
-        if id == Self::SOC || id == Self::EOC {
+        if id == self.soc || id == self.eoc {
             let mut lock = std::io::stdout().lock();
-            let _ = lock.write_all(if id == Self::SOC { b"\x1b[2m" } else { b"\x1b[0m\n" });
+            let _ = lock.write_all(if id == self.soc { b"\x1b[2m" } else { b"\x1b[0m\n" });
             let _ = lock.flush();
         }
     }
 
     fn flush_text(&mut self, tok: &Tokenizer, out: &[u32], final_: bool) {
-        if let Ok(text) = tok.decode(out, true) {
+        // Thinking delimiters are rendered as dimming, never as text (some tokenizers keep them).
+        let shown: Vec<u32> = out.iter().copied().filter(|&t| t != self.soc && t != self.eoc).collect();
+        if let Ok(text) = tok.decode(&shown, true) {
             let stable = if !final_ && text.ends_with('\u{FFFD}') { text.len().saturating_sub(3) } else { text.len() };
             if stable > self.printed && text.is_char_boundary(stable) {
                 let mut lock = std::io::stdout().lock();
@@ -315,6 +382,11 @@ impl Printer {
                 let _ = lock.flush();
                 self.printed = stable;
             }
+        }
+        if final_ {
+            let mut lock = std::io::stdout().lock();
+            let _ = lock.write_all(b"\x1b[0m");
+            let _ = lock.flush();
         }
     }
 }
@@ -345,7 +417,7 @@ fn generate_speculative(
     let (ls, lg) = model.cfg.shared_kv_layers();
     let mut stats = SpecStats { forwards: 0, drafted: 0, accepted: 0, per_pos: [0; 16] };
     let mut out: Vec<u32> = Vec::new();
-    let mut printer = Printer::new();
+    let mut printer = Printer::new(&chat::GemmaChat, false);
 
     // First token from the prompt's logits (the prefill forward already counted by the caller).
     let logits = model.logits(&hidden_last, 1);
@@ -457,52 +529,35 @@ fn generate_speculative(
 }
 
 /// Streams the model's reply to stdout. Returns (generated ids including stop token, forwards, seconds).
-fn generate(
-    model: &Model,
-    sess: &mut Session,
+#[allow(clippy::too_many_arguments)]
+fn generate<M: TextLm>(
+    model: &M,
+    sess: &mut M::Sess,
     tok: &Tokenizer,
     mut logits: Vec<f32>,
     sampler: &mut Sampler,
     eos: &[u32],
     max_tokens: usize,
+    fmt: &dyn ChatFormat,
+    think: bool,
 ) -> (Vec<u32>, usize, f64) {
     let t0 = Instant::now();
     let mut out: Vec<u32> = Vec::new();
-    let mut printed = 0usize;
-    let stdout = std::io::stdout();
+    let mut printer = Printer::new(fmt, think);
     let mut n_forward = 0usize;
-    const SOC: u32 = 100; // <|channel>  (start of thinking)
-    const EOC: u32 = 101; // <channel|>  (end of thinking)
     for _ in 0..max_tokens {
         let id = sampler.sample(&logits);
         out.push(id);
         if eos.contains(&id) {
             break;
         }
-        if id == SOC || id == EOC {
-            // Thinking trace is shown dimmed; the special tokens themselves are not decoded.
-            let mut lock = stdout.lock();
-            let _ = lock.write_all(if id == SOC { b"\x1b[2m" } else { b"\x1b[0m\n" });
-            let _ = lock.flush();
-        }
-        // Incremental decode: print the stable prefix of the decoded text.
-        if let Ok(text) = tok.decode(&out, true) {
-            let stable = if text.ends_with('\u{FFFD}') { text.len().saturating_sub(3) } else { text.len() };
-            if stable > printed && text.is_char_boundary(stable) {
-                let mut lock = stdout.lock();
-                let _ = lock.write_all(text[printed..stable].as_bytes());
-                let _ = lock.flush();
-                printed = stable;
-            }
-        }
+        printer.on_token(id);
+        printer.flush_text(tok, &out, false);
         logits = model.forward(sess, &[id]);
         n_forward += 1;
     }
-    if let Ok(text) = tok.decode(&out, true) {
-        if text.len() > printed {
-            print!("{}", &text[printed..]);
-        }
-    }
+    let shown = if out.last().is_some_and(|e| eos.contains(e)) { &out[..out.len() - 1] } else { &out[..] };
+    printer.flush_text(tok, shown, true);
     println!();
     (out, n_forward, t0.elapsed().as_secs_f64())
 }
@@ -520,13 +575,160 @@ fn report(prefill_tokens: usize, prefill_secs: f64, decode_tokens: usize, decode
 }
 
 fn main() -> Result<()> {
-    let args = parse_args()?;
+    let mut args = parse_args()?;
+    // Resolve repo ids to cached local directories.
+    let spec = args.model.to_string_lossy().to_string();
+    args.model = hf::resolve(&spec, args.cache_dir.as_deref())?;
+    if let Some(d) = &args.draft {
+        let spec = d.to_string_lossy().to_string();
+        args.draft = Some(hf::resolve(&spec, args.cache_dir.as_deref())?);
+    }
+    if args.download_only {
+        eprintln!("[model at {}]", args.model.display());
+        return Ok(());
+    }
     let threads = args.threads.unwrap_or_else(default_threads);
     pool::init(threads);
     run(args)
 }
 
 fn run(args: Args) -> Result<()> {
+    let model_type = config::model_type(&args.model)?;
+    match model_type.as_str() {
+        "gemma4" | "gemma4_text" => run_gemma(args),
+        "qwen3_5" | "qwen3_5_text" | "qwen3_6" | "qwen3_8" => run_qwen(args),
+        other => bail!("unsupported model_type {other}"),
+    }
+}
+
+/// Plain generation (single prompt or chat) for any model family, without attachments or drafter.
+fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt: &dyn ChatFormat) -> Result<()> {
+    let encode = |text: &str| -> Result<Vec<u32>> {
+        let enc = tok.encode(text, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        Ok(enc.get_ids().to_vec())
+    };
+    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
+    let mut sess = model.new_session();
+    let h = model.hidden_size();
+    if args.chat {
+        let mut first = true;
+        let stdin = std::io::stdin();
+        loop {
+            eprint!("> ");
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                break;
+            }
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut text = String::new();
+            if first {
+                text.push_str(&fmt.conversation_start(args.system.as_deref(), args.think));
+                first = false;
+            } else {
+                text.push_str(&fmt.end_of_model_turn());
+            }
+            text.push_str(&fmt.user_turn(line, args.think));
+            let ids = encode(&text)?;
+            if args.show_tokens {
+                eprintln!("[prompt ids: {ids:?}]");
+            }
+            let t = Instant::now();
+            let hs = prefill_mm(model, &mut sess, &ids, args.prefill_chunk, &[]);
+            let logits = model.logits(&hs[hs.len() - h..], 1);
+            let prefill_secs = t.elapsed().as_secs_f64();
+            prof::reset();
+            let (out, n, decode_secs) = generate(model, &mut sess, tok, logits, &mut sampler, eos, args.max_tokens, fmt, args.think);
+            if args.show_tokens {
+                eprintln!("[output ids: {out:?}]");
+            }
+            report(ids.len(), prefill_secs, n, decode_secs);
+            if args.profile {
+                prof::report(decode_secs, n);
+            }
+        }
+        return Ok(());
+    }
+    let prompt = match &args.prompt {
+        Some(p) => p.clone(),
+        None => {
+            let mut s = String::new();
+            std::io::stdin().lock().read_to_string(&mut s)?;
+            s
+        }
+    };
+    let text = if args.raw {
+        prompt
+    } else {
+        let mut t = fmt.conversation_start(args.system.as_deref(), args.think);
+        t.push_str(&fmt.user_turn(&prompt, args.think));
+        t
+    };
+    let ids = encode(&text)?;
+    if args.show_tokens {
+        eprintln!("[prompt ids ({}): {ids:?}]", ids.len());
+    }
+    if ids.is_empty() {
+        bail!("empty prompt");
+    }
+    let t = Instant::now();
+    let hs = prefill_mm(model, &mut sess, &ids, args.prefill_chunk, &[]);
+    let logits = model.logits(&hs[hs.len() - h..], 1);
+    let prefill_secs = t.elapsed().as_secs_f64();
+    if args.profile {
+        eprintln!("-- prefill --");
+        prof::report(prefill_secs, ids.len());
+    }
+    if let Some(path) = &args.dump_logits {
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(path, bytes)?;
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        let top = idx[..10].iter().map(|&i| format!("{i}:{:.3}", logits[i])).collect::<Vec<_>>().join(" ");
+        eprintln!("[wrote {} logits to {} | top10 {top}]", logits.len(), path.display());
+        eprintln!("[prefill {} tok in {:.2}s]", ids.len(), prefill_secs);
+        return Ok(());
+    }
+    prof::reset();
+    let (out, n, decode_secs) = generate(model, &mut sess, tok, logits, &mut sampler, eos, args.max_tokens, fmt, args.think);
+    if args.show_tokens {
+        eprintln!("[output ids: {out:?}]");
+    }
+    report(ids.len(), prefill_secs, n, decode_secs);
+    if args.profile {
+        eprintln!("-- decode --");
+        prof::report(decode_secs, n);
+    }
+    Ok(())
+}
+
+fn run_qwen(args: Args) -> Result<()> {
+    let t0 = Instant::now();
+    if args.draft.is_some() || !args.images.is_empty() || !args.audios.is_empty() {
+        bail!("speculative decoding and attachments are not supported for Qwen models yet");
+    }
+    let cfg = config::QwenConfig::load(&args.model)?;
+    let eos = config::load_eos_ids(&args.model);
+    let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
+    let model = qwen::QwenModel::load(cfg, &files, args.quant)?;
+    let tok = Tokenizer::from_file(args.model.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    eprintln!(
+        "[loaded Qwen: {} layers, hidden {}, {:.1} GB checkpoint ({}), {:?} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
+        model.cfg.num_hidden_layers,
+        model.cfg.hidden_size,
+        files.total_bytes() as f64 / 1e9,
+        if args.mmap { "mmap" } else { "in RAM" },
+        model.quant,
+        model.streamed_bytes() as f64 / 1e9,
+        pool::threads(),
+        t0.elapsed().as_secs_f64()
+    );
+    run_text(&args, &model, &tok, &eos, &chat::QwenChat)
+}
+
+fn run_gemma(args: Args) -> Result<()> {
     let t0 = Instant::now();
     let cfg = config::TextConfig::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
@@ -633,7 +835,7 @@ fn run(args: Args) -> Result<()> {
             let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
-            let (out, n, decode_secs) = generate(&model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens);
+            let (out, n, decode_secs) = generate(&model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens, &chat::GemmaChat, args.think);
             if args.show_tokens {
                 eprintln!("[output ids: {out:?}]");
             }
@@ -729,7 +931,7 @@ fn run(args: Args) -> Result<()> {
     }
 
     prof::reset();
-    let (out, n, decode_secs) = generate(&model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens);
+    let (out, n, decode_secs) = generate(&model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens, &chat::GemmaChat, args.think);
     if args.show_tokens {
         eprintln!("[output ids: {out:?}]");
     }

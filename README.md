@@ -18,6 +18,20 @@ decoding produces identical tokens.
 | google/gemma-4-12B-it | 12B | 24 GB | supported (k=v global attention), untested |
 | google/gemma-4-31B-it | 31B | 62 GB | supported, sharded loading, untested |
 | google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
+| Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text only; matches the bf16 reference; see below |
+
+### Qwen3.5 / Qwen3.8
+
+The Qwen3.5-family dense models are a different architecture (`qwen.rs`): 48 Gated DeltaNet layers
+(a causal depthwise conv, L2-normalised keys/queries and a 128x128 delta-rule recurrent state per
+value head) interleaved with 16 gated full-attention layers (24 query / 4 KV heads of 256, partial
+RoPE on 64 dims, a sigmoid output gate), SiLU MLPs and zero-centred RMSNorm. The recurrent layers
+keep a fixed-size state instead of a KV cache, so memory does not grow with context for 48 of the
+64 layers. The vision encoder and the MTP head in the checkpoint are not loaded yet, and
+speculative decoding is not available for this family yet.
+
+Thinking is on by default in the Qwen template; `--think` enables it here (the trace is dimmed),
+otherwise the generation prompt closes the think block.
 
 Text, images and audio are supported (E2B/E4B have both towers). Video is not.
 
@@ -47,7 +61,17 @@ stays causal, matching the E2B/E4B configuration.
 
 ## Getting weights
 
-The Gemma 4 checkpoints are Apache 2.0 and not gated, so plain `curl` works:
+`--model` accepts a HuggingFace repo id and fetches it on first use (resumable, pure-Rust HTTP via
+[rsurl](https://crates.io/crates/rsurl)) into `~/.cache/gemmars/hub` (or `$GEMMARS_CACHE`,
+or `--cache-dir`):
+
+```sh
+./target/release/gemmars --model google/gemma-4-E4B-it --quant q4 -p "Hello"
+./target/release/gemmars --model Qwen/Qwen3.8-27B --download-only     # just fetch
+```
+
+Set `HF_TOKEN` for gated repos. The Gemma 4 checkpoints are Apache 2.0 and not gated; manual
+downloads with plain `curl` work too:
 
 ```sh
 M=gemma-4-E4B-it
@@ -104,6 +128,13 @@ On an M5 Max (18 cores, ~280 GB/s measured CPU read bandwidth):
 | E4B-it | bf16 | 9.3 GB | ~28 tok/s (≈245 GB/s) | 41 / 47 tok/s | ~135 tok/s |
 | E4B-it | `--quant q8` | 5.2 GB | ~45 tok/s | 66 / 82 tok/s | ~135 tok/s |
 | E4B-it | `--quant q4` | 2.6 GB | ~76 tok/s | 75 / 99 tok/s | ~135 tok/s |
+| Qwen3.8-27B | bf16 | 51 GB | ~5.3 tok/s (≈270 GB/s) | n/a | ~19 tok/s |
+| Qwen3.8-27B | `--quant q8` | 29 GB | ~8.8 tok/s | n/a | ~19 tok/s |
+| Qwen3.8-27B | `--quant q4` | 14 GB | ~16 tok/s | n/a | ~20 tok/s |
+
+For the 27B model `--mmap` is recommended: quantization then reads the checkpoint straight from
+the page cache (about 3 s to quantize 27.8B parameters on 18 threads) instead of copying 55 GB
+into the process first.
 
 The matmul kernels reach the machine's bandwidth ceiling with 12 threads
 (`cargo run --release --bin membench` prints the raw numbers for your machine), so decode

@@ -35,7 +35,7 @@ impl Lin<'_> {
 }
 
 /// Fused matmuls over one shared input: all jobs must have the same precision.
-fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {
+pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {
     if jobs.is_empty() {
         return;
     }
@@ -77,7 +77,7 @@ fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], 
     }
 }
 
-fn linear(l: &Lin, n_out: usize, n_in: usize, x: &[f32], t: usize, y: &mut [f32]) {
+pub(crate) fn linear(l: &Lin, n_out: usize, n_in: usize, x: &[f32], t: usize, y: &mut [f32]) {
     linear_multi(&mut [(l, n_out, y)], n_in, x, t);
 }
 
@@ -140,10 +140,10 @@ pub struct LayerCache {
 }
 
 impl LayerCache {
-    fn new(n_kv: usize, hd: usize) -> Self {
+    pub(crate) fn new(n_kv: usize, hd: usize) -> Self {
         Self { k: Vec::new(), v: Vec::new(), n_kv, hd, len: 0 }
     }
-    fn push(&mut self, k: &[f32], v: &[f32], t: usize) {
+    pub(crate) fn push(&mut self, k: &[f32], v: &[f32], t: usize) {
         debug_assert_eq!(k.len(), t * self.n_kv * self.hd);
         self.k.extend_from_slice(k);
         self.v.extend_from_slice(v);
@@ -159,7 +159,7 @@ impl LayerCache {
         let o = (pos * self.n_kv + kvh) * self.hd;
         &self.v[o..o + self.hd]
     }
-    fn truncate(&mut self, len: usize) {
+    pub(crate) fn truncate(&mut self, len: usize) {
         if len < self.len {
             self.k.truncate(len * self.n_kv * self.hd);
             self.v.truncate(len * self.n_kv * self.hd);
