@@ -1,0 +1,428 @@
+// Host side of the gemmars WebAssembly module (browser and Deno, ES module, no build step).
+//
+// The module is plain C-ABI wasm (see src/lib.rs). This file provides its imports: a log sink, a
+// clock, randomness, and the WebGPU backend (`gpu_upload` / `gpu_matmul`). GPU readback is
+// asynchronous while the module's call is synchronous, so `gpu_matmul` is wrapped with
+// `WebAssembly.Suspending` and the exports that can reach it with `WebAssembly.promising` (JSPI).
+// Without JSPI or WebGPU the module still runs, on the CPU.
+
+const TILE = 64;
+
+// ---- WGSL ----------------------------------------------------------------------------------------
+// y[t][n] = sum_k x[t][k] * w[n][k]; one workgroup computes a 64 (n) x 64 (t) tile with 256 threads,
+// each 4x4 outputs; weights are dequantized to f32 in workgroup memory, 32 k per step.
+const WGSL_COMMON = `
+struct P { n_out: u32, n_in: u32, t_pad: u32, pad: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> w: array<u32>;
+@group(0) @binding(2) var<storage, read> s: array<u32>;
+@group(0) @binding(3) var<storage, read> x: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+
+// [k][n] and [k][t], scalar: assigning one component of a workgroup vec4 through a dynamic index
+// is miscompiled by some implementations (only lane 0 lands), so the tiles stay scalar arrays and
+// the inner loop assembles vec4s from four adjacent loads.
+var<workgroup> Ws: array<f32, ${32 * 64}>;
+var<workgroup> Xs: array<f32, ${32 * 64}>;
+
+fn put_w(k: u32, n: u32, v: f32) { Ws[k * 64u + n] = v; }
+fn put_x(k: u32, t: u32, v: f32) { Xs[k * 64u + t] = v; }
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let n0 = wg.x * 64u;
+  let t0 = wg.y * 64u;
+  let tn = li % 16u;
+  let tt = li / 16u;
+  let lr = li / 4u;   // row (n or t) this thread loads
+  let lc = li % 4u;   // which 8 of the 32 k
+  var a0 = vec4<f32>(0.0);
+  var a1 = vec4<f32>(0.0);
+  var a2 = vec4<f32>(0.0);
+  var a3 = vec4<f32>(0.0);
+  for (var k0 = 0u; k0 < p.n_in; k0 += 32u) {
+    load_w(n0 + lr, k0, lr, lc);
+    let xb = (t0 + lr) * p.n_in + k0 + lc * 8u;
+    for (var j = 0u; j < 8u; j++) { put_x(lc * 8u + j, lr, x[xb + j]); }
+    workgroupBarrier();
+    for (var k = 0u; k < 32u; k++) {
+      let wi = k * 64u + tn * 4u;
+      let xi = k * 64u + tt * 4u;
+      let wv = vec4<f32>(Ws[wi], Ws[wi + 1u], Ws[wi + 2u], Ws[wi + 3u]);
+      let xv = vec4<f32>(Xs[xi], Xs[xi + 1u], Xs[xi + 2u], Xs[xi + 3u]);
+      a0 += wv.x * xv;
+      a1 += wv.y * xv;
+      a2 += wv.z * xv;
+      a3 += wv.w * xv;
+    }
+    workgroupBarrier();
+  }
+  let nb = n0 + tn * 4u;
+  let tb = t0 + tt * 4u;
+  for (var j = 0u; j < 4u; j++) {
+    let o = (tb + j) * p.n_out + nb;
+    y[o] = a0[j];
+    y[o + 1u] = a1[j];
+    y[o + 2u] = a2[j];
+    y[o + 3u] = a3[j];
+  }
+}
+`;
+
+const WGSL_LOAD = {
+  // bf16: two per u32, low half first.
+  0: `
+fn load_w(row: u32, k0: u32, lr: u32, lc: u32) {
+  let e = (row * p.n_in + k0 + lc * 8u) / 2u;
+  for (var i = 0u; i < 4u; i++) {
+    let u = w[e + i];
+    put_w(lc * 8u + 2u * i, lr, bitcast<f32>(u << 16u));
+    put_w(lc * 8u + 2u * i + 1u, lr, bitcast<f32>(u & 0xffff0000u));
+  }
+}`,
+  // q8: int8 x4 per u32, one f32 scale per 32.
+  1: `
+fn load_w(row: u32, k0: u32, lr: u32, lc: u32) {
+  let d = bitcast<f32>(s[row * (p.n_in / 32u) + k0 / 32u]);
+  let e = (row * p.n_in + k0 + lc * 8u) / 4u;
+  for (var i = 0u; i < 2u; i++) {
+    let u = w[e + i];
+    put_w(lc * 8u + 4u * i, lr, d * f32(i32(u << 24u) >> 24u));
+    put_w(lc * 8u + 4u * i + 1u, lr, d * f32(i32(u << 16u) >> 24u));
+    put_w(lc * 8u + 4u * i + 2u, lr, d * f32(i32(u << 8u) >> 24u));
+    put_w(lc * 8u + 4u * i + 3u, lr, d * f32(i32(u) >> 24u));
+  }
+}`,
+  // q4_0: a block of 32 is 16 bytes, byte j holds elements j (low nibble) and j+16 (high); f16 scale.
+  2: `
+fn load_w(row: u32, k0: u32, lr: u32, lc: u32) {
+  let b = row * (p.n_in / 32u) + k0 / 32u;
+  let d = unpack2x16float(s[b / 2u])[b % 2u];
+  let u = w[b * 4u + lc];
+  for (var i = 0u; i < 4u; i++) {
+    let byte = (u >> (8u * i)) & 0xffu;
+    put_w(lc * 4u + i, lr, d * (f32(byte & 15u) - 8.0));
+    put_w(16u + lc * 4u + i, lr, d * (f32(byte >> 4u) - 8.0));
+  }
+}`,
+};
+
+// ---- WebGPU host ---------------------------------------------------------------------------------
+
+export class WebGpuHost {
+  constructor(device, adapter) {
+    this.device = device;
+    this.adapter = adapter;
+    this.weights = [];
+    this.pipelines = {};
+    this.xBuf = null;
+    this.yBufs = new Map();   // size -> buffer
+    this.stage = [];          // readback buffers, by job slot
+    this.params = new Map();  // key -> uniform buffer
+    this.bytesUploaded = 0;
+    this.maxBinding = device.limits.maxStorageBufferBindingSize;
+    this.layout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+    this.dummy = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
+  }
+
+  static async create(log = () => {}) {
+    if (typeof navigator === 'undefined' || !navigator.gpu) return null;
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) return null;
+    const want = ['maxStorageBufferBindingSize', 'maxBufferSize', 'maxComputeWorkgroupStorageSize'];
+    const requiredLimits = {};
+    for (const k of want) requiredLimits[k] = adapter.limits[k];
+    const device = await adapter.requestDevice({ requiredLimits });
+    device.lost.then((info) => log(`[webgpu: device lost: ${info.message}]`));
+    const info = adapter.info || {};
+    log(`[webgpu: ${info.description || info.device || info.vendor || 'adapter'}; max binding ${(device.limits.maxStorageBufferBindingSize / 2 ** 30).toFixed(1)} GiB]`);
+    return new WebGpuHost(device, adapter);
+  }
+
+  pipeline(kind) {
+    if (!this.pipelines[kind]) {
+      const module = this.device.createShaderModule({ code: WGSL_LOAD[kind] + WGSL_COMMON });
+      this.pipelines[kind] = this.device.createComputePipeline({
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.layout] }),
+        compute: { module, entryPoint: 'main' },
+      });
+    }
+    return this.pipelines[kind];
+  }
+
+  storage(bytes, extra = 0) {
+    const size = Math.max(16, Math.ceil(bytes.byteLength / 4) * 4);
+    const buf = this.device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | extra });
+    this.device.queue.writeBuffer(buf, 0, bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return buf;
+  }
+
+  /// Returns a handle, or -1 if the matrix cannot live on this device.
+  upload(kind, data, scales, nOut, nIn) {
+    if (data.byteLength > this.maxBinding || (scales && scales.byteLength > this.maxBinding)) return -1;
+    try {
+      const w = this.storage(data);
+      const s = scales ? this.storage(scales) : this.dummy;
+      this.weights.push({ kind, w, s, nOut, nIn });
+      this.bytesUploaded += data.byteLength + (scales ? scales.byteLength : 0);
+      return this.weights.length - 1;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  paramsFor(nOut, nIn, tPad) {
+    const key = `${nOut},${nIn},${tPad}`;
+    let b = this.params.get(key);
+    if (!b) {
+      b = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.device.queue.writeBuffer(b, 0, new Uint32Array([nOut, nIn, tPad, 0]));
+      this.params.set(key, b);
+    }
+    return b;
+  }
+
+  yFor(size, slot) {
+    // One output buffer per slot (jobs in a batch run concurrently), grown as needed.
+    const cur = this.yBufs.get(slot);
+    if (cur && cur.size >= size) return cur;
+    if (cur) cur.destroy();
+    const b = this.device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    this.yBufs.set(slot, b);
+    return b;
+  }
+
+  stageFor(size, slot) {
+    const cur = this.stage[slot];
+    if (cur && cur.size >= size) return cur;
+    if (cur) cur.destroy();
+    const b = this.device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    this.stage[slot] = b;
+    return b;
+  }
+
+  /// x: Float32Array [t][nIn] (copied already); jobs: [{handle, nOut, dst(Float32Array writer)}].
+  /// Resolves when every y has been written through `writeY(slot, Float32Array)`.
+  async matmul(x, t, nIn, jobs, writeY) {
+    const tPad = Math.ceil(t / TILE) * TILE;
+    const xBytes = tPad * nIn * 4;
+    if (!this.xBuf || this.xBuf.size < xBytes) {
+      if (this.xBuf) this.xBuf.destroy();
+      this.xBuf = this.device.createBuffer({ size: xBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    }
+    this.device.queue.writeBuffer(this.xBuf, 0, x.buffer, x.byteOffset, t * nIn * 4);
+    if (tPad > t) this.device.queue.writeBuffer(this.xBuf, t * nIn * 4, new Float32Array((tPad - t) * nIn));
+    const enc = this.device.createCommandEncoder();
+    const outs = [];
+    jobs.forEach((j, slot) => {
+      const wt = this.weights[j.handle];
+      if (!wt || wt.nIn !== nIn || wt.nOut !== j.nOut) throw new Error(`bad job: handle ${j.handle}`);
+      const ySize = tPad * j.nOut * 4;
+      const y = this.yFor(ySize, slot);
+      const st = this.stageFor(t * j.nOut * 4, slot);
+      const bg = this.device.createBindGroup({
+        layout: this.layout,
+        entries: [
+          { binding: 0, resource: { buffer: this.paramsFor(j.nOut, nIn, tPad) } },
+          { binding: 1, resource: { buffer: wt.w } },
+          { binding: 2, resource: { buffer: wt.s } },
+          { binding: 3, resource: { buffer: this.xBuf, size: xBytes } },
+          { binding: 4, resource: { buffer: y, size: ySize } },
+        ],
+      });
+      const pass = enc.beginComputePass();
+      pass.setPipeline(this.pipeline(wt.kind));
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(j.nOut / TILE, tPad / TILE, 1);
+      pass.end();
+      enc.copyBufferToBuffer(y, 0, st, 0, t * j.nOut * 4);
+      outs.push({ st, bytes: t * j.nOut * 4, slot });
+    });
+    this.device.queue.submit([enc.finish()]);
+    await Promise.all(outs.map((o) => o.st.mapAsync(GPUMapMode.READ, 0, o.bytes)));
+    for (const o of outs) {
+      writeY(o.slot, new Float32Array(o.st.getMappedRange(0, o.bytes)));
+      o.st.unmap();
+    }
+  }
+}
+
+// ---- module wrapper ------------------------------------------------------------------------------
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+export const hasJspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
+
+export class Gemmars {
+  /// `source`: the .wasm bytes, a Response, or a URL string. `gpu`: a WebGpuHost, null for CPU only.
+  /// `jspi: false` forces the plain synchronous exports (CPU only), as on engines without JSPI.
+  static async create(source, { gpu = null, log = (s) => console.error(s), jspi = hasJspi } = {}) {
+    const g = new Gemmars();
+    g.log = log;
+    jspi = jspi && hasJspi;
+    g.gpu = jspi ? gpu : null;
+    if (gpu && !jspi) log('[webgpu: no JSPI (WebAssembly.Suspending) on this engine; using CPU]');
+    const env = {
+      host_log: (p, n) => log(g.str(p, n)),
+      host_now_ms: () => performance.now(),
+      host_random: (p, n) => {
+        const v = g.u8(p, n);
+        for (let i = 0; i < n; i += 65536) crypto.getRandomValues(v.subarray(i, Math.min(n, i + 65536)));
+      },
+      gpu_available: () => (g.gpu ? 1 : 0),
+      gpu_upload: (kind, dp, dn, sp, sn, nOut, nIn) => {
+        if (!g.gpu) return -1;
+        return g.gpu.upload(kind, g.u8(dp, dn), sn ? g.u8(sp, sn) : null, nOut, nIn);
+      },
+      gpu_matmul: async (xp, t, nIn, jp, nJobs) => {
+        if (!g.gpu) return 1;
+        try {
+          const x = new Float32Array(g.memory.buffer, xp >>> 0, t * nIn).slice(); // copy: the module may move on
+          const d = new Uint32Array(g.memory.buffer, jp >>> 0, nJobs * 4);
+          const jobs = [];
+          for (let i = 0; i < nJobs; i++) jobs.push({ handle: d[i * 4], nOut: d[i * 4 + 1], y: d[i * 4 + 2] });
+          await g.gpu.matmul(x, t, nIn, jobs, (slot, out) => {
+            // Re-read the memory after suspension: it may have grown.
+            new Float32Array(g.memory.buffer, jobs[slot].y >>> 0, out.length).set(out);
+          });
+          return 0;
+        } catch (e) {
+          log(`[webgpu: ${e.message || e}]`);
+          return 2;
+        }
+      },
+    };
+    if (jspi) env.gpu_matmul = new WebAssembly.Suspending(env.gpu_matmul);
+    let bytes = source;
+    if (typeof source === 'string') source = await fetch(source);
+    if (source instanceof Response) bytes = await source.arrayBuffer();
+    const { instance } = await WebAssembly.instantiate(bytes, { env });
+    g.ex = instance.exports;
+    g.memory = g.ex.memory;
+    // Exports that can reach gpu_matmul must be promising (they return promises then).
+    g.chatTurnRaw = jspi ? WebAssembly.promising(g.ex.web_chat_turn) : async (...a) => g.ex.web_chat_turn(...a);
+    g.nextRaw = jspi ? WebAssembly.promising(g.ex.web_next) : async () => g.ex.web_next();
+    return g;
+  }
+
+  // Pointers cross the boundary as i32; `>>> 0` restores addresses above 2 GiB.
+  u8(p, n) { return new Uint8Array(this.memory.buffer, p >>> 0, n >>> 0); }
+  str(p, n) { return dec.decode(this.u8(p, n)); }
+
+  /// Copies a string into module memory; returns [ptr, len] (free with web_free).
+  strArg(s) {
+    const b = enc.encode(s);
+    const p = this.ex.web_alloc(b.length || 1) >>> 0;
+    this.u8(p, b.length).set(b);
+    return [p, b.length];
+  }
+
+  lastError() {
+    const lenBuf = this.ex.web_alloc(8) >>> 0;
+    const p = this.ex.web_last_error(lenBuf);
+    const n = new Uint32Array(this.memory.buffer, lenBuf, 1)[0];
+    const s = this.str(p, n);
+    this.ex.web_free(lenBuf, 8);
+    return s;
+  }
+
+  /// Registers `bytes` (Uint8Array) as `path` in the module's virtual filesystem.
+  putFile(path, bytes) {
+    const p = this.ex.web_alloc(bytes.byteLength || 1) >>> 0;
+    this.u8(p, bytes.byteLength).set(bytes);
+    const [pp, pn] = this.strArg(path);
+    this.ex.web_put_file(pp, pn, p, bytes.byteLength);
+    this.ex.web_free(pp, pn);
+  }
+
+  /// Allocates a file of `size` bytes and returns a function that receives chunks in order, so a
+  /// download can stream straight into module memory; call `.done()` to register it.
+  putFileStream(path, size) {
+    const p = this.ex.web_alloc(size || 1) >>> 0;
+    let off = 0;
+    const self = this;
+    return {
+      write(chunk) { self.u8(p, size).set(chunk, off); off += chunk.byteLength; },
+      done() {
+        const [pp, pn] = self.strArg(path);
+        self.ex.web_put_file(pp, pn, p, size);
+        self.ex.web_free(pp, pn);
+      },
+    };
+  }
+
+  /// quant: 'bf16' | 'q8' | 'q4'.
+  load(dir, quant = 'q8', { prefillChunk = 0 } = {}) {
+    const q = { bf16: 0, q8: 1, q4: 2 }[quant];
+    const [dp, dn] = this.strArg(dir);
+    const rc = this.ex.web_load(dp, dn, q, this.gpu ? 1 : 0, prefillChunk);
+    this.ex.web_free(dp, dn);
+    if (rc < 0) throw new Error(this.lastError());
+  }
+
+  setSampling({ temperature = 0, topK = 0, topP = 1, seed = 0 } = {}) {
+    this.ex.web_set_sampling(temperature, topK, topP, BigInt(seed));
+  }
+
+  reset() { this.ex.web_reset(); }
+
+  /// Runs the prefill for a user turn; resolves to the number of prompt tokens.
+  async chatTurn(user, { system = null, think = false, maxTokens = 512 } = {}) {
+    const [up, un] = this.strArg(user);
+    const [sp, sn] = system ? this.strArg(system) : [0, 0];
+    const n = await this.chatTurnRaw(up, un, sp, sn, think ? 1 : 0, maxTokens);
+    this.ex.web_free(up, un);
+    if (sn) this.ex.web_free(sp, sn);
+    if (n < 0) throw new Error(this.lastError());
+    return n;
+  }
+
+  /// Next token id, or -1 when the reply is complete.
+  async next() { return await this.nextRaw(); }
+
+  text() {
+    const lenBuf = this.ex.web_alloc(8) >>> 0;
+    const p = this.ex.web_text(lenBuf);
+    const n = new Uint32Array(this.memory.buffer, lenBuf, 1)[0];
+    const s = this.str(p, n);
+    this.ex.web_free(lenBuf, 8);
+    return s;
+  }
+
+  gpuStats() {
+    const lenBuf = this.ex.web_alloc(8) >>> 0;
+    const p = this.ex.web_gpu_stats(lenBuf);
+    const n = new Uint32Array(this.memory.buffer, lenBuf, 1)[0];
+    const s = n ? this.str(p, n) : '';
+    this.ex.web_free(lenBuf, 8);
+    return s;
+  }
+
+  /// Streams a whole reply: calls `onText(fullTextSoFar)` after each token. Returns stats.
+  async generate(user, opts = {}, onText = () => {}) {
+    const t0 = performance.now();
+    const nPrompt = await this.chatTurn(user, opts);
+    const t1 = performance.now();
+    let n = 0;
+    while ((await this.next()) >= 0) {
+      n++;
+      onText(this.text());
+    }
+    const t2 = performance.now();
+    return { promptTokens: nPrompt, prefillSecs: (t1 - t0) / 1e3, tokens: n, decodeSecs: (t2 - t1) / 1e3, text: this.text() };
+  }
+}
+
+/// Model files to register for a directory listing: config, tokenizer, generation config, shards.
+export function wantedFiles(names) {
+  return names.filter((n) => n === 'config.json' || n === 'generation_config.json' || n === 'tokenizer.json' || n === 'tokenizer_config.json' || n === 'model.safetensors.index.json' || n.endsWith('.safetensors'));
+}

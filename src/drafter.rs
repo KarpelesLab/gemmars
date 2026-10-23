@@ -45,7 +45,7 @@ pub struct Drafter<'a> {
 
 impl<'a> Drafter<'a> {
     pub fn load(dir: &Path, files: &'a ModelFiles) -> Result<Self> {
-        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+        let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
         let backbone_hidden = raw["backbone_hidden_size"].as_u64().context("backbone_hidden_size")? as usize;
         let num_centroids = raw["num_centroids"].as_u64().unwrap_or(2048) as usize;
         let top_k_centroids = raw["centroid_intermediate_top_k"].as_u64().unwrap_or(32) as usize;

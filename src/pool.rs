@@ -8,7 +8,8 @@
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Arc;
 use std::thread::{self, Thread};
-use std::time::{Duration, Instant};
+use crate::clock::Instant;
+use std::time::Duration;
 
 type JobFn<'a> = &'a (dyn Fn(usize) + Sync);
 

@@ -88,9 +88,7 @@ pub struct RopeSpec {
 impl TextConfig {
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("config.json");
-        let raw: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
-        )?;
+        let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&path)?)?;
         let text = raw.get("text_config").cloned().unwrap_or(raw);
         let mut cfg: TextConfig = serde_json::from_value(text).context("parse text config")?;
         cfg.finalize()?;
@@ -208,7 +206,7 @@ impl TextConfig {
 /// Stop tokens from `generation_config.json` (falls back to `<eos>` and `<turn|>`).
 pub fn load_eos_ids(dir: &Path) -> Vec<u32> {
     let path = dir.join("generation_config.json");
-    if let Ok(b) = std::fs::read(&path) {
+    if let Ok(b) = crate::fsx::read(&path) {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
             match &v["eos_token_id"] {
                 serde_json::Value::Number(n) => return vec![n.as_u64().unwrap() as u32],
@@ -224,7 +222,7 @@ pub fn load_eos_ids(dir: &Path) -> Vec<u32> {
 
 /// `model_type` from the root of config.json (e.g. "gemma4", "qwen3_5").
 pub fn model_type(dir: &Path) -> Result<String> {
-    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+    let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
     raw.get("model_type")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -295,7 +293,7 @@ pub struct QwenConfig {
 
 impl QwenConfig {
     pub fn load(dir: &Path) -> Result<Self> {
-        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+        let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
         let text = raw.get("text_config").cloned().unwrap_or(raw);
         let mut cfg: QwenConfig = serde_json::from_value(text).context("parse qwen text config")?;
         if cfg.layer_types.is_none() {

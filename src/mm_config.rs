@@ -151,7 +151,7 @@ pub struct MmConfig {
 impl MmConfig {
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("config.json");
-        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&path)?)?;
         let id = |k: &str, default: u32| raw.get(k).and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(default);
         let vision = match raw.get("vision_config") {
             Some(v) if !v.is_null() => Some(serde_json::from_value(v.clone()).context("vision_config")?),

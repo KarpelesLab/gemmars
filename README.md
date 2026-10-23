@@ -199,6 +199,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 | Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |
 | Vulkan | detection only (device name and memory) | no compute yet |
 | wasm32 (WASI) | simd128 kernels (bf16, Q8, Q4), threads via wasi-threads | measured: Qwen3.5-0.8B Q8 at 123 tok/s decode with 16 threads under wasmtime 30, identical output to native; see below |
+| Browser (Chrome 137+) | simd128 kernels + WebGPU GEMM for prefill (WGSL, via JSPI) | measured in headless Chrome 155: Qwen3.5-0.8B Q8 prefill 34 -> 231 tok/s, identical output; Firefox/Safari run the CPU path (no JSPI) |
 
 What the GPU does and does not do: every backend only takes prefill-sized matmuls (`t >= 16`
 tokens and enough FLOPs to amortize the ~0.15 ms it costs to submit and wait for a Metal command
@@ -236,8 +237,44 @@ Qwen3.5-0.8B Q8, 18-core M5 Max, 17-token prompt:
 
 Memory is 32-bit, so a model plus its quantized copy must fit in 4 GiB (`--quant q4` on a 2B
 model is fine; the 27B models are not). No file mapping exists in WASI, so the checkpoint is
-always read into memory. There is no WebGPU backend yet; a browser build would also need JS glue
-for fetching the weights, which is not part of this repository.
+always read into memory.
+
+### Browser (WebGPU)
+
+`web/` is a second crate (`gemmars-web`, `cdylib`) that wraps the library in a plain C-ABI wasm
+module, no bindgen, plus the JavaScript host `web/gemmars.js` and a page `web/index.html`. The
+host registers the model files in the module's in-memory filesystem (streamed straight from
+`fetch` or a local folder into module memory) and drives a chat session token by token.
+
+GPU work goes the other way round: the module imports `gpu_upload` / `gpu_matmul`, which the
+host implements with WebGPU (WGSL GEMM, 64x64 tile per workgroup, weights dequantized to f32 in
+workgroup memory; ~3.9 TFLOP/s at 4096^3 on the M5 Max, ~0.7 ms per round trip). The module's
+matmul call is synchronous while the buffer readback is asynchronous, so `gpu_matmul` is wrapped
+in `WebAssembly.Suspending` and the generating exports in `WebAssembly.promising` (JavaScript
+Promise Integration, Chrome 137+). Without JSPI or WebGPU the same page runs on the CPU.
+WebGL is not used: it has no compute shaders.
+
+```sh
+cd web && cargo build --release --target wasm32-unknown-unknown     # web/target/.../gemmars_web.wasm
+deno run --allow-net --allow-read web/serve.ts ~/.cache/gemmars/hub   # http://localhost:8080/, models at /models/<dir>
+# or from Deno directly (Deno has WebGPU, but its readback polls every ~14 ms, so --cpu is as fast there):
+deno run --allow-read --allow-env web/run.mjs --model ~/.cache/gemmars/hub/Qwen--Qwen3.5-0.8B --quant q8 -p "Hello"
+```
+
+Headless Chrome 155, Qwen3.5-0.8B Q8, 123-token prompt, single CPU thread (the browser build has
+no threads):
+
+| | Prefill | Decode |
+|---|---|---|
+| CPU (simd128) | 34 tok/s | 36 tok/s |
+| WebGPU prefill, first turn (includes the weight upload) | 165 tok/s | 38 tok/s |
+| WebGPU prefill, steady state | 231 tok/s | 38 tok/s |
+
+Limits: 4 GiB of wasm memory means the bf16 checkpoint plus its quantized copy must fit, so today
+only models up to ~2 GB of bf16 weights load in the browser (Qwen3.5-0.8B; the Gemma E2B/E4B
+checkpoints are 10-16 GB). A pre-quantized checkpoint format, loaded zero-copy, would lift that to
+E4B at Q4 (2.6 GB) and is the next step. Decode stays on the CPU for the same reasons as on Metal.
+`web/test_gemm.mjs` checks the WGSL kernels against a JavaScript reference.
 
 Feature flags: `media` (oxideav image/audio decoding), `hf` (HuggingFace fetching), `gpu`
 (dlsym-loaded backends); all on by default, `--no-default-features` gives the plain CPU build.
@@ -250,6 +287,9 @@ Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex bac
 - `platform.rs`: CPU feature and GPU detection (sysctl / procfs for memory, Metal via `objc_msgSend`,
   CUDA driver API, Vulkan loader), all through `dlsym`; `gpu.rs`: the `Backend` trait the linear layers
   dispatch through and the registry; `metal.rs`, `cuda.rs`: the backends with their shader sources.
+- `fsx.rs`, `clock.rs`: file access and monotonic time behind one interface, so the loaders run on a
+  real filesystem or on the browser's in-memory table; `web/`: the browser crate (C-ABI exports,
+  WebGPU backend calling back into the host) with the JavaScript host and page.
 - `kernels.rs`: NEON kernels (`kernels_x86.rs`, `kernels_wasm.rs`: the AVX2 and simd128 equivalents, selected by `build.rs` through the `has_simd` cfg). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
   prefers few long streams); prefill packs activations into 8-token panels and runs an 8-row x 8-token
   outer-product kernel that broadcasts bf16 weights by lane. Also RMSNorm, GELU (tanh approximation via

@@ -8,6 +8,8 @@ pub mod config;
 pub mod cuda;
 pub mod drafter;
 pub mod gpu;
+pub mod fsx;
+pub mod clock;
 #[cfg(feature = "hf")]
 pub mod hf;
 pub mod kernels;

@@ -31,6 +31,12 @@ impl<T: Copy> PageVec<T> {
     pub fn alloc_bytes(&self) -> usize {
         self.bytes
     }
+    /// Rebuilds a `PageVec` from a pointer obtained by forgetting one created with `zeroed(len)`
+    /// (same `len`).
+    pub unsafe fn from_raw(ptr: *mut T, len: usize) -> Self {
+        let bytes = (len * std::mem::size_of::<T>()).div_ceil(PAGE).max(1) * PAGE;
+        Self { ptr, len, bytes }
+    }
 }
 impl<T: Copy> Drop for PageVec<T> {
     fn drop(&mut self) {

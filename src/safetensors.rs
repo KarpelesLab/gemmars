@@ -6,6 +6,7 @@ use memmap2::Mmap;
 use crate::pool;
 use crate::quant::PageVec;
 use std::collections::HashMap;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -49,7 +50,8 @@ pub struct SafeTensors {
 
 /// Reads a whole file into memory using parallel positional reads (sequential where the
 /// platform has no positional read).
-fn read_file_parallel(file: &File, len: usize) -> Result<PageVec<u64>> {
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) fn read_file_parallel(file: &File, len: usize) -> Result<PageVec<u64>> {
     let mut buf = PageVec::<u64>::zeroed(len.div_ceil(8));
     let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, len) };
     #[cfg(unix)]
@@ -100,19 +102,19 @@ impl SendBytes {
 
 impl SafeTensors {
     pub fn open(path: &Path, in_memory: bool) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         #[cfg(not(target_arch = "wasm32"))]
         let mmap = if in_memory {
-            let len = file.metadata()?.len() as usize;
-            Storage::Heap(read_file_parallel(&file, len)?, len)
+            let (v, len) = crate::fsx::read_pages(path)?;
+            Storage::Heap(v, len)
         } else {
+            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
             Storage::Mmap(unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?)
         };
         #[cfg(target_arch = "wasm32")]
         let mmap = {
             let _ = in_memory;
-            let len = file.metadata()?.len() as usize;
-            Storage::Heap(read_file_parallel(&file, len)?, len)
+            let (v, len) = crate::fsx::read_pages(path)?;
+            Storage::Heap(v, len)
         };
         if mmap.len() < 8 {
             bail!("{}: file too small", path.display());
@@ -209,10 +211,10 @@ impl ModelFiles {
         let single = dir.join("model.safetensors");
         let idx = dir.join("model.safetensors.index.json");
         let mut files: Vec<PathBuf> = Vec::new();
-        if single.exists() {
+        if crate::fsx::exists(&single) {
             files.push(single);
-        } else if idx.exists() {
-            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&idx)?)?;
+        } else if crate::fsx::exists(&idx) {
+            let v: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&idx)?)?;
             let map = v["weight_map"].as_object().context("weight_map")?;
             let mut names: Vec<String> = map.values().map(|x| x.as_str().unwrap().to_string()).collect();
             names.sort();

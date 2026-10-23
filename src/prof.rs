@@ -1,7 +1,7 @@
 //! Lightweight always-on profiler: accumulated wall time per category.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use crate::clock::Instant;
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
