@@ -1,25 +1,12 @@
-mod chat;
-mod config;
-mod audio;
-mod drafter;
-mod hf;
-mod kernels;
-mod media;
-mod mm_config;
-mod model;
-mod pool;
-mod prof;
-mod quant;
-mod qwen;
-mod safetensors;
-mod sampler;
-mod vision;
-
+use gemmars::chat::{self, ChatFormat};
+use gemmars::model::{Model, Quant, Session};
+use gemmars::sampler::{argmax, Sampler};
+use gemmars::{audio, config, drafter, mm_config, platform, pool, prof, qwen, safetensors, vision};
+#[cfg(feature = "hf")]
+use gemmars::hf;
+#[cfg(feature = "media")]
+use gemmars::media;
 use anyhow::{bail, Context, Result};
-use chat::ChatFormat;
-use model::{Model, Quant, Session};
-use sampler::argmax;
-use sampler::Sampler;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -44,7 +31,7 @@ struct Args {
     profile: bool,
     dump_logits: Option<PathBuf>,
     show_tokens: bool,
-    prefill_chunk: usize,
+    prefill_chunk: Option<usize>,
     draft: Option<PathBuf>,
     draft_tokens: usize,
     images: Vec<PathBuf>,
@@ -53,6 +40,8 @@ struct Args {
     max_soft_tokens: usize,
     cache_dir: Option<PathBuf>,
     download_only: bool,
+    device: platform::DevicePref,
+    devices: bool,
 }
 
 fn usage() -> ! {
@@ -78,7 +67,7 @@ fn usage() -> ! {
          \x20 --quant bf16|q8|q4   weight precision for streamed matmuls (default bf16)\n\
          \x20 --preload            with --mmap, touch all weight pages before starting\n\
          \x20 --profile            print per-operation timing breakdown\n\
-         \x20 --prefill-chunk N    tokens per prefill chunk (default 256)\n\
+         \x20 --prefill-chunk N    tokens per prefill chunk (default 256 on CPU, 1024 with a GPU backend)\n\
          \x20 --draft DIR          speculative decoding with a Gemma 4 assistant (drafter) model; greedy only\n\
          \x20 --draft-tokens N     max draft tokens per round (default 6; adaptive from 3)\n\
          \x20 --image FILE         attach an image (repeatable; PNG/JPEG/WebP/GIF/BMP via oxideav)\n\
@@ -87,6 +76,8 @@ fn usage() -> ! {
          \x20 --dump-mm PREFIX     write multimodal soft tokens / patches as f32 files (for reference checks)\n\
          \x20 --cache-dir DIR      where fetched models are cached\n\
          \x20 --download-only      fetch the model (and drafter) and exit\n\
+         \x20 --devices            list detected CPU features and GPUs, then exit\n\
+         \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
          \x20 --show-tokens        print token ids"
     );
@@ -113,7 +104,7 @@ fn parse_args() -> Result<Args> {
         profile: false,
         dump_logits: None,
         show_tokens: false,
-        prefill_chunk: 256,
+        prefill_chunk: None,
         draft: None,
         draft_tokens: 6,
         images: Vec::new(),
@@ -122,6 +113,8 @@ fn parse_args() -> Result<Args> {
         max_soft_tokens: 0,
         cache_dir: None,
         download_only: false,
+        device: platform::DevicePref::Auto,
+        devices: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -150,7 +143,7 @@ fn parse_args() -> Result<Args> {
                 }
             }
             "--profile" => a.profile = true,
-            "--prefill-chunk" => a.prefill_chunk = val()?.parse()?,
+            "--prefill-chunk" => a.prefill_chunk = Some(val()?.parse()?),
             "--draft" => a.draft = Some(PathBuf::from(val()?)),
             "--draft-tokens" => a.draft_tokens = val()?.parse()?,
             "--image" => a.images.push(PathBuf::from(val()?)),
@@ -159,6 +152,11 @@ fn parse_args() -> Result<Args> {
             "--max-soft-tokens" => a.max_soft_tokens = val()?.parse()?,
             "--cache-dir" => a.cache_dir = Some(PathBuf::from(val()?)),
             "--download-only" => a.download_only = true,
+            "--devices" => a.devices = true,
+            "--device" => {
+                let v = val()?;
+                a.device = platform::DevicePref::parse(&v).with_context(|| format!("unknown device {v} (auto|cpu|cuda|metal|vulkan)"))?;
+            }
             "--dump-logits" => a.dump_logits = Some(PathBuf::from(val()?)),
             "--show-tokens" => a.show_tokens = true,
             "-h" | "--help" => usage(),
@@ -168,7 +166,7 @@ fn parse_args() -> Result<Args> {
             }
         }
     }
-    if a.model.as_os_str().is_empty() {
+    if a.model.as_os_str().is_empty() && !a.devices {
         usage();
     }
     Ok(a)
@@ -187,6 +185,12 @@ struct MmFeature {
 
 /// Decodes and encodes all attachments. Returns the placeholder text to prepend to the user
 /// message and the features in the same order.
+#[cfg(not(feature = "media"))]
+fn prepare_multimodal(_args: &Args, _files: &safetensors::ModelFiles, _text_hidden: usize) -> Result<(String, Vec<MmFeature>)> {
+    bail!("built without the `media` feature: image and audio inputs are unavailable")
+}
+
+#[cfg(feature = "media")]
 fn prepare_multimodal(args: &Args, files: &safetensors::ModelFiles, text_hidden: usize) -> Result<(String, Vec<MmFeature>)> {
     let mmc = mm_config::MmConfig::load(&args.model)?;
     let media = media::Media::new();
@@ -574,14 +578,32 @@ fn report(prefill_tokens: usize, prefill_secs: f64, decode_tokens: usize, decode
     );
 }
 
+/// Resolves a model spec to a directory: a local path, or (with the `hf` feature) a repo id.
+fn resolve_model(spec: &str, cache_dir: Option<&std::path::Path>) -> Result<PathBuf> {
+    #[cfg(feature = "hf")]
+    {
+        hf::resolve(spec, cache_dir)
+    }
+    #[cfg(not(feature = "hf"))]
+    {
+        let _ = cache_dir;
+        let p = PathBuf::from(spec);
+        if p.is_dir() { Ok(p) } else { bail!("{spec}: not a directory (built without the `hf` feature, so repo ids cannot be fetched)") }
+    }
+}
+
 fn main() -> Result<()> {
     let mut args = parse_args()?;
+    if args.devices {
+        print!("{}", platform::detect().report());
+        return Ok(());
+    }
     // Resolve repo ids to cached local directories.
     let spec = args.model.to_string_lossy().to_string();
-    args.model = hf::resolve(&spec, args.cache_dir.as_deref())?;
+    args.model = resolve_model(&spec, args.cache_dir.as_deref())?;
     if let Some(d) = &args.draft {
         let spec = d.to_string_lossy().to_string();
-        args.draft = Some(hf::resolve(&spec, args.cache_dir.as_deref())?);
+        args.draft = Some(resolve_model(&spec, args.cache_dir.as_deref())?);
     }
     if args.download_only {
         eprintln!("[model at {}]", args.model.display());
@@ -592,7 +614,17 @@ fn main() -> Result<()> {
     run(args)
 }
 
-fn run(args: Args) -> Result<()> {
+fn run(mut args: Args) -> Result<()> {
+    let plat = platform::detect();
+    eprintln!("[platform: {}]", plat.summary());
+    let gpu = gemmars::gpu::init(&plat, args.device);
+    match gpu {
+        Some(b) => eprintln!("[device: {} (prefill matmuls on the GPU, everything else on the CPU)]", b.name()),
+        None => eprintln!("[device: cpu]"),
+    }
+    // Bigger prefill chunks keep the GPU busier (577 vs 431 tok/s on E4B q4 at 1024 vs 256);
+    // on the CPU 256 keeps the activations in cache.
+    args.prefill_chunk = Some(args.prefill_chunk.unwrap_or(if gpu.is_some() { 1024 } else { 256 }));
     let model_type = config::model_type(&args.model)?;
     match model_type.as_str() {
         "gemma4" | "gemma4_text" => run_gemma(args),
@@ -636,7 +668,7 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
                 eprintln!("[prompt ids: {ids:?}]");
             }
             let t = Instant::now();
-            let hs = prefill_mm(model, &mut sess, &ids, args.prefill_chunk, &[]);
+            let hs = prefill_mm(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &[]);
             let logits = model.logits(&hs[hs.len() - h..], 1);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
@@ -674,7 +706,7 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
         bail!("empty prompt");
     }
     let t = Instant::now();
-    let hs = prefill_mm(model, &mut sess, &ids, args.prefill_chunk, &[]);
+    let hs = prefill_mm(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &[]);
     let logits = model.logits(&hs[hs.len() - h..], 1);
     let prefill_secs = t.elapsed().as_secs_f64();
     if args.profile {
@@ -818,7 +850,7 @@ fn run_gemma(args: Args) -> Result<()> {
             }
             let t = Instant::now();
             if let Some(dr) = &drafter {
-                let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk, &overrides);
+                let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
                 let h = model.cfg.hidden_size;
                 let hidden_last = hs[hs.len() - h..].to_vec();
                 let prefill_secs = t.elapsed().as_secs_f64();
@@ -831,7 +863,7 @@ fn run_gemma(args: Args) -> Result<()> {
                 eprintln!("[speculative: {:.2} tok/forward, drafts accepted {}%]", out.len() as f64 / st.forwards.max(1) as f64, 100 * st.accepted / st.drafted.max(1));
                 continue;
             }
-            let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk, &overrides);
+            let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
             let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
@@ -879,7 +911,7 @@ fn run_gemma(args: Args) -> Result<()> {
 
     if let Some(dr) = &drafter {
         let t = Instant::now();
-        let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk, &overrides);
+        let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
         let h = model.cfg.hidden_size;
         let hidden_last = hs[hs.len() - h..].to_vec();
         let prefill_secs = t.elapsed().as_secs_f64();
@@ -908,7 +940,7 @@ fn run_gemma(args: Args) -> Result<()> {
     }
 
     let t = Instant::now();
-    let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk, &overrides);
+    let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
     let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
     let prefill_secs = t.elapsed().as_secs_f64();
     if args.profile {

@@ -50,6 +50,9 @@ pub fn reset() {
 
 pub fn report(total_secs: f64, tokens: usize) {
     eprintln!("[profile over {tokens} forward tokens, {:.1} ms/token]", total_secs * 1e3 / tokens.max(1) as f64);
+    if let Some(s) = crate::gpu::active().and_then(|b| b.stats()) {
+        eprintln!("  gpu: {s}");
+    }
     let mut acc = 0f64;
     for i in 0..NAMES.len() {
         let s = NANOS[i].load(Ordering::Relaxed) as f64 * 1e-9;

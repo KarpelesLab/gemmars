@@ -3,19 +3,45 @@ name = "gemmars"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "gemmars"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gemmars"
+path = "src/main.rs"
+
+[[bin]]
+name = "membench"
+path = "src/bin/membench.rs"
+
+[features]
+default = ["media", "hf", "gpu"]
+# Image / audio file decoding through oxideav.
+media = ["dep:oxideav-core", "dep:oxideav-pipeline", "dep:oxideav-meta", "dep:oxideav-image"]
+# Fetching models from HuggingFace through rsurl.
+hf = ["dep:rsurl"]
+# Runtime-loaded GPU backends (CUDA, Metal, Vulkan detection); all optional at run time.
+gpu = ["dep:dlsym"]
+
 [dependencies]
-oxideav-core = "0.1"
-oxideav-pipeline = "0.1"
-oxideav-meta = { version = "0.0.3", default-features = false, features = ["png", "mjpeg", "webp", "gif", "bmp", "basic", "mp3", "flac", "aac", "mp4", "mov", "ogg", "vorbis", "opus", "mkv", "riff"] }
-oxideav-image = "0.0.5"
+oxideav-core = { version = "0.1", optional = true }
+oxideav-pipeline = { version = "0.1", optional = true }
+oxideav-meta = { version = "0.0.3", default-features = false, features = ["png", "mjpeg", "webp", "gif", "bmp", "basic", "mp3", "flac", "aac", "mp4", "mov", "ogg", "vorbis", "opus", "mkv", "riff"], optional = true }
+oxideav-image = { version = "0.0.5", optional = true }
 anyhow = "1.0.104"
 half = "2.7.1"
-memmap2 = "0.9.11"
-rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
-rsurl = { version = "0.1.20", default-features = false, features = ["purecrypto-tls", "idn"] }
+rsurl = { version = "0.1.20", default-features = false, features = ["purecrypto-tls", "idn"], optional = true }
+dlsym = { version = "0.0.2", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9.11"
+tokenizers = { version = "0.23.2", default-features = false, features = ["unstable_wasm"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokenizers = { version = "0.23.2", default-features = false, features = ["unstable_wasm"] }
 
 [profile.release]
 opt-level = 3

@@ -107,6 +107,9 @@ Useful flags:
 | `--draft DIR` | speculative decoding with Google's `gemma-4-E4B-it-assistant` drafter (greedy only; output identical to plain greedy) |
 | `--draft-tokens N` | max draft tokens per round (default 6; the length adapts between 2 and N) |
 | `--mmap` | map weights from disk instead of copying them into RAM |
+| `--devices` | list detected CPU features and GPUs (Metal, CUDA, Vulkan) and exit |
+| `--device D` | `auto` (default: use a GPU backend when one exists), `cpu`, `metal`, `cuda`, `vulkan` |
+| `--prefill-chunk N` | tokens per prefill chunk (default 256 on the CPU, 1024 when a GPU backend is active) |
 | `--profile` | per-operation timing and bandwidth breakdown |
 | `--dump-logits FILE` | write the logits for the last prompt token (for reference checks) |
 | `--show-tokens` | print token ids |
@@ -135,6 +138,15 @@ On an M5 Max (18 cores, ~280 GB/s measured CPU read bandwidth):
 For the 27B model `--mmap` is recommended: quantization then reads the checkpoint straight from
 the page cache (about 3 s to quantize 27.8B parameters on 18 threads) instead of copying 55 GB
 into the process first.
+
+With the Metal backend (default on Apple Silicon) prefill runs on the GPU:
+
+| Model | Precision | Prefill, CPU only | Prefill, Metal |
+|---|---|---|---|
+| E4B-it | `--quant q4` | ~97 tok/s | ~580 tok/s |
+| Qwen3.8-27B | `--quant q4` | ~18 tok/s | ~96 tok/s (256-token chunks) |
+
+(616-token prompt; decode speed is unchanged, see below for why.)
 
 The matmul kernels reach the machine's bandwidth ceiling with 12 threads
 (`cargo run --release --bin membench` prints the raw numbers for your machine), so decode
@@ -165,11 +177,50 @@ the transformers implementation token for token. It pays off most where the veri
 is bandwidth-bound (bf16, Q8); at Q4 the multi-token int8 kernels are instruction-bound, so it
 only helps on predictable text.
 
+## Platforms and accelerators
+
+The CPU path is the reference and works everywhere; everything else is detected at run time and
+loaded with [`dlsym`](https://crates.io/crates/dlsym), so one binary runs with or without the
+libraries present and nothing GPU-related is needed at build time. `--devices` prints what was found:
+
+```
+CPU: aarch64 on macos, 18 logical cores
+  features: neon dotprod i8mm bf16 fp16
+  memory: 137.4 GB
+GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
+```
+
+| Platform | Compute | Status |
+|---|---|---|
+| Apple Silicon (macOS, iOS) | NEON kernels + Metal GEMM for prefill | measured, bit-identical logits to the CPU path |
+| x86-64 (Linux, Windows, macOS) | AVX2 + FMA kernels (bf16, Q8 via `maddubs`, Q4), scalar fallback below AVX2 | compiles for all three; the kernel tests pass on the scalar fallback under Rosetta (which exposes no AVX), so the AVX2 kernels themselves are not yet executed anywhere |
+| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled GEMM (`cuda.rs`) | compile-checked only, not yet run on NVIDIA hardware |
+| Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |
+| Vulkan | detection only (device name and memory) | no compute yet |
+| wasm32 | scalar kernels, single-threaded pool | `cargo check --target wasm32-wasip1 --no-default-features` |
+
+What the GPU does and does not do: every backend only takes prefill-sized matmuls (`t >= 16`
+tokens and enough FLOPs to amortize the ~0.15 ms it costs to submit and wait for a Metal command
+buffer). Weights are not copied on Apple Silicon: quantized matrices and the safetensors blob
+live in page-aligned memory and are wrapped as shared `MTLBuffer`s. The Metal GEMM (64x64 tile per
+threadgroup, `simdgroup_float8x8`, weights dequantized to f32 in threadgroup memory) runs at
+~10 TFLOP/s for bf16 and ~7.5 for Q4, against ~1.3 TFLOP/s for the NEON GEMM. Decode stays on
+the CPU on purpose: it is bandwidth-bound, the CPU already streams weights at ~280 GB/s, and the
+GPU's ~450 GB/s only pays off if the entire forward pass moves over (attention, norms, the KV
+cache), which is the next step if decode speed on the GPU is wanted.
+
+Feature flags: `media` (oxideav image/audio decoding), `hf` (HuggingFace fetching), `gpu`
+(dlsym-loaded backends); all on by default, `--no-default-features` gives the plain CPU build.
+Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex backend.
+
 ## How it works
 
 - `safetensors.rs`: parses the header, exposes bf16 tensors as `&[u16]` (single file or sharded).
 - `config.rs`: reads `config.json` and derives per-layer facts (sliding vs global, head dims, KV sharing source, k=v).
-- `kernels.rs`: NEON kernels. Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
+- `platform.rs`: CPU feature and GPU detection (sysctl / procfs for memory, Metal via `objc_msgSend`,
+  CUDA driver API, Vulkan loader), all through `dlsym`; `gpu.rs`: the `Backend` trait the linear layers
+  dispatch through and the registry; `metal.rs`, `cuda.rs`: the backends with their shader sources.
+- `kernels.rs`: NEON kernels (`kernels_x86.rs`: the AVX2 equivalents). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
   prefers few long streams); prefill packs activations into 8-token panels and runs an 8-row x 8-token
   outer-product kernel that broadcasts bf16 weights by lane. Also RMSNorm, GELU (tanh approximation via
   a fast exp), RoPE tables, softmax.

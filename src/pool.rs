@@ -112,6 +112,8 @@ impl Pool {
     /// A pool using `threads` threads in total (the caller counts as one).
     pub fn new(threads: usize) -> Self {
         raise_qos();
+        // Without OS threads (wasm32 outside wasi-threads) everything runs inline.
+        let threads = if cfg!(target_arch = "wasm32") && !cfg!(target_feature = "atomics") { 1 } else { threads };
         let workers = threads.max(1) - 1;
         let shared = Arc::new(Shared {
             generation: AtomicU64::new(0),

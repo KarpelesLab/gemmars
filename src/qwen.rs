@@ -92,9 +92,9 @@ impl<'a> QwenModel<'a> {
         let lin = |full: &str, n_out: usize, n_in: usize| -> Result<Lin<'a>> {
             let w = get(full, &[n_out, n_in])?;
             Ok(match quant {
-                Quant::Bf16 => Lin::Bf16(w),
-                Quant::Q8 => Lin::Q8(quantize_bf16(w, n_out, n_in)),
-                Quant::Q4 => Lin::Q4(quantize_q4(w, n_out, n_in)),
+                Quant::Bf16 => Lin::bf16(w),
+                Quant::Q8 => Lin::q8(quantize_bf16(w, n_out, n_in)),
+                Quant::Q4 => Lin::q4(quantize_q4(w, n_out, n_in)),
             })
         };
 

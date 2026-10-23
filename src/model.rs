@@ -17,20 +17,46 @@ pub enum Quant {
     Q4,
 }
 
-/// A linear layer's weight `[n_out, n_in]`, either borrowed bf16 or quantized int8.
-pub enum Lin<'a> {
+/// A linear layer's weight `[n_out, n_in]`: borrowed bf16 or quantized, plus lazily created
+/// device-side state when an accelerator backend is active.
+pub struct Lin<'a> {
+    pub w: Weight<'a>,
+    dev: std::sync::OnceLock<Option<crate::gpu::DeviceWeight>>,
+}
+
+pub enum Weight<'a> {
     Bf16(&'a [u16]),
     Q8(QMatrix),
     Q4(Q4Matrix),
 }
 
-impl Lin<'_> {
+impl<'a> Lin<'a> {
+    pub fn bf16(w: &'a [u16]) -> Self {
+        Self { w: Weight::Bf16(w), dev: std::sync::OnceLock::new() }
+    }
+    pub fn q8(m: QMatrix) -> Self {
+        Self { w: Weight::Q8(m), dev: std::sync::OnceLock::new() }
+    }
+    pub fn q4(m: Q4Matrix) -> Self {
+        Self { w: Weight::Q4(m), dev: std::sync::OnceLock::new() }
+    }
     pub fn bytes(&self) -> usize {
-        match self {
-            Lin::Bf16(w) => w.len() * 2,
-            Lin::Q8(m) => m.bytes(),
-            Lin::Q4(m) => m.bytes(),
+        self.as_ref().bytes()
+    }
+    pub fn as_ref(&self) -> crate::gpu::WeightRef<'_> {
+        match &self.w {
+            Weight::Bf16(w) => crate::gpu::WeightRef::Bf16(w),
+            Weight::Q8(m) => crate::gpu::WeightRef::Q8(m),
+            Weight::Q4(m) => crate::gpu::WeightRef::Q4(m),
         }
+    }
+    /// Device-side state for this layer if the active accelerator wants the op at this size.
+    fn device_state(&self, n_out: usize, n_in: usize, t: usize) -> Option<&crate::gpu::DeviceWeight> {
+        let be = crate::gpu::active()?;
+        if !be.wants(n_out, n_in, t) {
+            return None;
+        }
+        self.dev.get_or_init(|| be.upload(&self.as_ref(), n_out, n_in)).as_ref()
     }
 }
 
@@ -39,20 +65,47 @@ pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, 
     if jobs.is_empty() {
         return;
     }
-    if jobs.iter().all(|(l, _, _)| matches!(l, Lin::Bf16(_))) {
+    // Accelerator first (one submission for the whole batch); whatever it declines runs on the CPU.
+    let mut rest: Vec<(&Lin, usize, &mut [f32])> = Vec::with_capacity(jobs.len());
+    let be = crate::gpu::active();
+    let mut gpu: Vec<crate::gpu::Job> = Vec::with_capacity(jobs.len());
+    let mut gpu_meta: Vec<(&Lin, usize)> = Vec::with_capacity(jobs.len());
+    for (l, n, y) in jobs.iter_mut() {
+        match be.and_then(|_| l.device_state(*n, n_in, t)) {
+            Some(dev) => {
+                gpu.push(crate::gpu::Job { w: l.as_ref(), dev, n_out: *n, y: &mut **y });
+                gpu_meta.push((l, *n));
+            }
+            None => rest.push((l, *n, &mut **y)),
+        }
+    }
+    if !gpu.is_empty() {
+        let _timer = prof::start(Cat::Matmul);
+        if !be.unwrap().matmul(x, t, n_in, &mut gpu) {
+            // Backend failed at run time: run these on the CPU too.
+            for (job, (l, n)) in gpu.into_iter().zip(gpu_meta) {
+                rest.push((l, n, job.y));
+            }
+        }
+    }
+    if rest.is_empty() {
+        return;
+    }
+    let jobs = &mut rest[..];
+    if jobs.iter().all(|(l, _, _)| matches!(l.w, Weight::Bf16(_))) {
         let mut v: Vec<(&[u16], usize, &mut [f32])> = jobs
             .iter_mut()
-            .map(|(l, n, y)| match l {
-                Lin::Bf16(w) => (*w, *n, &mut **y),
+            .map(|(l, n, y)| match &l.w {
+                Weight::Bf16(w) => (*w, *n, &mut **y),
                 _ => unreachable!(),
             })
             .collect();
         matmul_multi(&mut v, n_in, x, t);
-    } else if jobs.iter().all(|(l, _, _)| matches!(l, Lin::Q8(_))) {
+    } else if jobs.iter().all(|(l, _, _)| matches!(l.w, Weight::Q8(_))) {
         let mut v: Vec<(&QMatrix, &mut [f32])> = jobs
             .iter_mut()
-            .map(|(l, n, y)| match l {
-                Lin::Q8(m) => {
+            .map(|(l, n, y)| match &l.w {
+                Weight::Q8(m) => {
                     debug_assert_eq!(m.n_out, *n);
                     (m, &mut **y)
                 }
@@ -60,11 +113,11 @@ pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, 
             })
             .collect();
         matmul_quant_multi(&mut v, x, t);
-    } else if jobs.iter().all(|(l, _, _)| matches!(l, Lin::Q4(_))) {
+    } else if jobs.iter().all(|(l, _, _)| matches!(l.w, Weight::Q4(_))) {
         let mut v: Vec<(&Q4Matrix, &mut [f32])> = jobs
             .iter_mut()
-            .map(|(l, n, y)| match l {
-                Lin::Q4(m) => {
+            .map(|(l, n, y)| match &l.w {
+                Weight::Q4(m) => {
                     debug_assert_eq!(m.n_out, *n);
                     (m, &mut **y)
                 }
@@ -216,9 +269,9 @@ impl<'a> Model<'a> {
         let lin_with = |name: &str, n_out: usize, n_in: usize, q: Quant| -> Result<Lin<'a>> {
             let w = get(name, &[n_out, n_in])?;
             Ok(match q {
-                Quant::Bf16 => Lin::Bf16(w),
-                Quant::Q8 => Lin::Q8(quantize_bf16(w, n_out, n_in)),
-                Quant::Q4 => Lin::Q4(quantize_q4(w, n_out, n_in)),
+                Quant::Bf16 => Lin::bf16(w),
+                Quant::Q8 => Lin::q8(quantize_bf16(w, n_out, n_in)),
+                Quant::Q4 => Lin::q4(quantize_q4(w, n_out, n_in)),
             })
         };
         let lin = |name: &str, n_out: usize, n_in: usize| lin_with(name, n_out, n_in, quant);

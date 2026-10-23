@@ -2,13 +2,58 @@
 
 use crate::kernels::bf16_to_f32;
 use crate::pool;
+use std::ops::{Deref, DerefMut};
 
 pub const QBLOCK: usize = 32;
 
+/// Page size assumed for GPU zero-copy wrapping (16 KiB covers Apple Silicon; a multiple of 4 KiB).
+pub const PAGE: usize = 16384;
+
+/// A zero-initialised, page-aligned buffer whose allocation is a whole number of pages, so GPU
+/// APIs can map it without copying.
+pub struct PageVec<T: Copy> {
+    ptr: *mut T,
+    len: usize,
+    bytes: usize,
+}
+unsafe impl<T: Copy + Send> Send for PageVec<T> {}
+unsafe impl<T: Copy + Sync> Sync for PageVec<T> {}
+
+impl<T: Copy> PageVec<T> {
+    pub fn zeroed(len: usize) -> Self {
+        let bytes = (len * std::mem::size_of::<T>()).div_ceil(PAGE).max(1) * PAGE;
+        let layout = std::alloc::Layout::from_size_align(bytes, PAGE).expect("layout");
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut T;
+        assert!(!ptr.is_null(), "allocation of {bytes} bytes failed");
+        Self { ptr, len, bytes }
+    }
+    /// Size of the underlying page-aligned allocation in bytes.
+    pub fn alloc_bytes(&self) -> usize {
+        self.bytes
+    }
+}
+impl<T: Copy> Drop for PageVec<T> {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::from_size_align(self.bytes, PAGE).expect("layout");
+        unsafe { std::alloc::dealloc(self.ptr as *mut u8, layout) };
+    }
+}
+impl<T: Copy> Deref for PageVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+impl<T: Copy> DerefMut for PageVec<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
 /// A quantized `[n_out, n_in]` matrix: int8 values plus one scale per 32-element block.
 pub struct QMatrix {
-    pub q: Vec<i8>,
-    pub scales: Vec<f32>,
+    pub q: PageVec<i8>,
+    pub scales: PageVec<f32>,
     pub n_out: usize,
     pub n_in: usize,
 }
@@ -38,8 +83,8 @@ pub fn quantize_bf16(w: &[u16], n_out: usize, n_in: usize) -> QMatrix {
     assert_eq!(w.len(), n_out * n_in);
     assert!(n_in % QBLOCK == 0, "n_in must be a multiple of {QBLOCK}");
     let bpr = n_in / QBLOCK;
-    let mut q = vec![0i8; n_out * n_in];
-    let mut scales = vec![0f32; n_out * bpr];
+    let mut q = PageVec::<i8>::zeroed(n_out * n_in);
+    let mut scales = PageVec::<f32>::zeroed(n_out * bpr);
     let qp = SendPtr(q.as_mut_ptr());
     let sp = SendPtr(scales.as_mut_ptr());
     // Rows in chunks so each task is a few hundred KiB.
@@ -132,8 +177,8 @@ pub fn dequantize_rows(m: &QMatrix, r0: usize, r1: usize, out: &mut [f32]) {
 // ---------------------------------------------------------------------------
 
 pub struct Q4Matrix {
-    pub q: Vec<u8>,       // [n_out, n_in/2]
-    pub scales: Vec<u16>, // f16, [n_out, n_in/32]
+    pub q: PageVec<u8>,       // [n_out, n_in/2]
+    pub scales: PageVec<u16>, // f16, [n_out, n_in/32]
     pub n_out: usize,
     pub n_in: usize,
 }
@@ -157,8 +202,8 @@ pub fn quantize_q4(w: &[u16], n_out: usize, n_in: usize) -> Q4Matrix {
     assert_eq!(w.len(), n_out * n_in);
     assert!(n_in % QBLOCK == 0);
     let bpr = n_in / QBLOCK;
-    let mut q = vec![0u8; n_out * n_in / 2];
-    let mut scales = vec![0u16; n_out * bpr];
+    let mut q = PageVec::<u8>::zeroed(n_out * n_in / 2);
+    let mut scales = PageVec::<u16>::zeroed(n_out * bpr);
     let qp = SendPtr(q.as_mut_ptr());
     let sp = SendPtr(scales.as_mut_ptr());
     let rows_per_task = (256 * 1024 / (n_in * 2)).max(1);

@@ -1,31 +1,25 @@
 //! Memory bandwidth and matmul-kernel microbenchmark.
 //! usage: membench [GB]   (default 4 GB buffer)
 
-#[path = "../kernels.rs"]
-#[allow(dead_code)]
-mod kernels;
-#[path = "../prof.rs"]
-#[allow(dead_code)]
-mod prof;
-#[path = "../pool.rs"]
-#[allow(dead_code)]
-mod pool;
-#[path = "../quant.rs"]
-#[allow(dead_code)]
-mod quant;
-
-use rayon::prelude::*;
+use gemmars::{kernels, pool};
+#[cfg(feature = "gpu")]
+use gemmars::quant;
 use std::time::Instant;
 
 fn bench_read(buf: &[u64], threads: usize) -> f64 {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    pool::init(threads);
     let bytes = buf.len() * 8;
     let chunk = (buf.len() / (threads * 16)).max(1 << 16);
+    let n = buf.len().div_ceil(chunk);
     let mut best = 0f64;
     for _ in 0..3 {
         let t = Instant::now();
-        let s: u64 = pool.install(|| buf.par_chunks(chunk).map(|c| c.iter().fold(0u64, |a, &b| a ^ b)).sum());
-        std::hint::black_box(s);
+        let total = std::sync::atomic::AtomicU64::new(0);
+        pool::run(n, &|i| {
+            let c = &buf[i * chunk..((i + 1) * chunk).min(buf.len())];
+            total.fetch_add(c.iter().fold(0u64, |a, &b| a ^ b), std::sync::atomic::Ordering::Relaxed);
+        });
+        std::hint::black_box(total);
         let gbs = bytes as f64 / t.elapsed().as_secs_f64() / 1e9;
         best = best.max(gbs);
     }
@@ -47,11 +41,98 @@ fn bench_matmul(w: &[u16], n_out: usize, n_in: usize, t: usize, threads: usize) 
     best
 }
 
+/// `membench gpu [n_out n_in]`: checks and times the accelerator matmul against the CPU kernels.
+#[cfg(feature = "gpu")]
+fn bench_gpu(n_out: usize, n_in: usize) {
+    use gemmars::gpu::{self, WeightRef};
+    let plat = gemmars::platform::detect();
+    println!("{}", plat.summary());
+    let Some(be) = gpu::init(&plat, gemmars::platform::DevicePref::Auto) else {
+        println!("no accelerator backend");
+        return;
+    };
+    pool::init(pool::threads().max(1));
+    let w: Vec<u16> = (0..n_out * n_in).map(|i| ((((i as u32).wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32 - 0.5).to_bits() >> 16) as u16).collect();
+    let q8 = quant::quantize_bf16(&w, n_out, n_in);
+    let q4 = quant::quantize_q4(&w, n_out, n_in);
+    let refs: [(&str, WeightRef); 3] = [("bf16", WeightRef::Bf16(&w)), ("q8", WeightRef::Q8(&q8)), ("q4", WeightRef::Q4(&q4))];
+    for (name, wr) in refs.iter() {
+        let dev = be.upload(wr, n_out, n_in).expect("upload");
+        println!("\n{name} [{n_out} x {n_in}] on {}:", be.name());
+        for &t in &[1usize, 2, 4, 8, 16, 64, 256, 512] {
+            let x: Vec<f32> = (0..t * n_in).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
+            let mut y_ref = vec![0f32; t * n_out];
+            match wr {
+                WeightRef::Bf16(w) => kernels::matmul(w, n_out, n_in, &x, t, &mut y_ref),
+                WeightRef::Q8(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y_ref[..])], &x, t),
+                WeightRef::Q4(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y_ref[..])], &x, t),
+            }
+            let mut y = vec![0f32; t * n_out];
+            let mut best_gpu = f64::MAX;
+            let reps: usize = std::env::var("REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(if t >= 256 { 3 } else { 5 });
+            let wanted = be.wants(n_out, n_in, t);
+            for _ in 0..reps {
+                let ti = Instant::now();
+                let wr2 = match wr {
+                    WeightRef::Bf16(w) => WeightRef::Bf16(w),
+                    WeightRef::Q8(m) => WeightRef::Q8(m),
+                    WeightRef::Q4(m) => WeightRef::Q4(m),
+                };
+                let mut jobs = [gpu::Job { w: wr2, dev: &dev, n_out, y: &mut y }];
+                if !be.matmul(&x, t, n_in, &mut jobs) {
+                    best_gpu = f64::NAN;
+                    break;
+                }
+                best_gpu = best_gpu.min(ti.elapsed().as_secs_f64());
+            }
+            let mut best_cpu = f64::MAX;
+            for _ in 0..reps {
+                let ti = Instant::now();
+                match wr {
+                    WeightRef::Bf16(w) => kernels::matmul(w, n_out, n_in, &x, t, &mut y_ref),
+                    WeightRef::Q8(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y_ref[..])], &x, t),
+                    WeightRef::Q4(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y_ref[..])], &x, t),
+                }
+                best_cpu = best_cpu.min(ti.elapsed().as_secs_f64());
+            }
+            if std::env::var("SHOW").is_ok() {
+                println!("    gpu {:?}\n    cpu {:?}", &y[t * n_out - 4..], &y_ref[t * n_out - 4..]);
+            }
+            let scale = y_ref.iter().fold(0f32, |a, &b| a.max(b.abs())).max(1e-6);
+            let max_rel = y.iter().zip(&y_ref).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / scale;
+            let flops = 2.0 * (t * n_out * n_in) as f64;
+            println!(
+                "  t={t:>3}: gpu {:>8.3} ms ({:>7.1} GB/s, {:>7.1} GFLOP/s) | cpu {:>8.3} ms ({:>7.1} GFLOP/s) | max rel err {max_rel:.2e}{}",
+                best_gpu * 1e3,
+                wr.bytes() as f64 / best_gpu / 1e9,
+                flops / best_gpu / 1e9,
+                best_cpu * 1e3,
+                flops / best_cpu / 1e9,
+                if wanted { "" } else { "  (backend would decline this size)" }
+            );
+        }
+    }
+    if let Some(s) = be.stats() {
+        println!("\ngpu totals: {s}");
+    }
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("gpu") {
+        #[cfg(feature = "gpu")]
+        {
+            let n_out: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(10240);
+            let n_in: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(2560);
+            bench_gpu(n_out, n_in);
+        }
+        #[cfg(not(feature = "gpu"))]
+        println!("built without the gpu feature");
+        return;
+    }
     let gb: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(4);
     let n = gb << 27; // u64 count
     println!("filling {gb} GB buffer...");
-    let buf: Vec<u64> = (0..n as u64).into_par_iter().map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+    let buf: Vec<u64> = (0..n as u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
     let threads = [1usize, 2, 4, 6, 8, 12, 18];
     println!("\nplain read bandwidth (GB/s):");
     for &th in &threads {

@@ -1,8 +1,10 @@
 //! Minimal zero-copy safetensors reader (single file or sharded directory).
 
 use anyhow::{bail, Context, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::Mmap;
-use rayon::prelude::*;
+use crate::pool;
+use crate::quant::PageVec;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -17,14 +19,16 @@ pub struct TensorInfo {
 }
 
 enum Storage {
+    #[cfg(not(target_arch = "wasm32"))]
     Mmap(Mmap),
-    /// Heap copy, kept as u64 for 8-byte alignment.
-    Heap(Vec<u64>, usize),
+    /// Heap copy in a page-aligned, page-multiple allocation (so accelerators can map it in place).
+    Heap(PageVec<u64>, usize),
 }
 
 impl Storage {
     fn bytes(&self) -> &[u8] {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Storage::Mmap(m) => &m[..],
             Storage::Heap(v, n) => unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, *n) },
         }
@@ -43,28 +47,70 @@ pub struct SafeTensors {
     tensors: HashMap<String, TensorInfo>,
 }
 
-/// Reads a whole file into memory using parallel positional reads.
-fn read_file_parallel(file: &File, len: usize) -> Result<Vec<u64>> {
-    use std::os::unix::fs::FileExt;
-    let mut buf: Vec<u64> = vec![0u64; len.div_ceil(8)];
+/// Reads a whole file into memory using parallel positional reads (sequential where the
+/// platform has no positional read).
+fn read_file_parallel(file: &File, len: usize) -> Result<PageVec<u64>> {
+    let mut buf = PageVec::<u64>::zeroed(len.div_ceil(8));
     let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, len) };
+    #[cfg(unix)]
     const CHUNK: usize = 32 << 20;
-    bytes
-        .par_chunks_mut(CHUNK)
-        .enumerate()
-        .try_for_each(|(i, chunk)| file.read_exact_at(chunk, (i * CHUNK) as u64))
-        .context("read weights")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        use std::sync::Mutex;
+        let err: Mutex<Option<std::io::Error>> = Mutex::new(None);
+        let p = SendBytes(bytes.as_mut_ptr());
+        let n = len.div_ceil(CHUNK);
+        pool::run(n, &|i| {
+            let start = i * CHUNK;
+            let end = (start + CHUNK).min(len);
+            // SAFETY: chunks are disjoint.
+            let chunk = unsafe { std::slice::from_raw_parts_mut(p.get().add(start), end - start) };
+            if let Err(e) = file.read_exact_at(chunk, start as u64) {
+                *err.lock().unwrap() = Some(e);
+            }
+        });
+        if let Some(e) = err.into_inner().unwrap() {
+            return Err(e).context("read weights");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = file;
+        f.seek(SeekFrom::Start(0))?;
+        f.read_exact(bytes).context("read weights")?;
+    }
     Ok(buf)
+}
+
+#[derive(Clone, Copy)]
+#[cfg(unix)]
+struct SendBytes(*mut u8);
+unsafe impl Send for SendBytes {}
+unsafe impl Sync for SendBytes {}
+#[cfg(unix)]
+impl SendBytes {
+    fn get(self) -> *mut u8 {
+        self.0
+    }
 }
 
 impl SafeTensors {
     pub fn open(path: &Path, in_memory: bool) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        #[cfg(not(target_arch = "wasm32"))]
         let mmap = if in_memory {
             let len = file.metadata()?.len() as usize;
             Storage::Heap(read_file_parallel(&file, len)?, len)
         } else {
             Storage::Mmap(unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let mmap = {
+            let _ = in_memory;
+            let len = file.metadata()?.len() as usize;
+            Storage::Heap(read_file_parallel(&file, len)?, len)
         };
         if mmap.len() < 8 {
             bail!("{}: file too small", path.display());
@@ -133,15 +179,19 @@ impl SafeTensors {
 
     /// Touch every page so the weights are resident before the first forward pass.
     pub fn preload(&self) {
+        #[cfg(unix)]
         if let Storage::Mmap(m) = &self.mmap {
             let _ = m.advise(memmap2::Advice::WillNeed);
         }
         const CHUNK: usize = 64 << 20;
-        let total: u64 = self
-            .mmap
-            .par_chunks(CHUNK)
-            .map(|c| c.iter().step_by(4096).map(|&b| b as u64).sum::<u64>())
-            .sum();
+        let bytes: &[u8] = &self.mmap;
+        let n = bytes.len().div_ceil(CHUNK);
+        let total = std::sync::atomic::AtomicU64::new(0);
+        pool::run(n, &|i| {
+            let c = &bytes[i * CHUNK..((i + 1) * CHUNK).min(bytes.len())];
+            let s: u64 = c.iter().step_by(4096).map(|&b| b as u64).sum();
+            total.fetch_add(s, std::sync::atomic::Ordering::Relaxed);
+        });
         std::hint::black_box(total);
     }
 }
@@ -169,10 +219,10 @@ impl ModelFiles {
         } else {
             bail!("no model.safetensors or index found in {}", dir.display());
         }
-        let shards: Vec<SafeTensors> = files
-            .par_iter()
-            .map(|p| SafeTensors::open(p, in_memory))
-            .collect::<Result<Vec<_>>>()?;
+        let mut shards = Vec::with_capacity(files.len());
+        for p in &files {
+            shards.push(SafeTensors::open(p, in_memory)?);
+        }
         let mut index = HashMap::new();
         for (i, s) in shards.iter().enumerate() {
             for n in s.names() {

@@ -115,6 +115,10 @@ fn pack_xt(x: &[f32], t: usize, n_in: usize) -> Vec<f32> {
     xt
 }
 
+#[cfg(target_arch = "x86_64")]
+#[path = "kernels_x86.rs"]
+pub mod simd;
+
 #[cfg(target_arch = "aarch64")]
 pub mod simd {
     use std::arch::aarch64::*;
@@ -637,7 +641,7 @@ pub mod simd {
 }
 
 /// Computes rows r0..r1 of the output for all t tokens.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 unsafe fn matmul_block(
     w: &[u16],
@@ -679,7 +683,7 @@ unsafe fn matmul_block(
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 #[allow(clippy::too_many_arguments)]
 unsafe fn matmul_block(
     w: &[u16],
@@ -750,11 +754,11 @@ impl QMat for QMatrix {
         let bpr = self.n_in / QBLOCK;
         let xq = xa.q.as_ptr().add(c * self.n_in);
         let xs = xa.scales.as_ptr().add(c * bpr);
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             simd::q8_rows_t1(self, xq, xs, y, r0, r1);
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             for r in r0..r1 {
                 let mut acc = 0f32;
@@ -780,7 +784,7 @@ impl QMatrix {
         let bpr = n_in / QBLOCK;
         let xq = xa.q.as_ptr().add(c0 * n_in);
         let xs = xa.scales.as_ptr().add(c0 * bpr);
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             macro_rules! go {
                 ($TC:expr) => {{
@@ -809,7 +813,7 @@ impl QMatrix {
                 _ => unreachable!("bad tc {tc}"),
             }
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             let _ = (xq, xs);
             for c in 0..tc {
@@ -826,7 +830,7 @@ impl Q4Matrix {
         let xq = xa.q.as_ptr().add(c0 * n_in);
         let xs = xa.scales.as_ptr().add(c0 * bpr);
         let xsums = xa.sums.as_ptr().add(c0 * bpr);
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             macro_rules! go {
                 ($TC:expr) => {{
@@ -855,7 +859,7 @@ impl Q4Matrix {
                 _ => unreachable!("bad tc {tc}"),
             }
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             let _ = (xq, xs, xsums);
             for c in 0..tc {
@@ -883,11 +887,11 @@ impl QMat for Q4Matrix {
         let xq = xa.q.as_ptr().add(c * self.n_in);
         let xs = xa.scales.as_ptr().add(c * bpr);
         let xsums = xa.sums.as_ptr().add(c * bpr);
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             simd::q4_rows_t1(self, xq, xs, xsums, y, r0, r1);
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             let _ = xsums;
             let mut row = vec![0f32; self.n_in];
@@ -996,7 +1000,7 @@ unsafe fn matmul_quant_block_prefill<M: QMat>(m: &M, x: &[f32], xt: &[f32], t: u
         while r < r1 {
             let rows = (r1 - r).min(8);
             m.dequantize_rows(r, r + rows, &mut s[..rows * n_in]);
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             {
                 let sp = s.as_ptr();
                 if rows == 8 {
@@ -1016,7 +1020,7 @@ unsafe fn matmul_quant_block_prefill<M: QMat>(m: &M, x: &[f32], xt: &[f32], t: u
                     scalar_rows_f32(&s[..rows * n_in], n_in, x, t, y.add(r), n_out, rows);
                 }
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             {
                 let _ = xt;
                 scalar_rows_f32(&s[..rows * n_in], n_in, x, t, y.add(r), n_out, rows);
@@ -1039,7 +1043,7 @@ unsafe fn scalar_rows_f32(w: &[f32], n_in: usize, x: &[f32], t: usize, y: *mut f
 #[inline]
 pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
     debug_assert_eq!(w.len(), x.len());
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
         if w.len() % 32 == 0 {
             let o = unsafe { simd::kernel::<u16, 1, 1, 4, 8>(w.as_ptr(), 0, x.as_ptr(), 0, w.len()) };
