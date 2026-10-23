@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+oxideav-core = "0.1"
+oxideav-pipeline = "0.1"
+oxideav-meta = { version = "0.0.3", default-features = false, features = ["png", "mjpeg", "webp", "gif", "bmp", "basic", "mp3", "flac", "aac", "mp4", "mov", "ogg", "vorbis", "opus", "mkv", "riff"] }
+oxideav-image = "0.0.5"
 anyhow = "1.0.104"
 half = "2.7.1"
 memmap2 = "0.9.11"

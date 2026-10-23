@@ -19,7 +19,31 @@ decoding produces identical tokens.
 | google/gemma-4-31B-it | 31B | 62 GB | supported, sharded loading, untested |
 | google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
 
-Only the text decoder is implemented. Vision and audio towers in the checkpoints are ignored.
+Text, images and audio are supported (E2B/E4B have both towers). Video is not.
+
+## Images and audio
+
+```sh
+./target/release/gemmars --model models/gemma-4-E4B-it --quant q4 \
+    --image photo.jpg --audio clip.wav --prompt "Describe the image and transcribe the audio."
+```
+
+`--image` and `--audio` can be repeated; attachments are placed before the text of the user turn
+(or of the first turn in `--chat`). Files are decoded with the pure-Rust
+[oxideav](https://crates.io/crates/oxideav-core) crates (PNG, JPEG, WebP, GIF, BMP; WAV, MP3, FLAC,
+AAC/M4A, Ogg Vorbis/Opus, MKV audio), resampled to 16 kHz mono for audio.
+
+- **Vision**: aspect-preserving bicubic resize to at most 280 soft tokens (`--max-soft-tokens`
+  accepts 70/140/280/560/1120), 16x16 patches, a 16-layer ViT (hidden 768) with axial 2D RoPE and
+  clipped linears, 3x3 patch pooling, then the vision embedder. A 640x480 image becomes 57x42
+  patches and 266 soft tokens in about 2.5 s.
+- **Audio**: 128-bin log-mel features (20 ms frames, 10 ms hop), two stride-2 conv layers, a
+  12-layer conformer with chunked local attention and relative position bias, then the audio
+  embedder: 40 ms of audio per soft token (750 max, i.e. 30 s).
+
+Soft tokens replace the `<|image|>` / `<|audio|>` placeholder embeddings inside the text model
+(the per-layer-embedding lookup uses the pad token there, as in the reference). All attention
+stays causal, matching the E2B/E4B configuration.
 
 ## Getting weights
 
@@ -122,6 +146,9 @@ only helps on predictable text.
   quantization of weights at load time, plus per-matmul activation quantization; decode kernels use
   int8 SDOT over four blocks at a time, with multi-token variants for speculative verification.
 - `drafter.rs`: the Gemma 4 assistant model (drafter) and its centroid-masked LM head.
+- `vision.rs`, `audio.rs`: the two encoders plus preprocessing (resize/patching, mel features) and
+  the embedders; `media.rs`: file decoding through oxideav; `mm_config.rs`: tower configs and
+  placeholder token ids.
 - `pool.rs`: a spin-waiting thread pool with an atomic work counter. Dispatch costs about a microsecond,
   which matters because a decode step issues ~200 small parallel regions.
 - `model.rs`: the Gemma 4 decoder: scaled embeddings, per-layer embeddings (PLE), QK-norm, sliding /

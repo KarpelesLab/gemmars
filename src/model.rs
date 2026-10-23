@@ -367,6 +367,13 @@ impl<'a> Model<'a> {
 
     /// Runs `tokens` through the decoder and returns the final-normed hidden states `[t, hidden]`.
     pub fn forward_hidden(&self, sess: &mut Session, tokens: &[u32]) -> Vec<f32> {
+        self.forward_hidden_mm(sess, tokens, &[])
+    }
+
+    /// Like `forward_hidden`, but positions listed in `mm` (relative to this call, sorted) take
+    /// the given embedding (a multimodal soft token in text space) instead of the token
+    /// embedding; their per-layer-embedding lookup uses the pad token, as in the reference.
+    pub fn forward_hidden_mm(&self, sess: &mut Session, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
         let t = tokens.len();
         assert!(t > 0);
         let cfg = &self.cfg;
@@ -387,6 +394,14 @@ impl<'a> Model<'a> {
                 *r = bf16_to_f32(s) * scale;
             }
         });
+        // Multimodal soft tokens replace the placeholder embeddings; PLE uses the pad token there.
+        let mut ple_tokens: Vec<u32> = tokens.to_vec();
+        for &(i, emb) in mm {
+            debug_assert!(i < t && emb.len() == h);
+            x[i * h..(i + 1) * h].copy_from_slice(emb);
+            ple_tokens[i] = 0;
+        }
+        let tokens = &ple_tokens[..];
 
         // Per-layer embeddings: [t, nl, p]
         let pli: Option<Vec<f32>> = self.ple.as_ref().map(|ple| {

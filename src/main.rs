@@ -1,13 +1,17 @@
 mod chat;
 mod config;
+mod audio;
 mod drafter;
 mod kernels;
+mod media;
+mod mm_config;
 mod model;
 mod pool;
 mod prof;
 mod quant;
 mod safetensors;
 mod sampler;
+mod vision;
 
 use anyhow::{bail, Context, Result};
 use model::{Model, Quant, Session};
@@ -40,6 +44,10 @@ struct Args {
     prefill_chunk: usize,
     draft: Option<PathBuf>,
     draft_tokens: usize,
+    images: Vec<PathBuf>,
+    audios: Vec<PathBuf>,
+    dump_mm: Option<PathBuf>,
+    max_soft_tokens: usize,
 }
 
 fn usage() -> ! {
@@ -65,6 +73,10 @@ fn usage() -> ! {
          \x20 --prefill-chunk N    tokens per prefill chunk (default 256)\n\
          \x20 --draft DIR          speculative decoding with a Gemma 4 assistant (drafter) model; greedy only\n\
          \x20 --draft-tokens N     max draft tokens per round (default 6; adaptive from 3)\n\
+         \x20 --image FILE         attach an image (repeatable; PNG/JPEG/WebP/GIF/BMP via oxideav)\n\
+         \x20 --audio FILE         attach an audio clip (repeatable; WAV/MP3/FLAC/AAC/OGG via oxideav)\n\
+         \x20 --max-soft-tokens N  image soft-token budget: 70, 140, 280 (default), 560 or 1120\n\
+         \x20 --dump-mm PREFIX     write multimodal soft tokens / patches as f32 files (for reference checks)\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
          \x20 --show-tokens        print token ids"
     );
@@ -94,6 +106,10 @@ fn parse_args() -> Result<Args> {
         prefill_chunk: 256,
         draft: None,
         draft_tokens: 6,
+        images: Vec::new(),
+        audios: Vec::new(),
+        dump_mm: None,
+        max_soft_tokens: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -125,6 +141,10 @@ fn parse_args() -> Result<Args> {
             "--prefill-chunk" => a.prefill_chunk = val()?.parse()?,
             "--draft" => a.draft = Some(PathBuf::from(val()?)),
             "--draft-tokens" => a.draft_tokens = val()?.parse()?,
+            "--image" => a.images.push(PathBuf::from(val()?)),
+            "--audio" => a.audios.push(PathBuf::from(val()?)),
+            "--dump-mm" => a.dump_mm = Some(PathBuf::from(val()?)),
+            "--max-soft-tokens" => a.max_soft_tokens = val()?.parse()?,
             "--dump-logits" => a.dump_logits = Some(PathBuf::from(val()?)),
             "--show-tokens" => a.show_tokens = true,
             "-h" | "--help" => usage(),
@@ -144,6 +164,119 @@ fn default_threads() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
+/// Soft tokens for one attachment: placeholder token id and `[n, hidden]` embeddings.
+struct MmFeature {
+    token_id: u32,
+    emb: Vec<f32>,
+    n: usize,
+}
+
+/// Decodes and encodes all attachments. Returns the placeholder text to prepend to the user
+/// message and the features in the same order.
+fn prepare_multimodal(args: &Args, files: &safetensors::ModelFiles, text_hidden: usize) -> Result<(String, Vec<MmFeature>)> {
+    let mmc = mm_config::MmConfig::load(&args.model)?;
+    let media = media::Media::new();
+    let mut text = String::new();
+    let mut feats = Vec::new();
+    if !args.images.is_empty() {
+        let vcfg = mmc.vision.clone().context("checkpoint has no vision tower")?;
+        let t = Instant::now();
+        let tower = vision::VisionTower::load(vcfg, files, text_hidden)?;
+        let budget = if args.max_soft_tokens > 0 { args.max_soft_tokens } else { mmc.vision_soft_tokens_per_image };
+        if !vision::SUPPORTED_SOFT_TOKENS.contains(&budget) {
+            bail!("--max-soft-tokens must be one of {:?}", vision::SUPPORTED_SOFT_TOKENS);
+        }
+        for (i, path) in args.images.iter().enumerate() {
+            let img = media.load_image(path)?;
+            let patches = vision::preprocess(&img.data, img.width, img.height, &tower.cfg, budget)?;
+            let emb = tower.encode(&patches);
+            let n = emb.len() / text_hidden;
+            eprintln!(
+                "[image {}: {}x{} -> {}x{} patches -> {} soft tokens, {:.2}s]",
+                path.display(), img.width, img.height, patches.pw, patches.ph, n, t.elapsed().as_secs_f64()
+            );
+            if let (Some(prefix), 0) = (&args.dump_mm, i) {
+                let b: Vec<u8> = patches.patches.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(format!("{}_pixels.bin", prefix.display()), b)?;
+                let b: Vec<u8> = emb.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(format!("{}_image.bin", prefix.display()), b)?;
+            }
+            text.push_str("<|image>");
+            for _ in 0..n {
+                text.push_str("<|image|>");
+            }
+            text.push_str("<image|>");
+            feats.push(MmFeature { token_id: mmc.image_token_id, emb, n });
+        }
+    }
+    if !args.audios.is_empty() {
+        let acfg = mmc.audio.clone().context("checkpoint has no audio tower")?;
+        let t = Instant::now();
+        let tower = audio::AudioTower::load(acfg, files, text_hidden)?;
+        for (i, path) in args.audios.iter().enumerate() {
+            let mut pcm = media.load_audio(path, audio::SAMPLE_RATE)?;
+            // The reference feature extractor pads the waveform to a multiple of 128 samples.
+            let padded = pcm.len().div_ceil(128) * 128;
+            pcm.resize(padded, 0.0);
+            let frames = audio::num_mel_frames(pcm.len());
+            if frames == 0 {
+                bail!("{}: audio too short", path.display());
+            }
+            let mel = audio::mel_features(&pcm);
+            let emb = tower.encode(&mel, frames);
+            let n = emb.len() / text_hidden;
+            eprintln!(
+                "[audio {}: {:.2}s -> {} mel frames -> {} soft tokens, {:.2}s]",
+                path.display(), pcm.len() as f64 / audio::SAMPLE_RATE as f64, frames, n, t.elapsed().as_secs_f64()
+            );
+            if let (Some(prefix), 0) = (&args.dump_mm, i) {
+                let b: Vec<u8> = mel.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(format!("{}_mel.bin", prefix.display()), b)?;
+                let b: Vec<u8> = emb.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(format!("{}_audio.bin", prefix.display()), b)?;
+            }
+            text.push_str("<|audio>");
+            for _ in 0..n {
+                text.push_str("<|audio|>");
+            }
+            text.push_str("<audio|>");
+            feats.push(MmFeature { token_id: mmc.audio_token_id, emb, n });
+        }
+    }
+    Ok((text, feats))
+}
+
+/// Maps placeholder token positions in `ids` to soft-token embeddings, in attachment order.
+fn mm_overrides(ids: &[u32], feats: &[MmFeature], hidden: usize) -> Result<Vec<(usize, Vec<f32>)>> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for f in feats {
+        let mut k = 0;
+        while k < f.n {
+            let pos = ids[cursor..].iter().position(|&t| t == f.token_id).context("fewer placeholder tokens than soft tokens")? + cursor;
+            out.push((pos, f.emb[k * hidden..(k + 1) * hidden].to_vec()));
+            cursor = pos + 1;
+            k += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Prefill in chunks with multimodal overrides; returns the hidden states of the last chunk.
+fn prefill_mm(model: &Model, sess: &mut Session, ids: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
+    let mut hs = Vec::new();
+    let mut start = 0;
+    for c in ids.chunks(chunk.max(1)) {
+        let end = start + c.len();
+        let local: Vec<(usize, &[f32])> =
+            overrides.iter().filter(|(p, _)| *p >= start && *p < end).map(|(p, e)| (p - start, e.as_slice())).collect();
+        hs = model.forward_hidden_mm(sess, c, &local);
+        start = end;
+    }
+    hs
+}
+
+#[allow(dead_code)]
 fn prefill(model: &Model, sess: &mut Session, ids: &[u32], chunk: usize) -> Vec<f32> {
     let mut logits = Vec::new();
     for c in ids.chunks(chunk.max(1)) {
@@ -447,6 +580,11 @@ fn run(args: Args) -> Result<()> {
 
     if args.chat {
         let mut first = true;
+        let (mm_text, mm_feats) = if !args.images.is_empty() || !args.audios.is_empty() {
+            prepare_multimodal(&args, &files, model.cfg.hidden_size)?
+        } else {
+            (String::new(), Vec::new())
+        };
         let stdin = std::io::stdin();
         loop {
             eprint!("> ");
@@ -459,24 +597,26 @@ fn run(args: Args) -> Result<()> {
                 continue;
             }
             let mut text = String::new();
+            let mut overrides = Vec::new();
             if first {
                 text.push_str(&chat::conversation_start(args.system.as_deref(), args.think));
+                text.push_str(&chat::user_turn(&format!("{mm_text}{line}")));
                 first = false;
             } else {
                 // The previous stop token was sampled but never fed to the model.
                 text.push_str(&chat::end_of_model_turn());
+                text.push_str(&chat::user_turn(line));
             }
-            text.push_str(&chat::user_turn(line));
             let ids = encode(&text)?;
+            if !mm_feats.is_empty() && !text.is_empty() && text.contains("<|image|>") || text.contains("<|audio|>") {
+                overrides = mm_overrides(&ids, &mm_feats, model.cfg.hidden_size)?;
+            }
             if args.show_tokens {
                 eprintln!("[prompt ids: {ids:?}]");
             }
             let t = Instant::now();
             if let Some(dr) = &drafter {
-                let mut hs = Vec::new();
-                for c in ids.chunks(args.prefill_chunk.max(1)) {
-                    hs = model.forward_hidden(&mut sess, c);
-                }
+                let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk, &overrides);
                 let h = model.cfg.hidden_size;
                 let hidden_last = hs[hs.len() - h..].to_vec();
                 let prefill_secs = t.elapsed().as_secs_f64();
@@ -489,7 +629,8 @@ fn run(args: Args) -> Result<()> {
                 eprintln!("[speculative: {:.2} tok/forward, drafts accepted {}%]", out.len() as f64 / st.forwards.max(1) as f64, 100 * st.accepted / st.drafted.max(1));
                 continue;
             }
-            let logits = prefill(&model, &mut sess, &ids, args.prefill_chunk);
+            let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk, &overrides);
+            let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
             let (out, n, decode_secs) = generate(&model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens);
@@ -512,6 +653,12 @@ fn run(args: Args) -> Result<()> {
             s
         }
     };
+    let (mm_text, mm_feats) = if !args.images.is_empty() || !args.audios.is_empty() {
+        prepare_multimodal(&args, &files, model.cfg.hidden_size)?
+    } else {
+        (String::new(), Vec::new())
+    };
+    let prompt = format!("{mm_text}{prompt}");
     let text = if args.raw {
         format!("<bos>{prompt}")
     } else {
@@ -520,6 +667,7 @@ fn run(args: Args) -> Result<()> {
         t
     };
     let ids = encode(&text)?;
+    let overrides = mm_overrides(&ids, &mm_feats, model.cfg.hidden_size)?;
     if args.show_tokens {
         eprintln!("[prompt ids ({}): {ids:?}]", ids.len());
     }
@@ -529,10 +677,7 @@ fn run(args: Args) -> Result<()> {
 
     if let Some(dr) = &drafter {
         let t = Instant::now();
-        let mut hs = Vec::new();
-        for c in ids.chunks(args.prefill_chunk.max(1)) {
-            hs = model.forward_hidden(&mut sess, c);
-        }
+        let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk, &overrides);
         let h = model.cfg.hidden_size;
         let hidden_last = hs[hs.len() - h..].to_vec();
         let prefill_secs = t.elapsed().as_secs_f64();
@@ -561,7 +706,8 @@ fn run(args: Args) -> Result<()> {
     }
 
     let t = Instant::now();
-    let logits = prefill(&model, &mut sess, &ids, args.prefill_chunk);
+    let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk, &overrides);
+    let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
     let prefill_secs = t.elapsed().as_secs_f64();
     if args.profile {
         eprintln!("-- prefill --");
