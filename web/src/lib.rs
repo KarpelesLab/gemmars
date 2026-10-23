@@ -130,6 +130,19 @@ pub extern "C" fn web_put_file(path: *const u8, path_len: usize, ptr: *mut u8, l
     fsx::put(&path, v, len);
 }
 
+/// Registers file `path` as kept by the host (`len` bytes, read through `host_read(id, ...)`):
+/// used for lookup-table shards (`*-tables.safetensors`) so they do not count against the 4 GiB
+/// of module memory.
+#[unsafe(no_mangle)]
+pub extern "C" fn web_put_host_file(path: *const u8, path_len: usize, id: u32, len: f64) -> i32 {
+    let path = unsafe { str_arg(path, path_len) }.to_string();
+    if len > usize::MAX as f64 {
+        return set_error(&anyhow!("{path}: {len} bytes is too large for a host file in wasm32"));
+    }
+    fsx::put_host(&path, fsx::HostFile { id, len: len as usize });
+    0
+}
+
 // ---- model --------------------------------------------------------------------------------------
 
 /// Loads the model in directory `dir` of the virtual filesystem. `quant`: 0 bf16, 1 q8, 2 q4.
@@ -173,13 +186,15 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
         let s = m.new_session();
         Lm::Gemma(m, s)
     };
-    let (layers, hidden, streamed) = match &lm {
-        Lm::Gemma(m, _) => (m.cfg.num_hidden_layers, m.cfg.hidden_size, m.streamed_bytes()),
-        Lm::Qwen(m, _) => (m.cfg.num_hidden_layers, m.cfg.hidden_size, m.streamed_bytes()),
+    let (layers, hidden, streamed, stored) = match &lm {
+        Lm::Gemma(m, _) => (m.cfg.num_hidden_layers, m.cfg.hidden_size, m.streamed_bytes(), m.quant),
+        Lm::Qwen(m, _) => (m.cfg.num_hidden_layers, m.cfg.hidden_size, m.streamed_bytes(), m.quant),
     };
+    let _ = quant;
     log(&format!(
-        "[loaded {model_type}: {layers} layers, hidden {hidden}, {:.2} GB checkpoint, {quant:?} weights streaming {:.2} GB/token, device {}, {:.2}s]",
+        "[loaded {model_type}: {layers} layers, hidden {hidden}, {:.2} GB checkpoint, {stored:?} weights{} streaming {:.2} GB/token, device {}, {:.2}s]",
         files.total_bytes() as f64 / 1e9,
+        if Quant::stored(files).is_some() { " (pre-quantized)" } else { "" },
         streamed as f64 / 1e9,
         gemmars::gpu::active().map(|b| b.name().to_string()).unwrap_or_else(|| "cpu".into()),
         t0.elapsed().as_secs_f64()

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S deno run --allow-read --allow-env
 // Deno CLI for the browser build: same module and glue as index.html, model from a local directory.
 //   deno run --allow-read web/run.mjs --model ~/.cache/gemmars/hub/Qwen--Qwen3.5-0.8B --quant q8 -p "Hello"
-import { Gemmars, WebGpuHost, wantedFiles, hasJspi } from './gemmars.js';
+import { Gemmars, WebGpuHost, wantedFiles, hasJspi, isHostShard } from './gemmars.js';
 
 const args = Deno.args;
 const opt = (name, def) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : def; };
@@ -27,6 +27,20 @@ for (const name of wantedFiles(names)) {
   const path = `${modelDir}/${name}`;
   const size = (await Deno.stat(path)).size;
   const f = await Deno.open(path);
+  if (isHostShard(name)) {
+    const bytes = new Uint8Array(size);
+    let off = 0;
+    while (off < size) {
+      const n = await f.read(bytes.subarray(off));
+      if (n === null) break;
+      off += n;
+    }
+    f.close();
+    g.putHostFile(`/model/${name}`, bytes);
+    log(`[${name}: ${(size / 1e9).toFixed(2)} GB kept in host memory]`);
+    total += size;
+    continue;
+  }
   const w = g.putFileStream(`/model/${name}`, size);
   const buf = new Uint8Array(32 << 20);
   for (;;) {
@@ -38,7 +52,7 @@ for (const name of wantedFiles(names)) {
   w.done();
   total += size;
 }
-log(`[read ${(total / 1e9).toFixed(2)} GB into module memory in ${((performance.now() - t0) / 1e3).toFixed(2)}s]`);
+log(`[read ${(total / 1e9).toFixed(2)} GB of model files in ${((performance.now() - t0) / 1e3).toFixed(2)}s]`);
 g.load('/model', quant, { prefillChunk: chunk });
 g.setSampling({ temperature: Number(opt('--temp', '0')), topK: 64, topP: 0.95, seed: 1 });
 

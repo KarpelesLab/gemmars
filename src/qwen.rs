@@ -4,10 +4,9 @@
 
 use crate::config::QwenConfig;
 use crate::kernels::*;
-use crate::model::{attention, linear, linear_multi, LayerCache, Lin, Quant};
+use crate::model::{attention, linear, linear_multi, load_lin, table_quant, LayerCache, Lin, Quant, Table};
 use crate::pool;
 use crate::prof::{self, Cat};
-use crate::quant::{quantize_bf16, quantize_q4};
 use crate::safetensors::ModelFiles;
 use anyhow::{bail, Context, Result};
 
@@ -49,7 +48,7 @@ struct QLayer<'a> {
 pub struct QwenModel<'a> {
     pub cfg: QwenConfig,
     pub quant: Quant,
-    embed: &'a [u16],
+    embed: Table<'a>,
     layers: Vec<QLayer<'a>>,
     final_norm: Vec<f32>,
     lm_head: Lin<'a>,
@@ -74,9 +73,11 @@ fn one_plus(w: &[u16]) -> Vec<f32> {
 
 impl<'a> QwenModel<'a> {
     pub fn load(cfg: QwenConfig, files: &'a ModelFiles, quant: Quant) -> Result<Self> {
-        let prefix = if files.has("model.language_model.embed_tokens.weight") {
+        let quant = Quant::stored(files).unwrap_or(quant);
+        let has = |n: &str| files.has(n) || files.has(&format!("{n}.q8")) || files.has(&format!("{n}.q4"));
+        let prefix = if has("model.language_model.embed_tokens.weight") {
             "model.language_model."
-        } else if files.has("model.embed_tokens.weight") {
+        } else if has("model.embed_tokens.weight") {
             "model."
         } else {
             bail!("cannot find embed_tokens in checkpoint");
@@ -102,17 +103,12 @@ impl<'a> QwenModel<'a> {
                 other => bail!("tensor {full} has dtype {other}, expected BF16 or F32"),
             })
         };
-        let lin = |full: &str, n_out: usize, n_in: usize| -> Result<Lin<'a>> {
-            let w = get(full, &[n_out, n_in])?;
-            Ok(match quant {
-                Quant::Bf16 => Lin::bf16(w),
-                Quant::Q8 => Lin::q8(quantize_bf16(w, n_out, n_in)),
-                Quant::Q4 => Lin::q4(quantize_q4(w, n_out, n_in)),
-            })
-        };
+        let lin = |full: &str, n_out: usize, n_in: usize| load_lin(files, full, n_out, n_in, quant);
 
-        let embed = get(&format!("{prefix}embed_tokens.weight"), &[cfg.vocab_size, h])?;
-        let lm_head = if cfg.tie_word_embeddings || !files.has("lm_head.weight") {
+        let tied = cfg.tie_word_embeddings || !has("lm_head.weight");
+        // Lookups use the head's precision when tied (one copy in a pre-quantized file), else bf16.
+        let embed = Table::load(files, &format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h, if tied { quant } else { table_quant(quant) })?;
+        let lm_head = if tied {
             lin(&format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h)?
         } else {
             lin("lm_head.weight", cfg.vocab_size, h)?
@@ -229,9 +225,7 @@ impl<'a> QwenModel<'a> {
         let mut x = vec![0f32; t * h];
         for_chunks(&mut x, h, par, |ti, row| {
             let tok = tokens[ti] as usize;
-            for (r, &s) in row.iter_mut().zip(&self.embed[tok * h..(tok + 1) * h]) {
-                *r = bf16_to_f32(s);
-            }
+            self.embed.row(tok, row);
         });
         for &(i, emb) in mm {
             x[i * h..(i + 1) * h].copy_from_slice(emb);

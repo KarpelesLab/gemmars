@@ -4,8 +4,8 @@
 use crate::config::TextConfig;
 use crate::kernels::*;
 use crate::prof::{self, Cat};
-use crate::quant::{quantize_bf16, quantize_q4, Q4Matrix, QMatrix};
-use crate::safetensors::ModelFiles;
+use crate::quant::{quantize_bf16, quantize_q4, Q4Matrix, QKind, QMatrix};
+use crate::safetensors::{ModelFiles, Stored};
 use anyhow::{bail, Context, Result};
 
 /// Weight precision for the streamed (linear) weights.
@@ -15,6 +15,175 @@ pub enum Quant {
     Q8,
     /// Q4_0 layer weights; the LM head and PLE projection stay Q8.
     Q4,
+}
+
+impl Quant {
+    /// The stored quantized format, None for bf16.
+    pub fn kind(self) -> Option<QKind> {
+        match self {
+            Quant::Bf16 => None,
+            Quant::Q8 => Some(QKind::Q8),
+            Quant::Q4 => Some(QKind::Q4),
+        }
+    }
+    pub fn parse(s: &str) -> Option<Quant> {
+        match s {
+            "bf16" => Some(Quant::Bf16),
+            "q8" => Some(Quant::Q8),
+            "q4" => Some(Quant::Q4),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Quant::Bf16 => "bf16",
+            Quant::Q8 => "q8",
+            Quant::Q4 => "q4",
+        }
+    }
+    /// The precision a pre-quantized checkpoint was written with (overrides `--quant`).
+    pub fn stored(files: &ModelFiles) -> Option<Quant> {
+        files.metadata("gemmars_quant").and_then(Quant::parse)
+    }
+}
+
+/// Precision of the embedding tables written by `--save-quantized` (rows are dequantized one
+/// token at a time, so they are never streamed in full): `GEMMARS_TABLE_QUANT=bf16|q8|q4`,
+/// default the model precision.
+pub fn table_quant(quant: Quant) -> Quant {
+    std::env::var("GEMMARS_TABLE_QUANT").ok().and_then(|v| Quant::parse(&v)).unwrap_or(quant)
+}
+
+/// An embedding table `[rows, cols]` read one row at a time: borrowed bf16 or pre-quantized.
+pub enum Table<'a> {
+    Bf16(&'a [u16]),
+    Q8(QMatrix),
+    Q4(Q4Matrix),
+    /// Pre-quantized rows kept by the browser host, fetched one row per lookup.
+    /// Values and scales can sit in different shards, hence two files.
+    Host { qf: crate::fsx::HostFile, sf: crate::fsx::HostFile, kind: QKind, q_off: u64, s_off: u64, cols: usize },
+}
+
+impl<'a> Table<'a> {
+    /// Row `r` (of length `out.len()`) as f32.
+    pub fn row(&self, r: usize, out: &mut [f32]) {
+        let n = out.len();
+        match self {
+            Table::Bf16(w) => {
+                for (o, &v) in out.iter_mut().zip(&w[r * n..(r + 1) * n]) {
+                    *o = bf16_to_f32(v);
+                }
+            }
+            Table::Q8(m) => crate::quant::dequantize_rows(m, r, r + 1, out),
+            Table::Q4(m) => crate::quant::dequantize_rows_q4(m, r, r + 1, out),
+            &Table::Host { qf, sf, kind, q_off, s_off, cols } => {
+                use crate::quant::{PageVec, QBLOCK};
+                let bpr = cols / QBLOCK;
+                let (qb, sb) = match kind {
+                    QKind::Q8 => (cols, bpr * 4),
+                    QKind::Q4 => (cols / 2, bpr * 2),
+                };
+                let mut buf = PageVec::<u64>::zeroed((qb + sb).div_ceil(8));
+                let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, qb + sb) };
+                let (qbuf, sbuf) = bytes.split_at_mut(qb);
+                let ok = crate::fsx::read_host(qf, q_off + (r * qb) as u64, qbuf).and_then(|_| crate::fsx::read_host(sf, s_off + (r * sb) as u64, sbuf));
+                if let Err(e) = ok {
+                    panic!("table row {r}: {e}");
+                }
+                // One-row matrices over the scratch buffer (scales sit right after the values,
+                // which keeps them aligned because `qb` is a multiple of 16).
+                unsafe {
+                    match kind {
+                        QKind::Q8 => {
+                            let q = std::slice::from_raw_parts(qbuf.as_ptr() as *const i8, qb);
+                            let sc = std::slice::from_raw_parts(sbuf.as_ptr() as *const f32, bpr);
+                            let m = QMatrix { q: crate::quant::QBuf::borrowed(q), scales: crate::quant::QBuf::borrowed(sc), n_out: 1, n_in: cols };
+                            crate::quant::dequantize_rows(&m, 0, 1, out);
+                        }
+                        QKind::Q4 => {
+                            let sc = std::slice::from_raw_parts(sbuf.as_ptr() as *const u16, bpr);
+                            let m = Q4Matrix { q: crate::quant::QBuf::borrowed(qbuf), scales: crate::quant::QBuf::borrowed(sc), n_out: 1, n_in: cols };
+                            crate::quant::dequantize_rows_q4(&m, 0, 1, out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bytes held in memory by this table (0 when the host keeps it).
+    pub fn bytes(&self) -> usize {
+        match self {
+            Table::Bf16(w) => w.len() * 2,
+            Table::Q8(m) => m.bytes(),
+            Table::Q4(m) => m.bytes(),
+            Table::Host { .. } => 0,
+        }
+    }
+
+    /// Loads table `full` (`[rows, cols]`): the pre-quantized form when the checkpoint has one,
+    /// otherwise bf16, recording `store_as` for `--save-quantized`.
+    pub fn load(files: &'a ModelFiles, full: &str, rows: usize, cols: usize, store_as: Quant) -> Result<Self> {
+        files.note_use(full, false, true);
+        for kind in [QKind::Q8, QKind::Q4] {
+            let (qn, sn) = (format!("{full}.{}", kind.suffix()), format!("{full}.{}s", kind.suffix()));
+            if let (Some((qf, q_off)), Some((sf, s_off))) = (files.host_tensor(&qn), files.host_tensor(&sn)) {
+                let bpr = cols / crate::quant::QBLOCK;
+                let (qshape, sdt) = match kind {
+                    QKind::Q8 => (vec![rows, cols], "F32"),
+                    QKind::Q4 => (vec![rows, cols / 2], "F16"),
+                };
+                let (qi, si) = (files.info(&qn).unwrap(), files.info(&sn).unwrap());
+                if qi.shape != qshape || si.shape != [rows, bpr] || si.dtype != sdt {
+                    bail!("table {full}: stored shapes {:?} / {:?} do not match [{rows}, {cols}]", qi.shape, si.shape);
+                }
+                files.mark_quant(full, kind);
+                return Ok(Table::Host { qf, sf, kind, q_off, s_off, cols });
+            }
+        }
+        // SAFETY: the table borrows `files` for 'a, which outlives every model holding it.
+        if let Some(st) = unsafe { files.quantized(full, rows, cols)? } {
+            return Ok(match st {
+                Stored::Q8(m) => Table::Q8(m),
+                Stored::Q4(m) => Table::Q4(m),
+            });
+        }
+        let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
+        if info.shape.iter().product::<usize>() != rows * cols {
+            bail!("tensor {full} has shape {:?}, expected [{rows}, {cols}]", info.shape);
+        }
+        let w = files.bf16(full)?;
+        if let Some(k) = store_as.kind() {
+            files.mark_quant(full, k);
+        }
+        Ok(Table::Bf16(w))
+    }
+}
+
+/// A streamed linear weight `[n_out, n_in]` named `full`: pre-quantized from the checkpoint when
+/// present (zero-copy), otherwise bf16 quantized to `q` at load (and recorded for `--save-quantized`).
+pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize, q: Quant) -> Result<Lin<'a>> {
+    files.note_use(full, true, false);
+    // SAFETY: the matrix borrows `files` for 'a, which outlives every model holding it.
+    if let Some(st) = unsafe { files.quantized(full, n_out, n_in)? } {
+        return Ok(match st {
+            Stored::Q8(m) => Lin::q8(m),
+            Stored::Q4(m) => Lin::q4(m),
+        });
+    }
+    let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
+    if info.shape != [n_out, n_in] {
+        bail!("tensor {full} has shape {:?}, expected [{n_out}, {n_in}]", info.shape);
+    }
+    let w = files.bf16(full)?;
+    if let Some(k) = q.kind() {
+        files.mark_quant(full, k);
+    }
+    Ok(match q {
+        Quant::Bf16 => Lin::bf16(w),
+        Quant::Q8 => Lin::q8(quantize_bf16(w, n_out, n_in)),
+        Quant::Q4 => Lin::q4(quantize_q4(w, n_out, n_in)),
+    })
 }
 
 /// A linear layer's weight `[n_out, n_in]`: borrowed bf16 or quantized, plus lazily created
@@ -141,7 +310,7 @@ struct PleLayer<'a> {
 }
 
 struct PleGlobal<'a> {
-    embed: &'a [u16], // [V, L*P]
+    embed: Table<'a>, // [V, L*P]
     proj: Lin<'a>,    // [L*P, H]
     norm: &'a [u16],  // [P]
 }
@@ -174,7 +343,7 @@ pub struct Layer<'a> {
 pub struct Model<'a> {
     pub cfg: TextConfig,
     pub quant: Quant,
-    embed: &'a [u16], // [V, H] for lookups
+    embed: Table<'a>, // [V, H] for lookups
     head: Lin<'a>,    // tied LM head (same values as `embed`)
     ple: Option<PleGlobal<'a>>,
     pub layers: Vec<Layer<'a>>,
@@ -245,9 +414,11 @@ impl Session {
 
 impl<'a> Model<'a> {
     pub fn load(cfg: TextConfig, files: &'a ModelFiles, quant: Quant) -> Result<Self> {
-        let prefix = if files.has("model.language_model.embed_tokens.weight") {
+        let quant = Quant::stored(files).unwrap_or(quant);
+        let has = |n: &str| files.has(n) || files.has(&format!("{n}.q8")) || files.has(&format!("{n}.q4"));
+        let prefix = if has("model.language_model.embed_tokens.weight") {
             "model.language_model."
-        } else if files.has("model.embed_tokens.weight") {
+        } else if has("model.embed_tokens.weight") {
             "model."
         } else {
             bail!("cannot find embed_tokens in checkpoint");
@@ -266,26 +437,20 @@ impl<'a> Model<'a> {
             files.bf16(&full)
         };
         // A streamed linear weight: borrowed bf16 or quantized on load.
-        let lin_with = |name: &str, n_out: usize, n_in: usize, q: Quant| -> Result<Lin<'a>> {
-            let w = get(name, &[n_out, n_in])?;
-            Ok(match q {
-                Quant::Bf16 => Lin::bf16(w),
-                Quant::Q8 => Lin::q8(quantize_bf16(w, n_out, n_in)),
-                Quant::Q4 => Lin::q4(quantize_q4(w, n_out, n_in)),
-            })
-        };
+        let lin_with = |name: &str, n_out: usize, n_in: usize, q: Quant| load_lin(files, &format!("{prefix}{name}"), n_out, n_in, q);
         let lin = |name: &str, n_out: usize, n_in: usize| lin_with(name, n_out, n_in, quant);
         // The PLE projection feeds every layer directly: keep it at Q8 under Q4. The LM head follows
         // GEMMARS_HEAD_Q8=1 (Q8) or defaults to the model precision.
         let hi_quant = if quant == Quant::Q4 { Quant::Q8 } else { quant };
         let head_quant = if quant == Quant::Q4 && std::env::var("GEMMARS_HEAD_Q8").is_ok() { Quant::Q8 } else { quant };
 
-        let embed = get("embed_tokens.weight", &[cfg.vocab_size, h])?;
+        // Tied: lookups and the LM head read the same tensor (one copy in a pre-quantized file).
+        let embed = Table::load(files, &format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h, head_quant)?;
         let head = lin_with("embed_tokens.weight", cfg.vocab_size, h, head_quant)?;
         let final_norm = get("norm.weight", &[h])?;
         let ple = if cfg.has_ple() {
             Some(PleGlobal {
-                embed: get("embed_tokens_per_layer.weight", &[cfg.vocab_size_per_layer_input, nl * p])?,
+                embed: Table::load(files, &format!("{prefix}embed_tokens_per_layer.weight"), cfg.vocab_size_per_layer_input, nl * p, table_quant(quant))?,
                 proj: lin_with("per_layer_model_projection.weight", nl * p, h, hi_quant)?,
                 norm: get("per_layer_projection_norm.weight", &[p])?,
             })
@@ -389,7 +554,10 @@ impl<'a> Model<'a> {
     pub fn embed_scaled(&self, tok: u32) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         let scale = (h as f32).sqrt();
-        self.embed[tok as usize * h..(tok as usize + 1) * h].iter().map(|&s| bf16_to_f32(s) * scale).collect()
+        let mut e = vec![0f32; h];
+        self.embed.row(tok as usize, &mut e);
+        e.iter_mut().for_each(|v| *v *= scale);
+        e
     }
 
     /// Softcapped logits `[t, vocab]` for final-normed hidden states `[t, hidden]`.
@@ -441,11 +609,8 @@ impl<'a> Model<'a> {
         let mut x = vec![0f32; t * h];
         let scale = (h as f32).sqrt();
         for_chunks(&mut x, h, par, |ti, row| {
-            let tok = tokens[ti] as usize;
-            let src = &self.embed[tok * h..(tok + 1) * h];
-            for (r, &s) in row.iter_mut().zip(src) {
-                *r = bf16_to_f32(s) * scale;
-            }
+            self.embed.row(tokens[ti] as usize, row);
+            row.iter_mut().for_each(|v| *v *= scale);
         });
         // Multimodal soft tokens replace the placeholder embeddings; PLE uses the pad token there.
         let mut ple_tokens: Vec<u32> = tokens.to_vec();
@@ -465,14 +630,14 @@ impl<'a> Model<'a> {
             let s_emb = (p as f32).sqrt();
             let s_out = std::f32::consts::FRAC_1_SQRT_2;
             for_chunks(&mut proj, nl * p, par, |ti, row| {
-                let tok = tokens[ti] as usize;
-                let emb = &ple.embed[tok * nl * p..(tok + 1) * nl * p];
+                let mut emb = vec![0f32; nl * p];
+                ple.embed.row(tokens[ti] as usize, &mut emb);
                 for l in 0..nl {
                     let chunk = &mut row[l * p..(l + 1) * p];
                     scale_inplace(chunk, s_proj);
                     rmsnorm_inplace(chunk, Some(ple.norm), eps);
                     for (j, c) in chunk.iter_mut().enumerate() {
-                        *c = (*c + bf16_to_f32(emb[l * p + j]) * s_emb) * s_out;
+                        *c = (*c + emb[l * p + j] * s_emb) * s_out;
                     }
                 }
             });

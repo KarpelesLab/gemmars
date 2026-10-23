@@ -108,6 +108,7 @@ Useful flags:
 | `--draft DIR` | speculative decoding with Google's `gemma-4-E4B-it-assistant` drafter (greedy only; output identical to plain greedy) |
 | `--draft-tokens N` | max draft tokens per round (default 6; the length adapts between 2 and N) |
 | `--mmap` | map weights from disk instead of copying them into RAM |
+| `--save-quantized DIR` | write a pre-quantized, text-only checkpoint at `--quant` precision (see below) and exit |
 | `--devices` | list detected CPU features and GPUs (Metal, CUDA, Vulkan) and exit |
 | `--device D` | `auto` (default: use a GPU backend when one exists), `cpu`, `metal`, `cuda`, `vulkan` |
 | `--prefill-chunk N` | tokens per prefill chunk (default 256 on the CPU, 1024 when a GPU backend is active) |
@@ -165,6 +166,38 @@ about 1e-5 nats for Q8 and 3e-5 nats for Q4 on E4B, with the same top-5 tokens. 
 publishes `gemma-4-*-it-qat-q4_0-unquantized` checkpoints trained for Q4_0; they load the same
 way (`--quant q4` on that directory) but did not measure better than Q4 of the regular weights
 here, and they are a different fine-tune (KL 0.03 from the regular model).
+
+### Pre-quantized checkpoints
+
+`--quant` normally quantizes the bf16 weights at every start. `--save-quantized DIR` writes the
+result instead, so later runs (and browsers) load the int8 / int4 blocks as they are:
+
+```sh
+./target/release/gemmars --model google/gemma-4-E4B-it --quant q4 --save-quantized models/gemma-4-E4B-it-q4
+./target/release/gemmars --model models/gemma-4-E4B-it-q4 -p "Hello"     # precision comes from the file
+```
+
+The output is ordinary safetensors: each quantized matrix `X` becomes `X.q8` (I8) + `X.q8s` (F32
+scales) or `X.q4` (U8, two nibbles per byte) + `X.q4s` (F16 scales), in exactly the in-memory
+layout of the kernels, so the loader borrows them without copying (`QBuf`). Only the tensors the
+text model reads are written (no vision/audio towers, no Qwen MTP head); `__metadata__` records the
+precision. Shards are at most 1 GiB (one allocation must stay under 2 GiB in wasm32), and large
+tensors start on 16 KiB boundaries so Metal wraps them in place. The embedding tables are stored
+quantized too and dequantized one row per token; tables that are only ever looked up (Gemma's
+per-layer embeddings, Qwen 27B's untied input embedding) go to separate `model-tables-*` shards,
+which the browser host keeps outside wasm memory. `GEMMARS_TABLE_QUANT=bf16|q8|q4` overrides
+their precision (default: the model's).
+
+| Model | bf16 checkpoint | Q4 file | Load (in RAM) | KL vs bf16: Q4 at load / Q4 file |
+|---|---|---|---|---|
+| E2B-it | 10.2 GB | 2.6 GB | 0.40 s | 6.5e-4 / 5.9e-4 |
+| E4B-it | 16.0 GB | 4.2 GB | 0.48 s (was 1.51 s) | 0.167 / 0.181 |
+| Qwen3.8-27B | 55.6 GB | 15.1 GB | 2.55 s (4.6 s with `--mmap` before) | 0.130 / 0.133 (vs Q8) |
+
+The KL column uses one fixed prompt whose last-token distribution is unusually sensitive; what it
+shows is that the file adds nothing on top of Q4 itself (the per-layer embedding table at Q4 is
+within noise of keeping it at higher precision). Q8 files match Q8-at-load the same way (E4B
+7.1e-5 vs 6.7e-5). On Qwen3.5-0.8B, Q4 is too lossy in either form (KL ~1.3); use Q8 there.
 
 ### Speculative decoding
 
@@ -258,8 +291,15 @@ WebGL is not used: it has no compute shaders.
 cd web && cargo build --release --target wasm32-unknown-unknown     # web/target/.../gemmars_web.wasm
 deno run --allow-net --allow-read web/serve.ts ~/.cache/gemmars/hub   # http://localhost:8080/, models at /models/<dir>
 # or from Deno directly (Deno has WebGPU, but its readback polls every ~14 ms, so --cpu is as fast there):
-deno run --allow-read --allow-env web/run.mjs --model ~/.cache/gemmars/hub/Qwen--Qwen3.5-0.8B --quant q8 -p "Hello"
+deno run --allow-read --allow-env web/run.mjs --model models/gemma-4-E4B-it-q4 --cpu -p "Hello"
 ```
+
+Point the page (or `run.mjs`) at a pre-quantized checkpoint (`--save-quantized`, see above): it
+downloads only the quantized bytes and uses them in place, and its `model-tables-*` shards stay in
+JavaScript memory, read one row per token. That is what makes the larger models fit: E4B at Q4
+puts 2.6 GB in wasm memory and 1.6 GB of per-layer embeddings in JavaScript. Plain bf16
+checkpoints still work for small models (they are quantized in the module, which then holds both
+copies).
 
 Headless Chrome 155, Qwen3.5-0.8B Q8, 123-token prompt, single CPU thread (the browser build has
 no threads):
@@ -270,11 +310,19 @@ no threads):
 | WebGPU prefill, first turn (includes the weight upload) | 165 tok/s | 38 tok/s |
 | WebGPU prefill, steady state | 231 tok/s | 38 tok/s |
 
-Limits: 4 GiB of wasm memory means the bf16 checkpoint plus its quantized copy must fit, so today
-only models up to ~2 GB of bf16 weights load in the browser (Qwen3.5-0.8B; the Gemma E2B/E4B
-checkpoints are 10-16 GB). A pre-quantized checkpoint format, loaded zero-copy, would lift that to
-E4B at Q4 (2.6 GB) and is the next step. Decode stays on the CPU for the same reasons as on Metal.
-`web/test_gemm.mjs` checks the WGSL kernels against a JavaScript reference.
+Gemma 4 from pre-quantized Q4 files, same page, same 115-token prompt (second turn, weights
+already on the GPU); the output text is identical with and without WebGPU, and 40 greedy tokens
+from the wasm build match the native binary on the same file:
+
+| Model | CPU prefill | WebGPU prefill | Decode |
+|---|---|---|---|
+| E2B-it Q4 | 10 tok/s | 124 tok/s | 7.7 tok/s |
+| E4B-it Q4 | 5 tok/s | 125 tok/s | 4.0 tok/s |
+
+Limits: decode is single-threaded CPU and bandwidth-bound (one core streams ~10 GB/s of Q4
+weights), and stays off the GPU for the same reasons as on Metal. Weights in module memory must
+fit in 4 GiB, and no single file can exceed 2 GiB. `web/test_gemm.mjs` checks the WGSL kernels
+against a JavaScript reference.
 
 Feature flags: `media` (oxideav image/audio decoding), `hf` (HuggingFace fetching), `gpu`
 (dlsym-loaded backends); all on by default, `--no-default-features` gives the plain CPU build.

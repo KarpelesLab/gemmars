@@ -10,7 +10,7 @@ use gemmars::hf;
 use gemmars::media;
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
@@ -42,6 +42,7 @@ struct Args {
     max_soft_tokens: usize,
     cache_dir: Option<PathBuf>,
     download_only: bool,
+    save_quantized: Option<PathBuf>,
     device: platform::DevicePref,
     devices: bool,
 }
@@ -78,6 +79,8 @@ fn usage() -> ! {
          \x20 --dump-mm PREFIX     write multimodal soft tokens / patches as f32 files (for reference checks)\n\
          \x20 --cache-dir DIR      where fetched models are cached\n\
          \x20 --download-only      fetch the model (and drafter) and exit\n\
+         \x20 --save-quantized DIR write a text-only checkpoint with the weights already quantized to\n\
+         \x20                      --quant (loads zero-copy with no quantization pass; for browsers, mmap)\n\
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
@@ -115,6 +118,7 @@ fn parse_args() -> Result<Args> {
         max_soft_tokens: 0,
         cache_dir: None,
         download_only: false,
+        save_quantized: None,
         device: platform::DevicePref::Auto,
         devices: false,
     };
@@ -154,6 +158,10 @@ fn parse_args() -> Result<Args> {
             "--max-soft-tokens" => a.max_soft_tokens = val()?.parse()?,
             "--cache-dir" => a.cache_dir = Some(PathBuf::from(val()?)),
             "--download-only" => a.download_only = true,
+            "--save-quantized" => {
+                a.save_quantized = Some(PathBuf::from(val()?));
+                a.mmap = true;
+            }
             "--devices" => a.devices = true,
             "--device" => {
                 let v = val()?;
@@ -594,6 +602,37 @@ fn resolve_model(spec: &str, cache_dir: Option<&std::path::Path>) -> Result<Path
     }
 }
 
+/// Writes the tensors the loader used, quantized as loaded, plus the config and tokenizer files.
+fn save_quantized(src: &Path, out: &Path, files: &safetensors::ModelFiles, quant: Quant) -> Result<()> {
+    if out.exists() && std::fs::canonicalize(out)? == std::fs::canonicalize(src)? {
+        bail!("refusing to write into the source directory {}", src.display());
+    }
+    std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
+    let t0 = Instant::now();
+    let table = gemmars::model::table_quant(quant);
+    let source = src.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let written = files.write_quantized(
+        out,
+        &[("format", "pt"), ("gemmars_quant", quant.as_str()), ("gemmars_table_quant", table.as_str()), ("gemmars_source", &source)],
+    )?;
+    let mut copied = Vec::new();
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().to_string();
+        let keep = (name.ends_with(".json") && name != "model.safetensors.index.json") || name.ends_with(".jinja");
+        if keep && e.file_type()?.is_file() {
+            std::fs::copy(e.path(), out.join(&name))?;
+            copied.push(name);
+        }
+    }
+    copied.sort();
+    for (p, size) in &written {
+        eprintln!("[wrote {} ({:.2} GB)]", p.display(), *size as f64 / 1e9);
+    }
+    eprintln!("[{} weights, tables {}; copied {}; {:.1}s]", quant.as_str(), table.as_str(), copied.join(", "), t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = parse_args()?;
     if args.devices {
@@ -759,6 +798,9 @@ fn run_qwen(args: Args) -> Result<()> {
         pool::threads(),
         t0.elapsed().as_secs_f64()
     );
+    if let Some(out) = &args.save_quantized {
+        return save_quantized(&args.model, out, &files, model.quant);
+    }
     run_text(&args, &model, &tok, &eos, &chat::QwenChat)
 }
 
@@ -781,6 +823,9 @@ fn run_gemma(args: Args) -> Result<()> {
         pool::threads(),
         t0.elapsed().as_secs_f64()
     );
+    if let Some(out) = &args.save_quantized {
+        return save_quantized(&args.model, out, &files, model.quant);
+    }
     if args.preload && args.mmap {
         let t = Instant::now();
         files.preload();

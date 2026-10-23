@@ -37,7 +37,7 @@
     <label>or local folder <input type="file" id="folder" webkitdirectory directory multiple></label>
   </div>
   <div class="row">
-    <label>Weights <select id="quant"><option value="q4">q4 (smallest)</option><option value="q8" selected>q8</option><option value="bf16">bf16</option></select></label>
+    <label>Weights <select id="quant" title="Pre-quantized checkpoints (--save-quantized) carry their own precision"><option value="q4">q4 (smallest)</option><option value="q8" selected>q8</option><option value="bf16">bf16</option></select></label>
     <label><input type="checkbox" id="gpu" checked> WebGPU for prefill</label>
     <label>Prefill chunk <input type="number" id="chunk" value="0" min="0" step="16" style="width:80px" title="0 = default (512 with WebGPU, 256 on CPU)"></label>
     <button class="primary" id="load">Load</button>
@@ -63,7 +63,7 @@
 <pre id="log"></pre>
 
 <script type="module">
-import { Gemmars, WebGpuHost, hasJspi } from './gemmars.js';
+import { Gemmars, WebGpuHost, hasJspi, isHostShard } from './gemmars.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -84,6 +84,26 @@ async function fetchInto(g, base, name, path, onProgress) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
   const size = Number(r.headers.get('content-length') || 0);
+  if (isHostShard(name)) {
+    // Lookup tables stay in JavaScript memory; the module reads one row per token.
+    const bytes = size ? new Uint8Array(size) : null;
+    let got = 0;
+    if (bytes && r.body) {
+      const reader = r.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes.set(value, got);
+        got += value.byteLength;
+        onProgress(got, size);
+      }
+      g.putHostFile(path, bytes);
+      return size;
+    }
+    const all = new Uint8Array(await r.arrayBuffer());
+    g.putHostFile(path, all);
+    return all.byteLength;
+  }
   if (size && r.body) {
     const w = g.putFileStream(path, size);
     const reader = r.body.getReader();
@@ -136,6 +156,11 @@ async function loadFromFiles(g, fileList) {
   if (!files.length) throw new Error('no model files in that folder');
   let total = 0;
   for (const [i, f] of files.entries()) {
+    if (isHostShard(f.name)) {
+      g.putHostFile(`/model/${f.name}`, new Uint8Array(await f.arrayBuffer()));
+      total += f.size;
+      continue;
+    }
     const w = g.putFileStream(`/model/${f.name}`, f.size);
     const reader = f.stream().getReader();
     let got = 0;

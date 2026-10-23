@@ -271,8 +271,15 @@ export class Gemmars {
     jspi = jspi && hasJspi;
     g.gpu = jspi ? gpu : null;
     if (gpu && !jspi) log('[webgpu: no JSPI (WebAssembly.Suspending) on this engine; using CPU]');
+    g.hostFiles = [];
     const env = {
       host_log: (p, n) => log(g.str(p, n)),
+      host_read: (id, off, p, n) => {
+        const src = g.hostFiles[id];
+        if (!src || off + n > src.byteLength) return 1;
+        g.u8(p, n).set(src.subarray(off, off + n));
+        return 0;
+      },
       host_now_ms: () => performance.now(),
       host_random: (p, n) => {
         const v = g.u8(p, n);
@@ -360,7 +367,18 @@ export class Gemmars {
     };
   }
 
-  /// quant: 'bf16' | 'q8' | 'q4'.
+  /// Registers `bytes` (Uint8Array, kept in JavaScript memory) as `path`; the module reads it by
+  /// range. For lookup-table shards, which would not fit in wasm memory alongside the weights.
+  putHostFile(path, bytes) {
+    const id = this.hostFiles.length;
+    this.hostFiles.push(bytes);
+    const [pp, pn] = this.strArg(path);
+    const rc = this.ex.web_put_host_file(pp, pn, id, bytes.byteLength);
+    this.ex.web_free(pp, pn);
+    if (rc < 0) throw new Error(this.lastError());
+  }
+
+  /// quant: 'bf16' | 'q8' | 'q4' (ignored for pre-quantized checkpoints, which carry their own).
   load(dir, quant = 'q8', { prefillChunk = 0 } = {}) {
     const q = { bf16: 0, q8: 1, q4: 2 }[quant];
     const [dp, dn] = this.strArg(dir);
@@ -425,4 +443,10 @@ export class Gemmars {
 /// Model files to register for a directory listing: config, tokenizer, generation config, shards.
 export function wantedFiles(names) {
   return names.filter((n) => n === 'config.json' || n === 'generation_config.json' || n === 'tokenizer.json' || n === 'tokenizer_config.json' || n === 'model.safetensors.index.json' || n.endsWith('.safetensors'));
+}
+
+/// Shards written by `--save-quantized` that only hold lookup tables; the hosts keep these in
+/// JavaScript memory (`putHostFile`) instead of module memory.
+export function isHostShard(name) {
+  return /^model-tables(-\d+-of-\d+)?\.safetensors$/.test(name);
 }

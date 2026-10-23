@@ -7,6 +7,14 @@ use crate::quant::PageVec;
 use anyhow::{Context, Result};
 use std::path::Path;
 
+/// A file kept by the host instead of in module memory, read by byte range (browser only: lets a
+/// model use lookup tables larger than what fits in the 4 GiB wasm address space).
+#[derive(Clone, Copy, Debug)]
+pub struct HostFile {
+    pub id: u32,
+    pub len: usize,
+}
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod imp {
     use super::*;
@@ -21,6 +29,12 @@ mod imp {
         let len = file.metadata()?.len() as usize;
         Ok((crate::safetensors::read_file_parallel(&file, len)?, len))
     }
+    pub fn host_file(_path: &Path) -> Option<HostFile> {
+        None
+    }
+    pub fn read_host(_f: HostFile, _offset: u64, _buf: &mut [u8]) -> Result<()> {
+        anyhow::bail!("host-backed files exist only in the browser build")
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -31,6 +45,31 @@ mod imp {
 
     thread_local! {
         static FILES: RefCell<HashMap<String, (PageVec<u64>, usize)>> = RefCell::new(HashMap::new());
+        static HOST: RefCell<HashMap<String, HostFile>> = RefCell::new(HashMap::new());
+    }
+
+    #[link(wasm_import_module = "env")]
+    unsafe extern "C" {
+        /// Copies `len` bytes at `offset` of host file `id` into `ptr`; returns 0 on success.
+        fn host_read(id: u32, offset: f64, ptr: *mut u8, len: usize) -> i32;
+    }
+
+    /// Registers a file the host keeps (see `HostFile`).
+    pub fn put_host(path: &str, f: HostFile) {
+        HOST.with(|h| h.borrow_mut().insert(key(Path::new(path)), f));
+    }
+    pub fn host_file(path: &Path) -> Option<HostFile> {
+        HOST.with(|h| h.borrow().get(&key(path)).copied())
+    }
+    pub fn read_host(f: HostFile, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if offset as usize + buf.len() > f.len {
+            anyhow::bail!("host read past the end of file {}", f.id);
+        }
+        let rc = unsafe { host_read(f.id, offset as f64, buf.as_mut_ptr(), buf.len()) };
+        if rc != 0 {
+            anyhow::bail!("host read of file {} failed ({rc})", f.id);
+        }
+        Ok(())
     }
 
     fn key(path: &Path) -> String {
@@ -60,7 +99,7 @@ mod imp {
         })
     }
     pub fn exists(path: &Path) -> bool {
-        FILES.with(|f| f.borrow().contains_key(&key(path)))
+        FILES.with(|f| f.borrow().contains_key(&key(path))) || host_file(path).is_some()
     }
     /// Takes a file out of the table (large checkpoints are consumed, not copied).
     pub fn read_pages(path: &Path) -> Result<(PageVec<u64>, usize)> {

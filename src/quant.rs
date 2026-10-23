@@ -56,10 +56,60 @@ impl<T: Copy> DerefMut for PageVec<T> {
     }
 }
 
+/// Storage for quantized data: either owned (quantized at load time) or borrowed from a
+/// pre-quantized checkpoint that outlives the matrix (the model borrows its `ModelFiles`).
+pub struct QBuf<T: Copy> {
+    ptr: *const T,
+    len: usize,
+    _own: Option<PageVec<T>>,
+}
+unsafe impl<T: Copy + Send> Send for QBuf<T> {}
+unsafe impl<T: Copy + Sync> Sync for QBuf<T> {}
+
+impl<T: Copy> QBuf<T> {
+    /// Borrows `s` without copying.
+    ///
+    /// # Safety
+    /// `s` must stay valid and unmodified for as long as the returned buffer is used.
+    pub unsafe fn borrowed(s: &[T]) -> Self {
+        Self { ptr: s.as_ptr(), len: s.len(), _own: None }
+    }
+    pub fn is_borrowed(&self) -> bool {
+        self._own.is_none()
+    }
+}
+impl<T: Copy> From<PageVec<T>> for QBuf<T> {
+    fn from(v: PageVec<T>) -> Self {
+        Self { ptr: v.as_ptr(), len: v.len(), _own: Some(v) }
+    }
+}
+impl<T: Copy> Deref for QBuf<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// Quantized storage formats, as recorded in and read from pre-quantized checkpoints.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QKind {
+    Q8,
+    Q4,
+}
+
+impl QKind {
+    pub fn suffix(self) -> &'static str {
+        match self {
+            QKind::Q8 => "q8",
+            QKind::Q4 => "q4",
+        }
+    }
+}
+
 /// A quantized `[n_out, n_in]` matrix: int8 values plus one scale per 32-element block.
 pub struct QMatrix {
-    pub q: PageVec<i8>,
-    pub scales: PageVec<f32>,
+    pub q: QBuf<i8>,
+    pub scales: QBuf<f32>,
     pub n_out: usize,
     pub n_in: usize,
 }
@@ -119,7 +169,7 @@ pub fn quantize_bf16(w: &[u16], n_out: usize, n_in: usize) -> QMatrix {
             }
         }
     });
-    QMatrix { q, scales, n_out, n_in }
+    QMatrix { q: q.into(), scales: scales.into(), n_out, n_in }
 }
 
 /// Quantized activations `[t, n_in]`: int8 values and one scale per block.
@@ -183,8 +233,8 @@ pub fn dequantize_rows(m: &QMatrix, r0: usize, r1: usize, out: &mut [f32]) {
 // ---------------------------------------------------------------------------
 
 pub struct Q4Matrix {
-    pub q: PageVec<u8>,       // [n_out, n_in/2]
-    pub scales: PageVec<u16>, // f16, [n_out, n_in/32]
+    pub q: QBuf<u8>,       // [n_out, n_in/2]
+    pub scales: QBuf<u16>, // f16, [n_out, n_in/32]
     pub n_out: usize,
     pub n_in: usize,
 }
@@ -244,7 +294,7 @@ pub fn quantize_q4(w: &[u16], n_out: usize, n_in: usize) -> Q4Matrix {
             }
         }
     });
-    Q4Matrix { q, scales, n_out, n_in }
+    Q4Matrix { q: q.into(), scales: scales.into(), n_out, n_in }
 }
 
 /// Dequantizes rows `r0..r1` of `m` into `out` (f32 row-major).
