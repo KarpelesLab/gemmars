@@ -1,7 +1,9 @@
 use gemmars::chat::{self, ChatFormat};
 use gemmars::model::{Model, Quant, Session};
 use gemmars::sampler::{argmax, Sampler};
-use gemmars::{audio, config, drafter, mm_config, platform, pool, prof, qwen, safetensors, vision};
+use gemmars::{config, drafter, platform, pool, prof, qwen, safetensors};
+#[cfg(feature = "media")]
+use gemmars::{audio, mm_config, vision};
 #[cfg(feature = "hf")]
 use gemmars::hf;
 #[cfg(feature = "media")]

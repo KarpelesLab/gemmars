@@ -84,10 +84,12 @@ fn read_file_parallel(file: &File, len: usize) -> Result<PageVec<u64>> {
     Ok(buf)
 }
 
-#[derive(Clone, Copy)]
 #[cfg(unix)]
+#[derive(Clone, Copy)]
 struct SendBytes(*mut u8);
+#[cfg(unix)]
 unsafe impl Send for SendBytes {}
+#[cfg(unix)]
 unsafe impl Sync for SendBytes {}
 #[cfg(unix)]
 impl SendBytes {

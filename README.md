@@ -19,6 +19,7 @@ decoding produces identical tokens.
 | google/gemma-4-31B-it | 31B | 62 GB | supported, sharded loading, untested |
 | google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
 | Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text only; matches the bf16 reference; see below |
+| Qwen/Qwen3.5-0.8B | 0.8B | 1.7 GB | text only; the small one used for the wasm measurements |
 
 ### Qwen3.5 / Qwen3.8
 
@@ -197,7 +198,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 | Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled GEMM (`cuda.rs`) | compile-checked only, not yet run on NVIDIA hardware |
 | Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |
 | Vulkan | detection only (device name and memory) | no compute yet |
-| wasm32 | scalar kernels, single-threaded pool | `cargo check --target wasm32-wasip1 --no-default-features` |
+| wasm32 (WASI) | simd128 kernels (bf16, Q8, Q4), threads via wasi-threads | measured: Qwen3.5-0.8B Q8 at 123 tok/s decode with 16 threads under wasmtime 30, identical output to native; see below |
 
 What the GPU does and does not do: every backend only takes prefill-sized matmuls (`t >= 16`
 tokens and enough FLOPs to amortize the ~0.15 ms it costs to submit and wait for a Metal command
@@ -208,6 +209,35 @@ threadgroup, `simdgroup_float8x8`, weights dequantized to f32 in threadgroup mem
 the CPU on purpose: it is bandwidth-bound, the CPU already streams weights at ~280 GB/s, and the
 GPU's ~450 GB/s only pays off if the entire forward pass moves over (attention, norms, the KV
 cache), which is the next step if decode speed on the GPU is wanted.
+
+### WebAssembly
+
+`.cargo/config.toml` turns on `simd128` for the wasm targets (every current engine supports it;
+without it the scalar kernels are used, ~8x slower on Q8 decode) and raises the shared-memory
+maximum for the threads target to 4 GiB. The model directory is passed in as a preopened directory:
+
+```sh
+# single-threaded, runs under Node's built-in WASI (node --experimental-wasi ... on older versions)
+cargo build --release --target wasm32-wasip1 --no-default-features
+# threads (wasi-threads): wasmtime up to v30 runs it; v31+ dropped the wasi-threads proposal
+cargo build --release --target wasm32-wasip1-threads --no-default-features
+wasmtime run -W threads=y -S threads=y --dir ~/.cache/gemmars/hub/Qwen--Qwen3.5-0.8B::/model \
+  target/wasm32-wasip1-threads/release/gemmars.wasm --model /model --quant q8 -j 16 -p "Hello"
+```
+
+Qwen3.5-0.8B Q8, 18-core M5 Max, 17-token prompt:
+
+| Build | Threads | Prefill | Decode |
+|---|---|---|---|
+| wasm32-wasip1, scalar | 1 | 9 tok/s | 4.6 tok/s |
+| wasm32-wasip1, simd128 | 1 | 29 tok/s | 40 tok/s |
+| wasm32-wasip1-threads, simd128 | 16 | 327 tok/s | 123 tok/s |
+| native (NEON) | 18 | 373 tok/s | 184 tok/s |
+
+Memory is 32-bit, so a model plus its quantized copy must fit in 4 GiB (`--quant q4` on a 2B
+model is fine; the 27B models are not). No file mapping exists in WASI, so the checkpoint is
+always read into memory. There is no WebGPU backend yet; a browser build would also need JS glue
+for fetching the weights, which is not part of this repository.
 
 Feature flags: `media` (oxideav image/audio decoding), `hf` (HuggingFace fetching), `gpu`
 (dlsym-loaded backends); all on by default, `--no-default-features` gives the plain CPU build.
@@ -220,7 +250,7 @@ Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex bac
 - `platform.rs`: CPU feature and GPU detection (sysctl / procfs for memory, Metal via `objc_msgSend`,
   CUDA driver API, Vulkan loader), all through `dlsym`; `gpu.rs`: the `Backend` trait the linear layers
   dispatch through and the registry; `metal.rs`, `cuda.rs`: the backends with their shader sources.
-- `kernels.rs`: NEON kernels (`kernels_x86.rs`: the AVX2 equivalents). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
+- `kernels.rs`: NEON kernels (`kernels_x86.rs`, `kernels_wasm.rs`: the AVX2 and simd128 equivalents, selected by `build.rs` through the `has_simd` cfg). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
   prefers few long streams); prefill packs activations into 8-token panels and runs an 8-row x 8-token
   outer-product kernel that broadcasts bf16 weights by lane. Also RMSNorm, GELU (tanh approximation via
   a fast exp), RoPE tables, softmax.

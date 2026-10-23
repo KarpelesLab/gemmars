@@ -3,3 +3,11 @@ rustflags = ["-C", "target-cpu=native"]
 
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "target-feature=+neon,+dotprod,+fp16,+i8mm"]
+
+# wasm: simd128 is a compile-time choice (every current engine has it); the threads target also
+# needs a declared maximum for its shared memory (defaults to 1 GiB, too small for most models).
+[target.wasm32-wasip1]
+rustflags = ["-C", "target-feature=+simd128"]
+
+[target.wasm32-wasip1-threads]
+rustflags = ["-C", "target-feature=+simd128", "-C", "link-arg=--max-memory=4294967296"]

@@ -112,9 +112,6 @@ impl Pool {
     /// A pool using `threads` threads in total (the caller counts as one).
     pub fn new(threads: usize) -> Self {
         raise_qos();
-        // Without OS threads (wasm32 outside wasi-threads) everything runs inline.
-        let threads = if cfg!(target_arch = "wasm32") && !cfg!(target_feature = "atomics") { 1 } else { threads };
-        let workers = threads.max(1) - 1;
         let shared = Arc::new(Shared {
             generation: AtomicU64::new(0),
             region: AtomicPtr::new(std::ptr::null_mut()),
@@ -122,17 +119,17 @@ impl Pool {
             sleepers: AtomicUsize::new(0),
             exit: AtomicBool::new(false),
         });
-        let handles = (0..workers)
-            .map(|i| {
-                let s = shared.clone();
-                thread::Builder::new()
-                    .name(format!("gemmars-{i}"))
-                    .spawn(move || worker(s))
-                    .expect("spawn worker")
-                    .thread()
-                    .clone()
-            })
-            .collect();
+        // Spawning can fail where the platform has no threads (wasm32 outside wasi-threads, where
+        // `spawn` returns Unsupported); whatever was spawned is the pool, the rest runs inline.
+        let mut handles: Vec<thread::Thread> = Vec::with_capacity(threads.max(1) - 1);
+        for i in 0..threads.max(1) - 1 {
+            let s = shared.clone();
+            match thread::Builder::new().name(format!("gemmars-{i}")).spawn(move || worker(s)) {
+                Ok(h) => handles.push(h.thread().clone()),
+                Err(_) => break,
+            }
+        }
+        let workers = handles.len();
         Self { shared, handles, workers }
     }
 

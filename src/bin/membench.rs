@@ -2,7 +2,7 @@
 //! usage: membench [GB]   (default 4 GB buffer)
 
 use gemmars::{kernels, pool};
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", target_arch = "aarch64"))]
 use gemmars::quant;
 use std::time::Instant;
 

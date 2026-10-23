@@ -89,6 +89,19 @@ impl<'a> QwenModel<'a> {
             }
             files.bf16(full)
         };
+        // Small parameter vectors are stored as BF16 in some checkpoints and F32 in others.
+        let getf = |full: &str, shape: &[usize]| -> Result<Vec<f32>> {
+            let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
+            if info.shape != shape {
+                bail!("tensor {full} has shape {:?}, expected {:?}", info.shape, shape);
+            }
+            let b = files.bytes(full)?;
+            Ok(match info.dtype.as_str() {
+                "BF16" => b.chunks_exact(2).map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+                "F32" => b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                other => bail!("tensor {full} has dtype {other}, expected BF16 or F32"),
+            })
+        };
         let lin = |full: &str, n_out: usize, n_in: usize| -> Result<Lin<'a>> {
             let w = get(full, &[n_out, n_in])?;
             Ok(match quant {
@@ -128,17 +141,17 @@ impl<'a> QwenModel<'a> {
                 })
             } else {
                 let gp = format!("{lp}linear_attn.");
-                let conv_w = get(&format!("{gp}conv1d.weight"), &[conv_dim, 1, kc])?.iter().map(|&v| bf16_to_f32(v)).collect();
-                let a_log = get(&format!("{gp}A_log"), &[nv])?;
+                let conv_w = getf(&format!("{gp}conv1d.weight"), &[conv_dim, 1, kc])?;
+                let a_log = getf(&format!("{gp}A_log"), &[nv])?;
                 Mixer::Gdn(Gdn {
                     qkv: lin(&format!("{gp}in_proj_qkv.weight"), conv_dim, h)?,
                     z: lin(&format!("{gp}in_proj_z.weight"), value_dim, h)?,
                     b: lin(&format!("{gp}in_proj_b.weight"), nv, h)?,
                     a: lin(&format!("{gp}in_proj_a.weight"), nv, h)?,
                     conv_w,
-                    decay_coef: a_log.iter().map(|&v| -bf16_to_f32(v).exp()).collect(),
-                    dt_bias: get(&format!("{gp}dt_bias"), &[nv])?.iter().map(|&v| bf16_to_f32(v)).collect(),
-                    norm_w: get(&format!("{gp}norm.weight"), &[hdv])?.iter().map(|&v| bf16_to_f32(v)).collect(),
+                    decay_coef: a_log.iter().map(|&v| -v.exp()).collect(),
+                    dt_bias: getf(&format!("{gp}dt_bias"), &[nv])?,
+                    norm_w: getf(&format!("{gp}norm.weight"), &[hdv])?,
                     out: lin(&format!("{gp}out_proj.weight"), h, value_dim)?,
                 })
             };
