@@ -98,7 +98,7 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     if sizes.contains_key("model.safetensors") {
         files.push("model.safetensors".into());
     } else if sizes.contains_key("model.safetensors.index.json") {
-        fetch_file(repo, dir, "model.safetensors.index.json", sizes["model.safetensors.index.json"])?;
+        fetch_file(repo, dir, "model.safetensors.index.json", sizes["model.safetensors.index.json"], 0, 0)?;
         let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json"))?)?;
         let mut shards: Vec<String> = idx["weight_map"]
             .as_object()
@@ -112,13 +112,46 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     } else {
         bail!("{repo}: no safetensors weights found");
     }
-    for f in &files {
-        fetch_file(repo, dir, f, sizes.get(f).copied().flatten())?;
+    let count = files.len();
+    for (i, f) in files.iter().enumerate() {
+        fetch_file(repo, dir, f, sizes.get(f).copied().flatten(), i + 1, count)?;
     }
     Ok(())
 }
 
-fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>) -> Result<()> {
+fn human_gb(b: u64) -> String {
+    if b >= 1_000_000_000 { format!("{:.2} GB", b as f64 / 1e9) } else { format!("{:.1} MB", b as f64 / 1e6) }
+}
+
+/// Renders a progress line: `[=====>     ]  42.0%  3.21/7.64 GB  31 MB/s  eta 2m10s`.
+fn progress_line(label: &str, done: u64, total: Option<u64>, secs: f64) -> String {
+    let rate = done as f64 / secs.max(1e-3);
+    let speed = format!("{:5.0} MB/s", rate / 1e6);
+    match total {
+        Some(t) if t > 0 => {
+            let frac = (done as f64 / t as f64).clamp(0.0, 1.0);
+            let width = 30usize;
+            let filled = (frac * width as f64) as usize;
+            let bar: String = (0..width).map(|i| if i < filled { '=' } else if i == filled { '>' } else { ' ' }).collect();
+            let eta = if rate > 0.0 { ((t - done) as f64 / rate) as u64 } else { 0 };
+            // The rate is noise for the first second; show no estimate yet.
+            let eta_s = if secs < 1.0 {
+                "--".to_string()
+            } else if eta >= 3600 {
+                format!("{}h{:02}m", eta / 3600, (eta % 3600) / 60)
+            } else if eta >= 60 {
+                format!("{}m{:02}s", eta / 60, eta % 60)
+            } else {
+                format!("{eta}s")
+            };
+            format!("  {label} [{bar}] {:5.1}%  {}/{}  {speed}  eta {eta_s}", frac * 100.0, human_gb(done), human_gb(t))
+        }
+        _ => format!("  {label} {}  {speed}", human_gb(done)),
+    }
+}
+
+fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, index: usize, count: usize) -> Result<()> {
+    use std::io::IsTerminal;
     let path = dir.join(name);
     if let Ok(md) = std::fs::metadata(&path) {
         if md.len() > 0 && expected.is_none_or(|s| s == md.len()) {
@@ -127,35 +160,47 @@ fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>) -> Resu
     }
     let url = format!("https://huggingface.co/{repo}/resolve/main/{name}");
     let t0 = Instant::now();
-    let label = name.to_string();
+    let label = format!("[{index}/{count}] {name}");
+    let tty = std::io::stderr().is_terminal();
     let mut last = Instant::now();
+    let mut last_pct = -1i64;
+    let plabel = label.clone();
     let opts = DownloadOptions {
         progress: Some(Box::new(move |done: u64, total: Option<u64>| {
-            if last.elapsed().as_millis() >= 500 {
-                last = Instant::now();
-                let secs = t0.elapsed().as_secs_f64().max(1e-3);
-                match total {
-                    Some(t) if t > 0 => eprint!(
-                        "\r  {label}: {:5.1}% of {:.2} GB  {:.0} MB/s   ",
-                        100.0 * done as f64 / t as f64,
-                        t as f64 / 1e9,
-                        done as f64 / secs / 1e6
-                    ),
-                    _ => eprint!("\r  {label}: {:.2} GB   ", done as f64 / 1e9),
+            let secs = t0.elapsed().as_secs_f64();
+            if tty {
+                if last.elapsed().as_millis() >= 200 {
+                    last = Instant::now();
+                    eprint!("\r\x1b[K{}", progress_line(&plabel, done, total, secs));
+                }
+            } else {
+                // Not a terminal: one log line per 5% (or every 30 s when the size is unknown).
+                let pct = total.filter(|&t| t > 0).map(|t| (done * 100 / t) as i64 / 5 * 5);
+                let due = match pct {
+                    Some(p) => p != last_pct,
+                    None => last.elapsed().as_secs() >= 30,
+                };
+                if due {
+                    last = Instant::now();
+                    last_pct = pct.unwrap_or(-1);
+                    eprintln!("{}", progress_line(&plabel, done, total, secs));
                 }
             }
         })),
         ..Default::default()
     };
-    eprintln!("[fetching {repo}/{name}{}]", expected.map(|s| format!(" ({:.2} GB)", s as f64 / 1e9)).unwrap_or_default());
+    eprintln!("[fetching {repo}/{name}{}]", expected.map(|s| format!(" ({})", human_gb(s))).unwrap_or_default());
     let out = request(&url)?.download_resumable(&path, opts).map_err(|e| anyhow!("download {url}: {e}"))?;
     let secs = t0.elapsed().as_secs_f64().max(1e-3);
+    if tty {
+        eprint!("\r\x1b[K");
+    }
     eprintln!(
-        "\r  {name}: done, {:.2} GB in {:.0}s ({:.0} MB/s){}",
-        (out.bytes_written + out.resumed_from) as f64 / 1e9,
+        "  {label}: done, {} in {:.0}s ({:.0} MB/s){}",
+        human_gb(out.bytes_written + out.resumed_from),
         secs,
         out.bytes_written as f64 / secs / 1e6,
-        if out.resumed_from > 0 { format!(", resumed from {:.2} GB", out.resumed_from as f64 / 1e9) } else { String::new() }
+        if out.resumed_from > 0 { format!(", resumed from {}", human_gb(out.resumed_from)) } else { String::new() }
     );
     if let (Some(exp), Ok(md)) = (expected, std::fs::metadata(&path)) {
         if md.len() != exp {
