@@ -1,5 +1,6 @@
 mod chat;
 mod config;
+mod drafter;
 mod kernels;
 mod model;
 mod pool;
@@ -10,6 +11,7 @@ mod sampler;
 
 use anyhow::{bail, Context, Result};
 use model::{Model, Quant, Session};
+use sampler::argmax;
 use sampler::Sampler;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
@@ -36,6 +38,8 @@ struct Args {
     dump_logits: Option<PathBuf>,
     show_tokens: bool,
     prefill_chunk: usize,
+    draft: Option<PathBuf>,
+    draft_tokens: usize,
 }
 
 fn usage() -> ! {
@@ -55,10 +59,12 @@ fn usage() -> ! {
          \x20 --seed N             RNG seed\n\
          \x20 --threads N          worker threads (default: all cores)\n\
          \x20 --mmap               map weights from disk instead of copying into RAM\n\
-         \x20 --quant bf16|q8      weight precision for streamed matmuls (default bf16)\n\
+         \x20 --quant bf16|q8|q4   weight precision for streamed matmuls (default bf16)\n\
          \x20 --preload            with --mmap, touch all weight pages before starting\n\
          \x20 --profile            print per-operation timing breakdown\n\
          \x20 --prefill-chunk N    tokens per prefill chunk (default 256)\n\
+         \x20 --draft DIR          speculative decoding with a Gemma 4 assistant (drafter) model; greedy only\n\
+         \x20 --draft-tokens N     max draft tokens per round (default 6; adaptive from 3)\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
          \x20 --show-tokens        print token ids"
     );
@@ -86,6 +92,8 @@ fn parse_args() -> Result<Args> {
         dump_logits: None,
         show_tokens: false,
         prefill_chunk: 256,
+        draft: None,
+        draft_tokens: 6,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -109,11 +117,14 @@ fn parse_args() -> Result<Args> {
                 a.quant = match val()?.as_str() {
                     "bf16" => Quant::Bf16,
                     "q8" | "int8" => Quant::Q8,
-                    other => bail!("unknown quantization {other} (use bf16 or q8)"),
+                    "q4" | "q4_0" => Quant::Q4,
+                    other => bail!("unknown quantization {other} (use bf16, q8 or q4)"),
                 }
             }
             "--profile" => a.profile = true,
             "--prefill-chunk" => a.prefill_chunk = val()?.parse()?,
+            "--draft" => a.draft = Some(PathBuf::from(val()?)),
+            "--draft-tokens" => a.draft_tokens = val()?.parse()?,
             "--dump-logits" => a.dump_logits = Some(PathBuf::from(val()?)),
             "--show-tokens" => a.show_tokens = true,
             "-h" | "--help" => usage(),
@@ -139,6 +150,177 @@ fn prefill(model: &Model, sess: &mut Session, ids: &[u32], chunk: usize) -> Vec<
         logits = model.forward(sess, c);
     }
     logits
+}
+
+/// Incremental stdout printer: prints the stable decoded prefix of the token list.
+struct Printer {
+    printed: usize,
+}
+
+impl Printer {
+    const SOC: u32 = 100; // <|channel>  (start of thinking)
+    const EOC: u32 = 101; // <channel|>  (end of thinking)
+
+    fn new() -> Self {
+        Self { printed: 0 }
+    }
+
+    fn on_token(&mut self, id: u32) {
+        if id == Self::SOC || id == Self::EOC {
+            let mut lock = std::io::stdout().lock();
+            let _ = lock.write_all(if id == Self::SOC { b"\x1b[2m" } else { b"\x1b[0m\n" });
+            let _ = lock.flush();
+        }
+    }
+
+    fn flush_text(&mut self, tok: &Tokenizer, out: &[u32], final_: bool) {
+        if let Ok(text) = tok.decode(out, true) {
+            let stable = if !final_ && text.ends_with('\u{FFFD}') { text.len().saturating_sub(3) } else { text.len() };
+            if stable > self.printed && text.is_char_boundary(stable) {
+                let mut lock = std::io::stdout().lock();
+                let _ = lock.write_all(text[self.printed..stable].as_bytes());
+                let _ = lock.flush();
+                self.printed = stable;
+            }
+        }
+    }
+}
+
+struct SpecStats {
+    forwards: usize,
+    drafted: usize,
+    accepted: usize,
+    /// Histogram of accepted-draft counts per round.
+    per_pos: [usize; 16],
+}
+
+/// Greedy speculative decoding with the Gemma 4 drafter. Produces exactly the plain greedy
+/// sequence. `hidden_last` is the final-normed hidden state of the last prompt token.
+#[allow(clippy::too_many_arguments)]
+fn generate_speculative(
+    model: &Model,
+    drafter: &drafter::Drafter,
+    sess: &mut Session,
+    tok: &Tokenizer,
+    hidden_last: Vec<f32>,
+    k: usize,
+    eos: &[u32],
+    max_tokens: usize,
+) -> (Vec<u32>, SpecStats, f64) {
+    let t0 = Instant::now();
+    let h = model.cfg.hidden_size;
+    let (ls, lg) = model.cfg.shared_kv_layers();
+    let mut stats = SpecStats { forwards: 0, drafted: 0, accepted: 0, per_pos: [0; 16] };
+    let mut out: Vec<u32> = Vec::new();
+    let mut printer = Printer::new();
+
+    // First token from the prompt's logits (the prefill forward already counted by the caller).
+    let logits = model.logits(&hidden_last, 1);
+    let mut last = argmax(&logits);
+    let mut h_prev = hidden_last; // hidden state of the token that produced `last`
+    out.push(last);
+    printer.on_token(last);
+    printer.flush_text(tok, &out, false);
+
+    // Adaptive draft length: grow after a fully accepted round, shrink after a fully rejected one.
+    let (k_min, k_max) = (2usize.min(k.max(1)), k.max(1));
+    let mut k_cur = k_min.max(3).min(k_max);
+    'outer: while !eos.contains(&last) && out.len() < max_tokens {
+        // Draft k tokens from the drafter, chaining its projected hidden state.
+        let pos = sess.pos; // index of `last` (not yet in the cache)
+        let k = k_cur.min(max_tokens - out.len());
+        let mut drafts = Vec::with_capacity(k);
+        let mut hid = h_prev.clone();
+        let mut cur = last;
+        for _ in 0..k.max(1) {
+            let _t = prof::start(prof::Cat::Other);
+            let emb = model.embed_scaled(cur);
+            let (d, nh) = drafter.step(&emb, &hid, pos, sess.cache(ls), sess.cache(lg));
+            drafts.push(d);
+            hid = nh;
+            cur = d;
+        }
+        stats.drafted += drafts.len();
+        if stats.forwards == 0 && std::env::var("GEMMARS_DEBUG_DRAFT").is_ok() {
+            eprintln!("[debug: pos {pos} last {last} drafts {drafts:?}]");
+        }
+
+        // Verify: one main forward over [last, drafts...].
+        let mut seq = Vec::with_capacity(drafts.len() + 1);
+        seq.push(last);
+        seq.extend_from_slice(&drafts);
+        let check = std::env::var("GEMMARS_CHECK_SPEC").is_ok();
+        let sess_before = if check { Some(sess.clone()) } else { None };
+        let hs = model.forward_hidden(sess, &seq);
+        let logits = model.logits(&hs, seq.len());
+        stats.forwards += 1;
+        let v = model.cfg.vocab_size;
+        if let Some(mut s2) = sess_before {
+            // Debug: recompute every position through single-token forwards and compare argmaxes.
+            for (i, &tk) in seq.iter().enumerate() {
+                let l1 = model.forward(&mut s2, &[tk]);
+                let lk = &logits[i * v..(i + 1) * v];
+                let (a1, ak) = (argmax(&l1), argmax(lk));
+                if a1 != ak {
+                    eprintln!(
+                        "[check: pos {} token {}: t=1 argmax {} ({:.4}) vs t={} argmax {} ({:.4}); cross: t1[{}]={:.4} tk[{}]={:.4}]",
+                        pos + i, tk, a1, l1[a1 as usize], seq.len(), ak, lk[ak as usize], ak, l1[ak as usize], a1, lk[a1 as usize]
+                    );
+                }
+            }
+        }
+        let mut n = 0;
+        while n < drafts.len() && argmax(&logits[n * v..(n + 1) * v]) == drafts[n] {
+            n += 1;
+        }
+        stats.accepted += n;
+        if n < stats.per_pos.len() {
+            stats.per_pos[n] += 1;
+        }
+        if n == drafts.len() {
+            k_cur = (k_cur + 1).min(k_max);
+        } else if n == 0 {
+            k_cur = (k_cur - 1).max(k_min);
+        }
+        if stats.forwards == 1 && std::env::var("GEMMARS_DEBUG_DRAFT").is_ok() {
+            let truth: Vec<u32> = (0..seq.len()).map(|i| argmax(&logits[i * v..(i + 1) * v])).collect();
+            eprintln!("[debug: main argmax after each of {seq:?} = {truth:?}; accepted {n}]");
+        }
+        for &d in &drafts[..n] {
+            if out.len() >= max_tokens {
+                sess.truncate(pos + n + 1);
+                break 'outer;
+            }
+            out.push(d);
+            printer.on_token(d);
+            if eos.contains(&d) {
+                sess.truncate(pos + n);
+                break 'outer;
+            }
+        }
+        let bonus = argmax(&logits[n * v..(n + 1) * v]);
+        // Keep only [last, drafts[..n]] in the cache; `bonus` is processed by the next round.
+        sess.truncate(pos + n + 1);
+        h_prev = hs[n * h..(n + 1) * h].to_vec();
+        last = bonus;
+        if out.len() >= max_tokens {
+            break;
+        }
+        out.push(bonus);
+        printer.on_token(bonus);
+        printer.flush_text(tok, &out, false);
+    }
+    if let Some(&e) = out.last() {
+        if eos.contains(&e) {
+            out.pop();
+            printer.flush_text(tok, &out, true);
+            out.push(e);
+        } else {
+            printer.flush_text(tok, &out, true);
+        }
+    }
+    println!();
+    (out, stats, t0.elapsed().as_secs_f64())
 }
 
 /// Streams the model's reply to stdout. Returns (generated ids including stop token, forwards, seconds).
@@ -241,6 +423,25 @@ fn run(args: Args) -> Result<()> {
         Ok(enc.get_ids().to_vec())
     };
 
+    let draft_files = match &args.draft {
+        Some(d) => Some(safetensors::ModelFiles::open(d, true)?),
+        None => None,
+    };
+    let drafter = match (&args.draft, &draft_files) {
+        (Some(d), Some(f)) => {
+            let dr = drafter::Drafter::load(d, f)?;
+            if dr.backbone_hidden != model.cfg.hidden_size {
+                bail!("drafter backbone size {} does not match model hidden size {}", dr.backbone_hidden, model.cfg.hidden_size);
+            }
+            if args.temperature > 0.0 {
+                eprintln!("[note: speculative decoding is greedy; --temp ignored]");
+            }
+            eprintln!("[drafter loaded: {} layers, hidden {}, {} draft tokens/round]", dr.cfg.num_hidden_layers, dr.cfg.hidden_size, args.draft_tokens);
+            Some(dr)
+        }
+        _ => None,
+    };
+
     let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
     let mut sess = model.new_session();
 
@@ -271,6 +472,23 @@ fn run(args: Args) -> Result<()> {
                 eprintln!("[prompt ids: {ids:?}]");
             }
             let t = Instant::now();
+            if let Some(dr) = &drafter {
+                let mut hs = Vec::new();
+                for c in ids.chunks(args.prefill_chunk.max(1)) {
+                    hs = model.forward_hidden(&mut sess, c);
+                }
+                let h = model.cfg.hidden_size;
+                let hidden_last = hs[hs.len() - h..].to_vec();
+                let prefill_secs = t.elapsed().as_secs_f64();
+                let (out, st, secs) =
+                    generate_speculative(&model, dr, &mut sess, &tok, hidden_last, args.draft_tokens, &eos, args.max_tokens);
+                if args.show_tokens {
+                    eprintln!("[output ids: {out:?}]");
+                }
+                report(ids.len(), prefill_secs, out.len(), secs);
+                eprintln!("[speculative: {:.2} tok/forward, drafts accepted {}%]", out.len() as f64 / st.forwards.max(1) as f64, 100 * st.accepted / st.drafted.max(1));
+                continue;
+            }
             let logits = prefill(&model, &mut sess, &ids, args.prefill_chunk);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
@@ -307,6 +525,39 @@ fn run(args: Args) -> Result<()> {
     }
     if ids.is_empty() {
         bail!("empty prompt");
+    }
+
+    if let Some(dr) = &drafter {
+        let t = Instant::now();
+        let mut hs = Vec::new();
+        for c in ids.chunks(args.prefill_chunk.max(1)) {
+            hs = model.forward_hidden(&mut sess, c);
+        }
+        let h = model.cfg.hidden_size;
+        let hidden_last = hs[hs.len() - h..].to_vec();
+        let prefill_secs = t.elapsed().as_secs_f64();
+        prof::reset();
+        let (out, st, secs) = generate_speculative(&model, dr, &mut sess, &tok, hidden_last, args.draft_tokens, &eos, args.max_tokens);
+        if args.show_tokens {
+            eprintln!("[output ids: {out:?}]");
+        }
+        let n = out.len();
+        report(ids.len(), prefill_secs, n, secs);
+        eprintln!(
+            "[speculative: {} main forwards for {} tokens = {:.2} tok/forward; drafts accepted {}/{} = {:.0}%]",
+            st.forwards,
+            n,
+            n as f64 / st.forwards.max(1) as f64,
+            st.accepted,
+            st.drafted,
+            100.0 * st.accepted as f64 / st.drafted.max(1) as f64
+        );
+        eprintln!("[accepted-per-round histogram: {:?}]", &st.per_pos[..=args.draft_tokens.min(15)]);
+        if args.profile {
+            eprintln!("-- decode --");
+            prof::report(secs, st.forwards);
+        }
+        return Ok(());
     }
 
     let t = Instant::now();

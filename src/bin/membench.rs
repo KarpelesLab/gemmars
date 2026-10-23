@@ -206,6 +206,107 @@ fn main() {
             println!("gemm_8x8 1 thread {name}: {:.0} GFLOP/s", flops_per_pass * passes as f64 / t0.elapsed().as_secs_f64() / 1e9);
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Quantized decode kernels, single thread, over ~1 GB of weights.
+        let n_in = 4096usize;
+        let rows = 131072usize; // q8: 512 MB; q4: 256 MB
+        let wb: Vec<u16> = (0..rows * n_in).map(|i| 0x3f80 ^ (i as u16 & 0x7f)).collect();
+        pool::init(1);
+        let q8 = quant::quantize_bf16(&wb, rows, n_in);
+        let q4 = quant::quantize_q4(&wb, rows, n_in);
+        let x: Vec<f32> = (0..4 * n_in).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+        let xa = quant::quantize_act(&x, 4, n_in);
+        let bpr = n_in / 32;
+        println!("\nquantized decode kernels, 1 thread (GB/s of weight bytes | weight-equivalent bf16 GB/s):");
+        macro_rules! bench {
+            ($name:expr, $bytes:expr, $body:expr) => {{
+                let mut best = 0f64;
+                let mut sink = 0f32;
+                for _ in 0..3 {
+                    let t0 = Instant::now();
+                    sink += $body;
+                    best = best.max($bytes as f64 / t0.elapsed().as_secs_f64() / 1e9);
+                }
+                std::hint::black_box(sink);
+                println!("  {:<24} {:>6.1} | {:>6.1}", $name, best, best * (rows * n_in * 2) as f64 / $bytes as f64);
+            }};
+        }
+        unsafe {
+            bench!("q8 tc=4 (R2)", q8.bytes(), {
+                let mut s = 0f32;
+                let mut r = 0;
+                while r + 2 <= rows {
+                    let o = kernels::simd::q8_dot_rows_tc::<2, 4>(q8.q.as_ptr().add(r * n_in), q8.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr());
+                    s += o[0][0] + o[0][1] + o[0][2] + o[0][3] + o[1][0] + o[1][1] + o[1][2] + o[1][3];
+                    r += 2;
+                }
+                s
+            });
+            bench!("q4 tc=4 (R2)", q4.bytes(), {
+                let mut s = 0f32;
+                let mut r = 0;
+                while r + 2 <= rows {
+                    let o = kernels::simd::q4_dot_rows_tc::<2, 4>(q4.q.as_ptr().add(r * n_in / 2), q4.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr(), xa.sums.as_ptr());
+                    s += o[0][0] + o[0][1] + o[0][2] + o[0][3] + o[1][0] + o[1][1] + o[1][2] + o[1][3];
+                    r += 2;
+                }
+                s
+            });
+            bench!("q8 t=1 (R2)", q8.bytes(), {
+                let mut s = 0f32;
+                let mut r = 0;
+                while r + 2 <= rows {
+                    let o = kernels::simd::q8_dot_rows::<2>(q8.q.as_ptr().add(r * n_in), q8.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr());
+                    s += o[0] + o[1];
+                    r += 2;
+                }
+                s
+            });
+            for tc in [2usize, 4] {
+                let name = format!("q8 tc={tc} (R1)");
+                bench!(name, q8.bytes() , {
+                    let mut s = 0f32;
+                    for r in 0..rows {
+                        let o: [f32; 4] = if tc == 4 {
+                            kernels::simd::q8_dot_rows_tc::<1, 4>(q8.q.as_ptr().add(r * n_in), q8.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr())[0]
+                        } else {
+                            let o2 = kernels::simd::q8_dot_rows_tc::<1, 2>(q8.q.as_ptr().add(r * n_in), q8.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr())[0];
+                            [o2[0], o2[1], 0.0, 0.0]
+                        };
+                        s += o[0] + o[1] + o[2] + o[3];
+                    }
+                    s
+                });
+            }
+            bench!("q4 t=1 (R2)", q4.bytes(), {
+                let mut s = 0f32;
+                let mut r = 0;
+                while r + 2 <= rows {
+                    let o = kernels::simd::q4_dot_rows::<2>(q4.q.as_ptr().add(r * n_in / 2), q4.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr(), xa.sums.as_ptr());
+                    s += o[0] + o[1];
+                    r += 2;
+                }
+                s
+            });
+            for tc in [2usize, 4] {
+                let name = format!("q4 tc={tc} (R1)");
+                bench!(name, q4.bytes(), {
+                    let mut s = 0f32;
+                    for r in 0..rows {
+                        let o: [f32; 4] = if tc == 4 {
+                            kernels::simd::q4_dot_rows_tc::<1, 4>(q4.q.as_ptr().add(r * n_in / 2), q4.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr(), xa.sums.as_ptr())[0]
+                        } else {
+                            let o2 = kernels::simd::q4_dot_rows_tc::<1, 2>(q4.q.as_ptr().add(r * n_in / 2), q4.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr(), xa.sums.as_ptr())[0];
+                            [o2[0], o2[1], 0.0, 0.0]
+                        };
+                        s += o[0] + o[1] + o[2] + o[3];
+                    }
+                    s
+                });
+            }
+        }
+    }
     println!("\nbf16 matmul, t=32 (f32 conversion path), GFLOP/s:");
     for &th in &[6usize, 12, 18] {
         let gbs = bench_matmul(w, n_out, n_in, 32, th);

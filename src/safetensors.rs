@@ -108,6 +108,12 @@ impl SafeTensors {
         self.tensors.keys()
     }
 
+    /// Raw bytes of a tensor.
+    pub fn bytes(&self, name: &str) -> Result<&[u8]> {
+        let t = self.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;
+        Ok(&self.mmap[t.start..t.end])
+    }
+
     /// Returns a bf16 tensor as a slice of raw u16 bit patterns.
     pub fn bf16(&self, name: &str) -> Result<&[u16]> {
         let t = self.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;
@@ -187,6 +193,11 @@ impl ModelFiles {
     pub fn bf16(&self, name: &str) -> Result<&[u16]> {
         let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
         self.shards[i].bf16(name)
+    }
+
+    pub fn bytes(&self, name: &str) -> Result<&[u8]> {
+        let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
+        self.shards[i].bytes(name)
     }
 
     pub fn total_bytes(&self) -> usize {

@@ -162,6 +162,15 @@ impl TextConfig {
             .expect("no non-shared layer of matching type")
     }
 
+    /// Layers whose K/V are the model's "shared KV states" (consumed by KV-sharing layers and
+    /// by the drafter): the last non-shared layer of each type, as (sliding, global).
+    pub fn shared_kv_layers(&self) -> (usize, usize) {
+        let first = self.first_kv_shared_layer();
+        let s = (0..first).rev().find(|&l| self.is_sliding(l)).expect("no sliding layer");
+        let g = (0..first).rev().find(|&l| !self.is_sliding(l)).expect("no global layer");
+        (s, g)
+    }
+
     pub fn layer_intermediate(&self, layer: usize) -> usize {
         if self.use_double_wide_mlp && self.is_kv_shared(layer) {
             self.intermediate_size * 2

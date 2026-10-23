@@ -4,7 +4,7 @@
 use crate::config::TextConfig;
 use crate::kernels::*;
 use crate::prof::{self, Cat};
-use crate::quant::{quantize_bf16, QMatrix};
+use crate::quant::{quantize_bf16, quantize_q4, Q4Matrix, QMatrix};
 use crate::safetensors::ModelFiles;
 use anyhow::{bail, Context, Result};
 
@@ -13,12 +13,15 @@ use anyhow::{bail, Context, Result};
 pub enum Quant {
     Bf16,
     Q8,
+    /// Q4_0 layer weights; the LM head and PLE projection stay Q8.
+    Q4,
 }
 
 /// A linear layer's weight `[n_out, n_in]`, either borrowed bf16 or quantized int8.
 pub enum Lin<'a> {
     Bf16(&'a [u16]),
     Q8(QMatrix),
+    Q4(Q4Matrix),
 }
 
 impl Lin<'_> {
@@ -26,6 +29,7 @@ impl Lin<'_> {
         match self {
             Lin::Bf16(w) => w.len() * 2,
             Lin::Q8(m) => m.bytes(),
+            Lin::Q4(m) => m.bytes(),
         }
     }
 }
@@ -44,7 +48,7 @@ fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], 
             })
             .collect();
         matmul_multi(&mut v, n_in, x, t);
-    } else {
+    } else if jobs.iter().all(|(l, _, _)| matches!(l, Lin::Q8(_))) {
         let mut v: Vec<(&QMatrix, &mut [f32])> = jobs
             .iter_mut()
             .map(|(l, n, y)| match l {
@@ -52,10 +56,24 @@ fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], 
                     debug_assert_eq!(m.n_out, *n);
                     (m, &mut **y)
                 }
-                Lin::Bf16(_) => panic!("mixed precision in fused matmul"),
+                _ => unreachable!(),
             })
             .collect();
-        matmul_q8_multi(&mut v, x, t);
+        matmul_quant_multi(&mut v, x, t);
+    } else if jobs.iter().all(|(l, _, _)| matches!(l, Lin::Q4(_))) {
+        let mut v: Vec<(&Q4Matrix, &mut [f32])> = jobs
+            .iter_mut()
+            .map(|(l, n, y)| match l {
+                Lin::Q4(m) => {
+                    debug_assert_eq!(m.n_out, *n);
+                    (m, &mut **y)
+                }
+                _ => unreachable!(),
+            })
+            .collect();
+        matmul_quant_multi(&mut v, x, t);
+    } else {
+        panic!("mixed precision in fused matmul");
     }
 }
 
@@ -112,6 +130,7 @@ pub struct Model<'a> {
     inv_freq_full: Vec<f32>,
 }
 
+#[derive(Clone)]
 pub struct LayerCache {
     k: Vec<f32>,
     v: Vec<f32>,
@@ -131,16 +150,15 @@ impl LayerCache {
         self.len += t;
     }
     #[inline(always)]
-    fn k_at(&self, pos: usize, kvh: usize) -> &[f32] {
+    pub fn k_at(&self, pos: usize, kvh: usize) -> &[f32] {
         let o = (pos * self.n_kv + kvh) * self.hd;
         &self.k[o..o + self.hd]
     }
     #[inline(always)]
-    fn v_at(&self, pos: usize, kvh: usize) -> &[f32] {
+    pub fn v_at(&self, pos: usize, kvh: usize) -> &[f32] {
         let o = (pos * self.n_kv + kvh) * self.hd;
         &self.v[o..o + self.hd]
     }
-    #[allow(dead_code)]
     fn truncate(&mut self, len: usize) {
         if len < self.len {
             self.k.truncate(len * self.n_kv * self.hd);
@@ -151,19 +169,24 @@ impl LayerCache {
 }
 
 /// Mutable decoding state: KV caches and the current position.
+#[derive(Clone)]
 pub struct Session {
     caches: Vec<Option<LayerCache>>,
     pub pos: usize,
 }
 
-#[allow(dead_code)]
 impl Session {
-    /// Drops cached positions at or beyond `pos` (for rewinding a conversation).
+    /// Drops cached positions at or beyond `pos` (rewinding after rejected speculative tokens).
     pub fn truncate(&mut self, pos: usize) {
         for c in self.caches.iter_mut().flatten() {
             c.truncate(pos);
         }
         self.pos = self.pos.min(pos);
+    }
+
+    /// The KV cache owned by `layer` (which must not be a KV-sharing layer).
+    pub fn cache(&self, layer: usize) -> &LayerCache {
+        self.caches[layer].as_ref().expect("layer has no own KV cache")
     }
 }
 
@@ -190,21 +213,27 @@ impl<'a> Model<'a> {
             files.bf16(&full)
         };
         // A streamed linear weight: borrowed bf16 or quantized on load.
-        let lin = |name: &str, n_out: usize, n_in: usize| -> Result<Lin<'a>> {
+        let lin_with = |name: &str, n_out: usize, n_in: usize, q: Quant| -> Result<Lin<'a>> {
             let w = get(name, &[n_out, n_in])?;
-            Ok(match quant {
+            Ok(match q {
                 Quant::Bf16 => Lin::Bf16(w),
                 Quant::Q8 => Lin::Q8(quantize_bf16(w, n_out, n_in)),
+                Quant::Q4 => Lin::Q4(quantize_q4(w, n_out, n_in)),
             })
         };
+        let lin = |name: &str, n_out: usize, n_in: usize| lin_with(name, n_out, n_in, quant);
+        // The PLE projection feeds every layer directly: keep it at Q8 under Q4. The LM head follows
+        // GEMMARS_HEAD_Q8=1 (Q8) or defaults to the model precision.
+        let hi_quant = if quant == Quant::Q4 { Quant::Q8 } else { quant };
+        let head_quant = if quant == Quant::Q4 && std::env::var("GEMMARS_HEAD_Q8").is_ok() { Quant::Q8 } else { quant };
 
         let embed = get("embed_tokens.weight", &[cfg.vocab_size, h])?;
-        let head = lin("embed_tokens.weight", cfg.vocab_size, h)?;
+        let head = lin_with("embed_tokens.weight", cfg.vocab_size, h, head_quant)?;
         let final_norm = get("norm.weight", &[h])?;
         let ple = if cfg.has_ple() {
             Some(PleGlobal {
                 embed: get("embed_tokens_per_layer.weight", &[cfg.vocab_size_per_layer_input, nl * p])?,
-                proj: lin("per_layer_model_projection.weight", nl * p, h)?,
+                proj: lin_with("per_layer_model_projection.weight", nl * p, h, hi_quant)?,
                 norm: get("per_layer_projection_norm.weight", &[p])?,
             })
         } else {
@@ -303,9 +332,41 @@ impl<'a> Model<'a> {
         Session { caches, pos: 0 }
     }
 
+    /// The main model's input embedding of `tok`, scaled by sqrt(hidden) (as fed to the drafter).
+    pub fn embed_scaled(&self, tok: u32) -> Vec<f32> {
+        let h = self.cfg.hidden_size;
+        let scale = (h as f32).sqrt();
+        self.embed[tok as usize * h..(tok as usize + 1) * h].iter().map(|&s| bf16_to_f32(s) * scale).collect()
+    }
+
+    /// Softcapped logits `[t, vocab]` for final-normed hidden states `[t, hidden]`.
+    pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let _timer = prof::start(Cat::Head);
+        let mut logits = vec![0f32; t * cfg.vocab_size];
+        linear(&self.head, cfg.vocab_size, cfg.hidden_size, hidden, t, &mut logits);
+        if let Some(cap) = cfg.final_logit_softcapping {
+            let cap = cap as f32;
+            for_chunks(&mut logits, 8192, true, |_, c| {
+                for v in c.iter_mut() {
+                    *v = (*v / cap).tanh() * cap;
+                }
+            });
+        }
+        logits
+    }
+
     /// Runs `tokens` through the model starting at `sess.pos`, appending to the KV
     /// cache, and returns the (softcapped) logits for the last token.
     pub fn forward(&self, sess: &mut Session, tokens: &[u32]) -> Vec<f32> {
+        let t = tokens.len();
+        let h = self.cfg.hidden_size;
+        let hs = self.forward_hidden(sess, tokens);
+        self.logits(&hs[(t - 1) * h..], 1)
+    }
+
+    /// Runs `tokens` through the decoder and returns the final-normed hidden states `[t, hidden]`.
+    pub fn forward_hidden(&self, sess: &mut Session, tokens: &[u32]) -> Vec<f32> {
         let t = tokens.len();
         assert!(t > 0);
         let cfg = &self.cfg;
@@ -360,22 +421,10 @@ impl<'a> Model<'a> {
             self.layer_forward(l, layer, &mut x, t, start, pli.as_deref(), sess, rope);
         }
 
-        // Final norm + LM head on the last token only.
-        let _timer = prof::start(Cat::Head);
-        let mut last = vec![0f32; h];
-        rmsnorm(&x[(t - 1) * h..], Some(self.final_norm), eps, &mut last);
-        let mut logits = vec![0f32; cfg.vocab_size];
-        linear(&self.head, cfg.vocab_size, h, &last, 1, &mut logits);
-        if let Some(cap) = cfg.final_logit_softcapping {
-            let cap = cap as f32;
-            for_chunks(&mut logits, 8192, true, |_, c| {
-                for v in c.iter_mut() {
-                    *v = (*v / cap).tanh() * cap;
-                }
-            });
-        }
+        // Final norm.
+        rmsnorm_rows_inplace(&mut x, h, Some(self.final_norm), eps);
         sess.pos += t;
-        logits
+        x
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -491,13 +540,13 @@ impl<'a> Model<'a> {
 ///
 /// Work is split per (token, kv head) so the `rep` query heads sharing a KV head read
 /// each key/value once. When that gives too few tasks (short decode), it splits per head.
-fn attention(q: &[f32], cache: &LayerCache, nh: usize, t: usize, start: usize, window: Option<usize>, out: &mut [f32]) {
+pub(crate) fn attention(q: &[f32], cache: &LayerCache, nh: usize, t: usize, start: usize, window: Option<usize>, out: &mut [f32]) {
     let _timer = prof::start(Cat::Attention);
     let hd = cache.hd;
     let n_kv = cache.n_kv;
     let rep = nh / n_kv;
-    let par = t > 1 || cache.len > 256;
     let threads = crate::pool::threads();
+    let par = t > 1 || cache.len > 32;
     let group = if t * n_kv >= threads { rep } else { 1 };
     let groups_per_kv = rep / group;
     let ntasks = t * n_kv * groups_per_kv;

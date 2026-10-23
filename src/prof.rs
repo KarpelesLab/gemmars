@@ -15,7 +15,7 @@ pub enum Cat {
     Other,
 }
 
-const NAMES: [&str; 7] = ["matmul", "attention", "norm", "elementwise", "embed+ple", "lm_head", "other"];
+const NAMES: [&str; 7] = ["matmul", "attention", "norm", "elementwise", "embed+ple", "lm_head", "drafter"];
 static NANOS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 static CALLS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 static BYTES: AtomicU64 = AtomicU64::new(0);
