@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Reference check for embeddings against sentence-transformers (float32, CPU).
 
-usage: ref_embed.py MODEL_DIR TEXTS_FILE OURS.jsonl [--prompt-name NAME] [--bf16-weights] [--sparse | --colbert]
+usage: ref_embed.py MODEL_DIR TEXTS_FILE OURS.jsonl [--prompt-name NAME] [--bf16-weights] [--trust-remote-code]
+                    [--sparse | --colbert]
 
 TEXTS_FILE has one text per line; OURS.jsonl is `oxinfer --embed` output for the same lines (a
 JSON array per line; with --sparse a {token: weight} object, with --colbert an array of arrays).
 Prints the cosine between our vector and the reference per text and compares the similarity
 matrices. --sparse / --colbert check BGE-M3's heads, computed here as FlagEmbedding does
 (relu(sparse_linear(h)) max per token without special tokens; normalize(colbert_linear(h[1:]))).
+--trust-remote-code runs the model repo's own modeling code (NomicBERT).
 """
 import json, sys
 import numpy as np
@@ -24,7 +26,14 @@ def main():
         return heads(model_dir, texts, ours, "--sparse" in sys.argv)
     from sentence_transformers import SentenceTransformer
 
-    m = SentenceTransformer(model_dir, device="cpu", model_kwargs={"dtype": torch.float32})
+    m = SentenceTransformer(
+        model_dir, device="cpu", model_kwargs={"dtype": torch.float32}, trust_remote_code="--trust-remote-code" in sys.argv
+    )
+    for mod in m.modules():
+        # transformers 5 dropped this helper; NomicBERT's remote code still calls it.
+        if mod.__class__.__name__ == "NomicBertModel" and not hasattr(mod, "get_extended_attention_mask"):
+            ext = lambda mask, shape: (1.0 - mask[:, None, None, :].float()) * torch.finfo(torch.float32).min
+            mod.get_extended_attention_mask = ext
     if "--bf16-weights" in sys.argv:
         # Isolate implementation error: the same bf16-rounded weights oxinfer computes with.
         with torch.no_grad():
