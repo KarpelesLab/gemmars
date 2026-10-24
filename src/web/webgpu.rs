@@ -18,6 +18,22 @@ unsafe extern "C" {
     /// A k x k convolution of `x` (`[h*w, cin]` f32) with weight `handle` into `y`
     /// (`[oh*ow, n_out]`); see `ConvDesc`. Returns 0 on success.
     fn gpu_conv(x: *const f32, desc: *const ConvDesc) -> i32;
+    /// Attention over per-head padded operands (see `AttnDesc`); writes `out`. 0 on success.
+    fn gpu_attention(q: *const f32, k: *const f32, vt: *const f32, out: *mut f32, desc: *const AttnDesc) -> i32;
+}
+
+/// Attention for the host: `q` `[heads][tqp][dhp]`, `k` `[heads][tkp][dhp]`, `vt`
+/// `[heads][dho][tkp]` (zero padded), `out` `[heads][tqp][dho]`.
+#[repr(C)]
+pub struct AttnDesc {
+    heads: u32,
+    tqp: u32,
+    tkp: u32,
+    dhp: u32,
+    dho: u32,
+    tk: u32,
+    causal: u32,
+    scale: f32,
 }
 
 /// Convolution geometry for the host (all u32; `y` is a module-memory pointer).
@@ -34,7 +50,16 @@ pub struct ConvDesc {
     oh: u32,
     ow: u32,
     y: u32,
-    _pad: u32,
+    /// Input normalization: 0 none, 1 group, 2 layer; SiLU after it; channels per group;
+    /// epsilon; gamma and beta pointers (`cin` floats each); number of statistics.
+    mode: u32,
+    silu: u32,
+    cpg: u32,
+    eps: f32,
+    gamma: u32,
+    beta: u32,
+    n_stats: u32,
+    _pad: [u32; 2],
 }
 
 /// One matmul for the host: output `y` is [t, n_out] f32 in module memory.
@@ -116,11 +141,16 @@ impl Backend for WebGpuBackend {
         Some(Box::new(Handle(h)))
     }
     fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {
-        if norm.is_some() {
-            return false;
-        }
+        use crate::gpu::NormKind;
         let Some(h) = job.dev.downcast_ref::<Handle>() else { return false };
         if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(64) {
+            return false;
+        }
+        if let Some(n) = norm
+            && (n.gamma.len() != g.cin
+                || n.beta.len() != g.cin
+                || matches!(n.kind, NormKind::Group(gr) if gr == 0 || !g.cin.is_multiple_of(gr)))
+        {
             return false;
         }
         let t0 = crate::clock::Instant::now();
@@ -136,7 +166,25 @@ impl Backend for WebGpuBackend {
             oh: g.oh as u32,
             ow: g.ow as u32,
             y: job.y.as_mut_ptr() as u32,
-            _pad: 0,
+            mode: match norm.map(|n| n.kind) {
+                None => 0,
+                Some(NormKind::Group(_)) => 1,
+                Some(NormKind::Layer) => 2,
+            },
+            silu: norm.is_some_and(|n| n.silu) as u32,
+            cpg: match norm.map(|n| n.kind) {
+                Some(NormKind::Group(gr)) => (g.cin / gr) as u32,
+                _ => 1,
+            },
+            eps: norm.map_or(0.0, |n| n.eps),
+            gamma: norm.map_or(0, |n| n.gamma.as_ptr() as u32),
+            beta: norm.map_or(0, |n| n.beta.as_ptr() as u32),
+            n_stats: match norm.map(|n| n.kind) {
+                Some(NormKind::Group(gr)) => gr as u32,
+                Some(NormKind::Layer) => (g.h * g.w) as u32,
+                None => 0,
+            },
+            _pad: [0; 2],
         };
         let rc = unsafe { gpu_conv(x.as_ptr(), &d) };
         if rc != 0 {
@@ -146,6 +194,69 @@ impl Backend for WebGpuBackend {
         let flops = 2.0 * (g.oh * g.ow) as f64 * job.n_out as f64 * (g.k * g.k * g.cin) as f64;
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.flops.fetch_add(flops as u64, Ordering::Relaxed);
+        self.micros.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        true
+    }
+    fn attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        tq: usize,
+        tk: usize,
+        heads: usize,
+        dh: usize,
+        causal: bool,
+        out: &mut [f32],
+    ) -> bool {
+        let d = heads * dh;
+        if q.len() < tq * d || k.len() < tk * d || v.len() < tk * d || out.len() < tq * d || tq == 0 || tk == 0 {
+            return false;
+        }
+        let t0 = crate::clock::Instant::now();
+        let (dhp, dho, tkp, tqp) = (
+            dh.next_multiple_of(32),
+            dh.next_multiple_of(64),
+            tk.next_multiple_of(64),
+            tq.next_multiple_of(64),
+        );
+        let mut qh = vec![0f32; heads * tqp * dhp];
+        let mut kh = vec![0f32; heads * tkp * dhp];
+        let mut vt = vec![0f32; heads * dho * tkp];
+        for h in 0..heads {
+            for i in 0..tq {
+                qh[(h * tqp + i) * dhp..][..dh].copy_from_slice(&q[i * d + h * dh..][..dh]);
+            }
+            for j in 0..tk {
+                kh[(h * tkp + j) * dhp..][..dh].copy_from_slice(&k[j * d + h * dh..][..dh]);
+                for c in 0..dh {
+                    vt[(h * dho + c) * tkp + j] = v[j * d + h * dh + c];
+                }
+            }
+        }
+        let mut o = vec![0f32; heads * tqp * dho];
+        let desc = AttnDesc {
+            heads: heads as u32,
+            tqp: tqp as u32,
+            tkp: tkp as u32,
+            dhp: dhp as u32,
+            dho: dho as u32,
+            tk: tk as u32,
+            causal: causal as u32,
+            scale: 1.0 / (dh as f32).sqrt(),
+        };
+        let rc = unsafe { gpu_attention(qh.as_ptr(), kh.as_ptr(), vt.as_ptr(), o.as_mut_ptr(), &desc) };
+        if rc != 0 {
+            super::log(&format!("[webgpu: attention failed ({rc}); falling back to CPU]"));
+            return false;
+        }
+        for h in 0..heads {
+            for i in 0..tq {
+                out[i * d + h * dh..][..dh].copy_from_slice(&o[(h * tqp + i) * dho..][..dh]);
+            }
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.flops.fetch_add((4 * tq * tk * d) as u64, Ordering::Relaxed);
         self.micros.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
         true
     }

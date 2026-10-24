@@ -925,6 +925,9 @@ fn run_image(args: &Args) -> Result<()> {
             eprintln!("  gpu: {s}");
         }
     }
+    if oxinfer::sd::ops::gpu_check::on() {
+        eprintln!("[gpu check: {}]", oxinfer::sd::ops::gpu_check::summary());
+    }
     Ok(())
 }
 

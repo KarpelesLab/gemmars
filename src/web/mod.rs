@@ -507,6 +507,7 @@ struct SdState {
     image: Vec<u8>,
     width: u32,
     height: u32,
+    check: String,
 }
 
 thread_local! {
@@ -538,6 +539,7 @@ pub unsafe extern "C" fn web_sd_load(dir: *const u8, dir_len: usize, gpu: u32) -
                     image: Vec::new(),
                     width: 0,
                     height: 0,
+                    check: String::new(),
                 })
             });
             0
@@ -616,6 +618,31 @@ pub unsafe extern "C" fn web_sd_generate(
                 0
             }
             Err(e) => set_error(&e),
+        }
+    })
+}
+
+/// Recompute every device op of the image pipeline on the CPU and keep the worst error per kind.
+#[unsafe(no_mangle)]
+pub extern "C" fn web_gpu_check_enable() {
+    crate::sd::ops::gpu_check::enable();
+}
+
+/// The device-vs-CPU summary (pointer; length to `*len`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_gpu_check_summary(len: *mut usize) -> *const u8 {
+    SD.with(|s| {
+        let mut s = s.borrow_mut();
+        match s.as_mut() {
+            Some(st) => {
+                st.check = crate::sd::ops::gpu_check::summary();
+                unsafe { *len = st.check.len() };
+                st.check.as_ptr()
+            }
+            None => {
+                unsafe { *len = 0 };
+                std::ptr::null()
+            }
         }
     })
 }

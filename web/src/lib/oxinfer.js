@@ -24,13 +24,26 @@ const X_CONV = `
     let iy = i32(tok / p.ow) * i32(p.stride) + i32(tap / p.k) - i32(p.padk);
     let ix = i32(tok % p.ow) * i32(p.stride) + i32(tap % p.k) - i32(p.padk);
     if (tok < p.npix && iy >= 0 && ix >= 0 && iy < i32(p.h) && ix < i32(p.w)) {
-      let xb = (u32(iy) * p.w + u32(ix)) * p.cin + ci0 + lc * 8u;
-      for (var j = 0u; j < 8u; j++) { put_x(lc * 8u + j, lr, x[xb + j]); }
+      let pin = u32(iy) * p.w + u32(ix);
+      let xb = pin * p.cin + ci0 + lc * 8u;
+      for (var j = 0u; j < 8u; j++) { put_x(lc * 8u + j, lr, norm1(x[xb + j], ci0 + lc * 8u + j, pin)); }
     } else {
       for (var j = 0u; j < 8u; j++) { put_x(lc * 8u + j, lr, 0.0); }
     }`;
 const P_DENSE = 'struct P { n_out: u32, n_in: u32, t_pad: u32, pad: u32 }';
-const P_CONV = 'struct P { n_out: u32, n_in: u32, t_pad: u32, pad: u32, h: u32, w: u32, cin: u32, k: u32, stride: u32, ow: u32, npix: u32, padk: u32 }';
+// Convolutions may normalize their input as they load it (mode 1 group norm, 2 layer norm; st holds
+// (mean, 1/std) per group or input pixel, gb gamma then beta), then apply SiLU.
+const P_CONV = `struct P { n_out: u32, n_in: u32, t_pad: u32, pad: u32, h: u32, w: u32, cin: u32, k: u32, stride: u32, ow: u32, npix: u32, padk: u32, mode: u32, silu: u32, cpg: u32, pad2: u32 }
+@group(0) @binding(5) var<storage, read> st: array<vec2<f32>>;
+@group(0) @binding(6) var<storage, read> gb: array<f32>;
+fn norm1(v: f32, ch: u32, pin: u32) -> f32 {
+  if (p.mode == 0u) { return v; }
+  var m: vec2<f32>;
+  if (p.mode == 1u) { m = st[ch / p.cpg]; } else { m = st[pin]; }
+  var y = (v - m.x) * m.y * gb[ch] + gb[p.cin + ch];
+  if (p.silu != 0u) { y = y / (1.0 + exp(-y)); }
+  return y;
+}`;
 
 const WGSL_COMMON = `
 __P__
@@ -89,6 +102,97 @@ __X__
 }
 `;
 
+// Statistics for fused normalization (two passes: mean, then mean squared deviation) and the
+// attention softmax; reductions go through workgroup memory.
+const WGSL_GROUP_STATS = `
+struct GS { n: u32, c: u32, groups: u32, eps: f32 }
+@group(0) @binding(0) var<uniform> p: GS;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> st: array<vec2<f32>>;
+var<workgroup> red: array<f32, 256>;
+fn reduce(li: u32, v: f32) -> f32 {
+  red[li] = v;
+  workgroupBarrier();
+  for (var o = 128u; o > 0u; o = o >> 1u) {
+    if (li < o) { red[li] += red[li + o]; }
+    workgroupBarrier();
+  }
+  let t = red[0];
+  workgroupBarrier();
+  return t;
+}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let g = wg.x;
+  let cpg = p.c / p.groups;
+  let total = p.n * cpg;
+  var s = 0.0;
+  for (var i = li; i < total; i += 256u) { s += x[(i / cpg) * p.c + g * cpg + i % cpg]; }
+  let mean = reduce(li, s) / f32(total);
+  var v = 0.0;
+  for (var i = li; i < total; i += 256u) { let d = x[(i / cpg) * p.c + g * cpg + i % cpg] - mean; v += d * d; }
+  let vr = reduce(li, v) / f32(total);
+  if (li == 0u) { st[g] = vec2<f32>(mean, inverseSqrt(vr + p.eps)); }
+}`;
+const WGSL_ROW_STATS = `
+struct RS { c: u32, eps: f32, rows: u32, pad: u32 }
+@group(0) @binding(0) var<uniform> p: RS;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> st: array<vec2<f32>>;
+var<workgroup> red: array<f32, 64>;
+fn reduce(li: u32, v: f32) -> f32 {
+  red[li] = v;
+  workgroupBarrier();
+  for (var o = 32u; o > 0u; o = o >> 1u) {
+    if (li < o) { red[li] += red[li + o]; }
+    workgroupBarrier();
+  }
+  let t = red[0];
+  workgroupBarrier();
+  return t;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let r = wg.x + wg.y * 32768u;
+  let base = min(r, p.rows - 1u) * p.c;
+  var s = 0.0;
+  for (var i = li; i < p.c; i += 64u) { s += x[base + i]; }
+  let mean = reduce(li, s) / f32(p.c);
+  var v = 0.0;
+  for (var i = li; i < p.c; i += 64u) { let d = x[base + i] - mean; v += d * d; }
+  let vr = reduce(li, v) / f32(p.c);
+  if (li == 0u && r < p.rows) { st[r] = vec2<f32>(mean, inverseSqrt(vr + p.eps)); }
+}`;
+const WGSL_SOFTMAX = `
+struct SM { cols: u32, ld: u32, scale: f32, causal: u32 }
+@group(0) @binding(0) var<uniform> p: SM;
+@group(0) @binding(1) var<storage, read_write> s: array<f32>;
+var<workgroup> red: array<f32, 64>;
+fn reduce(li: u32, v: f32, is_max: bool) -> f32 {
+  red[li] = v;
+  workgroupBarrier();
+  for (var o = 32u; o > 0u; o = o >> 1u) {
+    if (li < o) { red[li] = select(red[li] + red[li + o], max(red[li], red[li + o]), is_max); }
+    workgroupBarrier();
+  }
+  let t = red[0];
+  workgroupBarrier();
+  return t;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let r = wg.x;
+  let base = r * p.ld;
+  let lim = select(p.cols, min(r + 1u, p.cols), p.causal != 0u);
+  var m = -3.0e38;
+  for (var i = li; i < lim; i += 64u) { m = max(m, s[base + i] * p.scale); }
+  m = reduce(li, m, true);
+  var sum = 0.0;
+  for (var i = li; i < lim; i += 64u) { let e = exp(s[base + i] * p.scale - m); s[base + i] = e; sum += e; }
+  let inv = 1.0 / reduce(li, sum, false);
+  for (var i = li; i < p.ld; i += 64u) { s[base + i] = select(0.0, s[base + i] * inv, i < lim); }
+}`;
+
 const WGSL_LOAD = {
   // bf16: two per u32, low half first.
   0: `
@@ -112,6 +216,12 @@ fn load_w(row: u32, k0: u32, lr: u32, lc: u32) {
     put_w(lc * 8u + 4u * i + 2u, lr, d * f32(i32(u << 8u) >> 24u));
     put_w(lc * 8u + 4u * i + 3u, lr, d * f32(i32(u) >> 24u));
   }
+}`,
+  // f32 rows (attention keys and transposed values), one value per u32.
+  3: `
+fn load_w(row: u32, k0: u32, lr: u32, lc: u32) {
+  let e = row * p.n_in + k0 + lc * 8u;
+  for (var j = 0u; j < 8u; j++) { put_w(lc * 8u + j, lr, bitcast<f32>(w[e + j])); }
 }`,
   // q4_0: a block of 32 is 16 bytes, byte j holds elements j (low nibble) and j+16 (high); f16 scale.
   2: `
@@ -151,6 +261,52 @@ export class WebGpuHost {
       ],
     });
     this.dummy = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
+    // Convolutions also bind the normalization statistics and gamma/beta.
+    this.convLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      ],
+    });
+    this.bufs = {};
+  }
+
+  /// A growable storage buffer by name (contents are not preserved when it grows).
+  buf(name, bytes, usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC) {
+    const b = this.bufs[name];
+    const size = Math.max(256, Math.ceil(bytes / 256) * 256);
+    if (b && b.size >= size) return b;
+    if (b) b.destroy();
+    return (this.bufs[name] = this.device.createBuffer({ size, usage }));
+  }
+
+  uniform(values, isFloat) {
+    const b = this.device.createBuffer({ size: Math.max(16, values.length * 4), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const data = new ArrayBuffer(values.length * 4);
+    const u = new Uint32Array(data);
+    const f = new Float32Array(data);
+    values.forEach((v, i) => (isFloat?.[i] ? (f[i] = v) : (u[i] = v)));
+    this.device.queue.writeBuffer(b, 0, data);
+    (this.temps ||= []).push(b);
+    return b;
+  }
+
+  /// Destroys the per-call uniform buffers once the work using them has completed.
+  releaseTemps() {
+    for (const b of this.temps || []) b.destroy();
+    this.temps = [];
+  }
+
+  auxPipeline(name, code) {
+    if (!this.pipelines[name]) {
+      this.pipelines[name] = this.device.createComputePipeline({ layout: 'auto', compute: { module: this.device.createShaderModule({ code }), entryPoint: 'main' } });
+    }
+    return this.pipelines[name];
   }
 
   static async create(log = () => {}) {
@@ -175,11 +331,72 @@ export class WebGpuHost {
       const code = WGSL_LOAD[kind] + WGSL_COMMON.replace('__P__', conv ? P_CONV : P_DENSE).replace('__X__', conv ? X_CONV : X_DENSE);
       const module = this.device.createShaderModule({ code });
       this.pipelines[key] = this.device.createComputePipeline({
-        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.layout] }),
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [conv ? this.convLayout : this.layout] }),
         compute: { module, entryPoint: 'main' },
       });
     }
     return this.pipelines[key];
+  }
+
+  /// Attention over per-head padded operands (views of module memory, copied by writeBuffer):
+  /// q [heads][tqp][dhp], k [heads][tkp][dhp], vt [heads][dho][tkp]; resolves after
+  /// `writeO(Float32Array [heads][tqp][dho])`.
+  async attention(q, k, vt, d, writeO) {
+    const { heads, tqp, tkp, dhp, dho, tk, causal, scale } = d;
+    const qb = this.buf('aq', q.byteLength);
+    const kb = this.buf('ak', k.byteLength);
+    const vb = this.buf('av', vt.byteLength);
+    const sb = this.buf('asc', tqp * tkp * 4);
+    const ob = this.buf('ao', heads * tqp * dho * 4);
+    this.device.queue.writeBuffer(qb, 0, q.buffer, q.byteOffset, q.byteLength);
+    this.device.queue.writeBuffer(kb, 0, k.buffer, k.byteOffset, k.byteLength);
+    this.device.queue.writeBuffer(vb, 0, vt.buffer, vt.byteOffset, vt.byteLength);
+    const gemm = this.pipeline(3, false);
+    const smPipe = this.auxPipeline('softmax', WGSL_SOFTMAX);
+    const smU = this.uniform([tk, tkp, scale, causal], [false, false, true, false]);
+    const smBg = this.device.createBindGroup({ layout: smPipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: smU } }, { binding: 1, resource: { buffer: sb, size: tqp * tkp * 4 } }] });
+    const pS = this.paramsFor(tkp, dhp, tqp);
+    const pO = this.paramsFor(dho, tkp, tqp);
+    const enc = this.device.createCommandEncoder();
+    for (let h = 0; h < heads; h++) {
+      // Scores: keys as the "weights", queries as the input.
+      let pass = enc.beginComputePass();
+      pass.setPipeline(gemm);
+      pass.setBindGroup(0, this.device.createBindGroup({ layout: this.layout, entries: [
+        { binding: 0, resource: { buffer: pS } },
+        { binding: 1, resource: { buffer: kb, offset: h * tkp * dhp * 4, size: tkp * dhp * 4 } },
+        { binding: 2, resource: { buffer: this.dummy } },
+        { binding: 3, resource: { buffer: qb, offset: h * tqp * dhp * 4, size: tqp * dhp * 4 } },
+        { binding: 4, resource: { buffer: sb, size: tqp * tkp * 4 } },
+      ] }));
+      pass.dispatchWorkgroups(tkp / TILE, tqp / TILE, 1);
+      pass.end();
+      pass = enc.beginComputePass();
+      pass.setPipeline(smPipe);
+      pass.setBindGroup(0, smBg);
+      pass.dispatchWorkgroups(tqp);
+      pass.end();
+      // Output: transposed values as the "weights", probabilities as the input.
+      pass = enc.beginComputePass();
+      pass.setPipeline(gemm);
+      pass.setBindGroup(0, this.device.createBindGroup({ layout: this.layout, entries: [
+        { binding: 0, resource: { buffer: pO } },
+        { binding: 1, resource: { buffer: vb, offset: h * dho * tkp * 4, size: dho * tkp * 4 } },
+        { binding: 2, resource: { buffer: this.dummy } },
+        { binding: 3, resource: { buffer: sb, size: tqp * tkp * 4 } },
+        { binding: 4, resource: { buffer: ob, offset: h * tqp * dho * 4, size: tqp * dho * 4 } },
+      ] }));
+      pass.dispatchWorkgroups(dho / TILE, tqp / TILE, 1);
+      pass.end();
+    }
+    const bytes = heads * tqp * dho * 4;
+    const stage = this.buf('ao_stage', bytes, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+    enc.copyBufferToBuffer(ob, 0, stage, 0, bytes);
+    this.device.queue.submit([enc.finish()]);
+    await stage.mapAsync(GPUMapMode.READ, 0, bytes);
+    writeO(new Float32Array(stage.getMappedRange(0, bytes)));
+    stage.unmap();
+    this.releaseTemps();
   }
 
   /// k x k convolution: `x` is the channels-last image ([h*w, cin] f32 view, copied by
@@ -195,22 +412,49 @@ export class WebGpuHost {
       this.cxBuf = this.device.createBuffer({ size: xBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     }
     this.device.queue.writeBuffer(this.cxBuf, 0, x.buffer, x.byteOffset, x.byteLength);
-    if (!this.convParams) this.convParams = this.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.device.queue.writeBuffer(this.convParams, 0, new Uint32Array([d.nOut, d.nIn, tPad, 0, d.h, d.w, d.cin, d.k, d.stride, d.ow, t, (d.k / 2) | 0]));
+    if (!this.convParams) this.convParams = this.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.convParams, 0, new Uint32Array([d.nOut, d.nIn, tPad, 0, d.h, d.w, d.cin, d.k, d.stride, d.ow, t, (d.k / 2) | 0, d.mode || 0, d.silu || 0, d.cpg || 1, 0]));
     const ySize = tPad * d.nOut * 4;
     const y = this.yFor(ySize, 0);
     const st = this.stageFor(t * d.nOut * 4, 0);
+    const statsBuf = this.buf('stats', Math.max(1, d.nStats || 1) * 8);
+    const gbBuf = this.buf('gb', 2 * d.cin * 4);
+    const enc = this.device.createCommandEncoder();
+    if (d.mode) {
+      // Statistics first, in the same submission (passes run in order).
+      const gbArr = new Float32Array(2 * d.cin);
+      gbArr.set(d.gamma, 0);
+      gbArr.set(d.beta, d.cin);
+      this.device.queue.writeBuffer(gbBuf, 0, gbArr);
+      const sp = enc.beginComputePass();
+      if (d.mode === 1) {
+        const pipe = this.auxPipeline('group_stats', WGSL_GROUP_STATS);
+        const u = this.uniform([d.h * d.w, d.cin, d.nStats, d.eps], [false, false, false, true]);
+        sp.setPipeline(pipe);
+        sp.setBindGroup(0, this.device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: u } }, { binding: 1, resource: { buffer: this.cxBuf, size: xBytes } }, { binding: 2, resource: { buffer: statsBuf } }] }));
+        sp.dispatchWorkgroups(d.nStats);
+      } else {
+        const rows = d.h * d.w;
+        const pipe = this.auxPipeline('row_stats', WGSL_ROW_STATS);
+        const u = this.uniform([d.cin, d.eps, rows, 0], [false, true, false, false]);
+        sp.setPipeline(pipe);
+        sp.setBindGroup(0, this.device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: u } }, { binding: 1, resource: { buffer: this.cxBuf, size: xBytes } }, { binding: 2, resource: { buffer: statsBuf } }] }));
+        sp.dispatchWorkgroups(Math.min(rows, 32768), Math.ceil(rows / 32768));
+      }
+      sp.end();
+    }
     const bg = this.device.createBindGroup({
-      layout: this.layout,
+      layout: this.convLayout,
       entries: [
         { binding: 0, resource: { buffer: this.convParams } },
         { binding: 1, resource: { buffer: wt.w } },
         { binding: 2, resource: { buffer: wt.s } },
         { binding: 3, resource: { buffer: this.cxBuf, size: xBytes } },
         { binding: 4, resource: { buffer: y, size: ySize } },
+        { binding: 5, resource: { buffer: statsBuf } },
+        { binding: 6, resource: { buffer: gbBuf } },
       ],
     });
-    const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipeline(wt.kind, true));
     pass.setBindGroup(0, bg);
@@ -221,6 +465,7 @@ export class WebGpuHost {
     await st.mapAsync(GPUMapMode.READ, 0, t * d.nOut * 4);
     writeY(new Float32Array(st.getMappedRange(0, t * d.nOut * 4)));
     st.unmap();
+    this.releaseTemps();
   }
 
   storage(bytes, extra = 0) {
@@ -359,10 +604,31 @@ export class Oxinfer {
       gpu_conv: async (xp, dp) => {
         if (!g.gpu) return 1;
         try {
-          const v = new Uint32Array(g.memory.buffer, dp >>> 0, 12);
-          const d = { handle: v[0], nOut: v[1], nIn: v[2], h: v[3], w: v[4], cin: v[5], k: v[6], stride: v[7], oh: v[8], ow: v[9], y: v[10] };
+          const v = new Uint32Array(g.memory.buffer, dp >>> 0, 20);
+          const fv = new Float32Array(g.memory.buffer, dp >>> 0, 20);
+          const d = { handle: v[0], nOut: v[1], nIn: v[2], h: v[3], w: v[4], cin: v[5], k: v[6], stride: v[7], oh: v[8], ow: v[9], y: v[10], mode: v[11], silu: v[12], cpg: v[13], eps: fv[14], nStats: v[17] };
+          if (d.mode) {
+            d.gamma = new Float32Array(g.memory.buffer, v[15] >>> 0, d.cin);
+            d.beta = new Float32Array(g.memory.buffer, v[16] >>> 0, d.cin);
+          }
           const x = new Float32Array(g.memory.buffer, xp >>> 0, d.h * d.w * d.cin);
           await g.gpu.conv(x, d, (out) => new Float32Array(g.memory.buffer, d.y >>> 0, out.length).set(out));
+          return 0;
+        } catch (e) {
+          log(`[webgpu: ${e.message || e}]`);
+          return 2;
+        }
+      },
+      gpu_attention: async (qp, kp, vp, op, dp) => {
+        if (!g.gpu) return 1;
+        try {
+          const v = new Uint32Array(g.memory.buffer, dp >>> 0, 8);
+          const d = { heads: v[0], tqp: v[1], tkp: v[2], dhp: v[3], dho: v[4], tk: v[5], causal: v[6], scale: new Float32Array(g.memory.buffer, dp >>> 0, 8)[7] };
+          const mem = g.memory.buffer;
+          const q = new Float32Array(mem, qp >>> 0, d.heads * d.tqp * d.dhp);
+          const k = new Float32Array(mem, kp >>> 0, d.heads * d.tkp * d.dhp);
+          const vt = new Float32Array(mem, vp >>> 0, d.heads * d.dho * d.tkp);
+          await g.gpu.attention(q, k, vt, d, (o) => new Float32Array(g.memory.buffer, op >>> 0, o.length).set(o));
           return 0;
         } catch (e) {
           log(`[webgpu: ${e.message || e}]`);
@@ -390,8 +656,10 @@ export class Oxinfer {
     if (jspi) {
       env.gpu_matmul = new WebAssembly.Suspending(env.gpu_matmul);
       env.gpu_conv = new WebAssembly.Suspending(env.gpu_conv);
+      env.gpu_attention = new WebAssembly.Suspending(env.gpu_attention);
     } else {
       env.gpu_conv = () => 1;
+      env.gpu_attention = () => 1;
     }
     let bytes = source;
     if (typeof source === 'string') source = await fetch(source);
@@ -501,6 +769,20 @@ export class Oxinfer {
     const rc = this.ex.web_sd_load(dp, dn, this.gpu ? 1 : 0);
     this.ex.web_free(dp, dn);
     if (rc < 0) throw new Error(this.lastError());
+  }
+
+  /// Recompute every GPU op on the CPU as well (slow) and keep the worst error per kind.
+  gpuCheckEnable() {
+    this.ex.web_gpu_check_enable();
+  }
+
+  gpuCheckSummary() {
+    const lenBuf = this.ex.web_alloc(8) >>> 0;
+    const p = this.ex.web_gpu_check_summary(lenBuf);
+    const n = new Uint32Array(this.memory.buffer, lenBuf, 1)[0];
+    const s = n ? this.str(p, n) : '';
+    this.ex.web_free(lenBuf, 8);
+    return s;
   }
 
   /// { size, steps, guidance, turbo } for the loaded pipeline.

@@ -101,11 +101,16 @@ reference is the bf16 weight storage (47 dB).
 | | Text | UNet pass | VAE decode | SD-Turbo image | SD 1.5, 25 steps + guidance |
 |---|---|---|---|---|---|
 | CPU only (18 threads) | 0.08 s | 0.91 s | 2.87 s | 3.9 s | |
-| CPU + Metal convolutions | 0.08 s | 0.67 s | 0.77 s | 1.6 s | 35 s |
-| Browser (Chrome, WebGPU, one CPU thread) | 0.3 s | 6.6 s | 5.8 s | 12.7 s | |
+| Metal | 0.08 s | 0.37 s | 0.66 s | 1.1 s | 16 s |
+| Browser (Chrome, WebGPU, one CPU thread) | 0.2 s | 1.1 s | 1.9 s | 3.2 s | |
 
-Attention, normalization and the remaining element-wise work run on the CPU; moving them onto
-the GPU is the next lever. SDXL, SD 3 and Flux use different architectures and are not supported.
+With a GPU, convolutions, attention and the group and layer norms run on it: each norm is fused
+into the convolution or projection that consumes it (a statistics kernel, then normalization and
+SiLU applied while the input is loaded), and attention runs its two products as GPU matmuls with a
+softmax kernel between them. What stays on the CPU is element-wise: residual adds, the GEGLU gate,
+upsampling and skip concatenation. `OXINFER_GPU_CHECK=1` recomputes every device op on the CPU and
+prints the worst relative error per kind (about 4e-6 for attention, 1e-6 for the fused norms, on
+Metal and WebGPU). SDXL, SD 3 and Flux use different architectures and are not supported.
 
 ## Image and audio input
 

@@ -74,6 +74,7 @@ async function load() {
     await nextTick();
     await pause();
     engine.sdLoad('/model');
+    if (params.get('check') === '1') engine.gpuCheckEnable();
     const d = engine.sdDefaults();
     steps.value = Number(params.get('steps') || d.steps);
     guidance.value = Number(params.get('guidance') ?? d.guidance);
@@ -159,6 +160,7 @@ onMounted(async () => {
     if (engine) {
       for (let i = 0; i < Number(params.get('repeat') || 1); i++) await generate();
       props.log(`[image-done ${result.value ? `${result.value.width}x${result.value.height} ${result.value.secs.toFixed(2)}s` : 'none'}]`);
+      if (params.get('check') === '1') props.log(`[gpu check: ${engine.gpuCheckSummary()}]`);
     }
     fetch('/exit', { method: 'POST' }).catch(() => {});
   }

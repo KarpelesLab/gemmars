@@ -359,25 +359,61 @@ impl Pre<'_> {
     }
 }
 
-/// With `OXINFER_GPU_CHECK=1`, recomputes a device result on the CPU and prints the difference.
-fn check_gpu(what: &str, y: &[f32], cpu: impl FnOnce() -> Vec<f32>) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("OXINFER_GPU_CHECK").is_some()) {
+/// Device-vs-CPU checking (`OXINFER_GPU_CHECK=1`, or `gpu_check::enable()`): every device op is
+/// recomputed on the CPU; the worst relative error per op kind is kept for `gpu_check::summary()`.
+pub mod gpu_check {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 off, 2 on
+    static WORST: Mutex<BTreeMap<&'static str, (usize, f64)>> = Mutex::new(BTreeMap::new());
+
+    pub fn enable() {
+        ON.store(2, Ordering::Relaxed);
+    }
+
+    pub fn on() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => {
+                let v = std::env::var_os("OXINFER_GPU_CHECK").is_some();
+                ON.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+                v
+            }
+            v => v == 2,
+        }
+    }
+
+    pub(super) fn record(what: &'static str, rel: f64) {
+        let mut w = WORST.lock().unwrap();
+        let e = w.entry(what).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 = e.1.max(rel);
+    }
+
+    /// "attention: 31 ops, worst rel L2 4.2e-6; ..." (empty when nothing was checked).
+    pub fn summary() -> String {
+        WORST
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, (n, r))| format!("{k}: {n} ops, worst rel L2 {r:.1e}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+fn check_gpu(what: &'static str, y: &[f32], cpu: impl FnOnce() -> Vec<f32>) {
+    if !gpu_check::on() {
         return;
     }
     let r = cpu();
-    let (mut num, mut den, mut max) = (0f64, 0f64, 0f32);
+    let (mut num, mut den) = (0f64, 0f64);
     for (a, b) in y.iter().zip(&r) {
         num += ((a - b) as f64).powi(2);
         den += (*b as f64).powi(2);
-        max = max.max((a - b).abs());
     }
-    eprintln!(
-        "[gpu check {what} ({} values): rel L2 {:.2e}, max |diff| {:.2e}]",
-        y.len(),
-        (num / den.max(1e-30)).sqrt(),
-        max
-    );
+    gpu_check::record(what, (num / den.max(1e-30)).sqrt());
 }
 
 impl Linear {
