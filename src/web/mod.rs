@@ -203,11 +203,18 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
         Lm::Qwen(m, ..) => (m.cfg.num_hidden_layers, m.cfg.hidden_size, m.streamed_bytes(), m.quant),
     };
     let _ = quant;
+    files.release_unused_host_files();
     let eos = crate::chat::with_turn_end(lm.fmt(), &tok, eos);
     log(&format!(
         "[loaded {model_type}: {layers} layers, hidden {hidden}, {:.2} GB checkpoint, {stored:?} weights{} streaming {:.2} GB/token, device {}, {:.2}s]",
         files.total_bytes() as f64 / 1e9,
-        if Quant::stored(files).is_some() { " (pre-quantized)" } else { "" },
+        if files.is_mlx() {
+            " (MLX)"
+        } else if Quant::stored(files).is_some() {
+            " (pre-quantized)"
+        } else {
+            ""
+        },
         streamed as f64 / 1e9,
         crate::gpu::active().map(|b| b.name().to_string()).unwrap_or_else(|| "cpu".into()),
         t0.elapsed().as_secs_f64()

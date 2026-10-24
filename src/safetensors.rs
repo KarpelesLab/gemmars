@@ -338,6 +338,8 @@ pub struct ModelFiles {
     uses: Mutex<HashMap<String, (bool, bool)>>,
     /// bf16 copies of MLX-quantized tensors that were read as plain bf16 (never freed).
     dequantized: Mutex<HashMap<String, PageVec<u16>>>,
+    /// Aligned copies of tensors from host-kept shards or unaligned mapped ones (never freed).
+    copies: Mutex<HashMap<String, (PageVec<u64>, usize)>>,
 }
 
 /// Maximum shard size written by `write_quantized`.
@@ -414,6 +416,7 @@ impl ModelFiles {
             touched: Mutex::new(BTreeMap::new()),
             uses: Mutex::new(HashMap::new()),
             dequantized: Mutex::new(HashMap::new()),
+            copies: Mutex::new(HashMap::new()),
         };
         if files.is_mlx() {
             let cfg = crate::fsx::read(&dir.join("config.json"))
@@ -446,28 +449,33 @@ impl ModelFiles {
                     .collect()
             })
             .unwrap_or_default();
-        for sh in &mut self.shards {
-            let names: Vec<String> = sh.tensors.keys().filter(|n| n.ends_with(".scales")).cloned().collect();
-            for sn in names {
-                let base = &sn[..sn.len() - ".scales".len()];
-                let wn = format!("{base}.weight");
-                let (bits, group) = overrides.get(base).copied().unwrap_or((bits, group));
-                let s_cols = *sh.tensors[&sn].shape.last().unwrap_or(&0);
-                let Some(w) = sh.tensors.get_mut(&wn) else { continue };
-                if w.dtype != "U32" || w.shape.len() != 2 {
-                    continue;
-                }
-                let n_in = w.shape[1] * 32 / bits;
-                if s_cols * group != n_in {
-                    bail!(
-                        "{wn}: {} packed columns at {bits} bits do not match {s_cols} groups of {group}",
-                        w.shape[1]
-                    );
-                }
-                w.shape[1] = n_in;
-                w.dtype = "BF16".into();
-                w.mlx = Some(MlxQuant { bits, group });
+        // Scales and their matrix may sit in different shards.
+        let scales: Vec<(String, usize)> = self
+            .shards
+            .iter()
+            .flat_map(|sh| sh.tensors.iter())
+            .filter(|(n, _)| n.ends_with(".scales"))
+            .map(|(n, t)| (n.clone(), *t.shape.last().unwrap_or(&0)))
+            .collect();
+        for (sn, s_cols) in scales {
+            let base = &sn[..sn.len() - ".scales".len()];
+            let wn = format!("{base}.weight");
+            let (bits, group) = overrides.get(base).copied().unwrap_or((bits, group));
+            let Some(&i) = self.index.get(&wn) else { continue };
+            let Some(w) = self.shards[i].tensors.get_mut(&wn) else { continue };
+            if w.dtype != "U32" || w.shape.len() != 2 {
+                continue;
             }
+            let n_in = w.shape[1] * 32 / bits;
+            if s_cols * group != n_in {
+                bail!(
+                    "{wn}: {} packed columns at {bits} bits do not match {s_cols} groups of {group}",
+                    w.shape[1]
+                );
+            }
+            w.shape[1] = n_in;
+            w.dtype = "BF16".into();
+            w.mlx = Some(MlxQuant { bits, group });
         }
         Ok(())
     }
@@ -578,28 +586,38 @@ impl ModelFiles {
             return self.mlx_bf16(name, m, info.shape[0], info.shape[1]);
         }
         let sh = &self.shards[i];
-        let misaligned = !matches!(sh.mmap, Storage::Host(_)) && !(sh.mmap.as_ptr() as usize + info.start).is_multiple_of(2);
-        if info.dtype == "BF16" && misaligned {
-            // Unaligned in a mapped file (MLX headers have any length): use an aligned copy.
-            let mut cache = self.dequantized.lock().unwrap();
-            if !cache.contains_key(name) {
-                let b = self.shards[i].bytes(name)?;
-                let mut v = PageVec::<u16>::zeroed(b.len() / 2);
-                for (o, c) in v.iter_mut().zip(b.as_chunks::<2>().0) {
-                    *o = u16::from_le_bytes(*c);
-                }
-                cache.insert(name.to_string(), v);
-            }
-            let v = &cache[name];
-            // SAFETY: as in `mlx_bf16`.
-            return Ok(unsafe { std::slice::from_raw_parts(v.as_ptr(), v.len()) });
+        let host = matches!(sh.mmap, Storage::Host(_));
+        if info.dtype == "BF16" && (host || !(sh.mmap.as_ptr() as usize + info.start).is_multiple_of(2)) {
+            // In a host-kept shard, or unaligned in a mapped file (MLX headers have any length):
+            // read an aligned copy.
+            let b = self.copy(name)?;
+            return Ok(unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len() / 2) });
         }
-        self.shards[i].bf16(name)
+        sh.bf16(name)
     }
 
     pub fn bytes(&self, name: &str) -> Result<&[u8]> {
         self.touch(name);
+        let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
+        if matches!(self.shards[i].mmap, Storage::Host(_)) {
+            return self.copy(name);
+        }
         self.raw(name)
+    }
+
+    /// An 8-byte-aligned copy of tensor `name`'s bytes, kept for the lifetime of `self`.
+    fn copy(&self, name: &str) -> Result<&[u8]> {
+        let mut cache = self.copies.lock().unwrap();
+        if !cache.contains_key(name) {
+            let b = self.bytes_cow(name)?;
+            let mut v = PageVec::<u64>::zeroed(b.len().div_ceil(8));
+            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), v.as_mut_ptr() as *mut u8, b.len()) };
+            cache.insert(name.to_string(), (v, b.len()));
+        }
+        let (v, n) = &cache[name];
+        // SAFETY: entries are never removed or replaced, and the PageVec's heap block does not
+        // move when the map rehashes, so the slice lives as long as `self`.
+        Ok(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, *n) })
     }
 
     fn raw(&self, name: &str) -> Result<&[u8]> {
@@ -632,6 +650,35 @@ impl ModelFiles {
         match &sh.mmap {
             Storage::Host(h) => sh.tensors.get(name).map(|t| (*h, t.start as u64)),
             _ => None,
+        }
+    }
+
+    /// Lets the host drop every host-kept shard the model no longer reads: all but those holding
+    /// lookup tables (with their MLX scales and biases), which are read row by row while running.
+    /// Call once the model is built.
+    pub fn release_unused_host_files(&self) {
+        let uses = self.uses.lock().unwrap();
+        let mut keep = std::collections::HashSet::new();
+        for (name, &(_, table)) in uses.iter() {
+            if !table {
+                continue;
+            }
+            let base = name.strip_suffix(".weight").unwrap_or(name);
+            for n in [name.clone(), format!("{base}.scales"), format!("{base}.biases")]
+                .into_iter()
+                .chain([".q8", ".q8s", ".q4", ".q4s"].iter().map(|s| format!("{name}{s}")))
+            {
+                if let Some(&i) = self.index.get(&n) {
+                    keep.insert(i);
+                }
+            }
+        }
+        for (i, sh) in self.shards.iter().enumerate() {
+            if let Storage::Host(h) = &sh.mmap
+                && !keep.contains(&i)
+            {
+                crate::fsx::release_host(*h);
+            }
         }
     }
 
@@ -917,8 +964,9 @@ impl ModelFiles {
         Ok((std::fs::metadata(out)?.len(), names))
     }
 
-    pub fn total_bytes(&self) -> usize {
-        self.shards.iter().map(|s| s.len()).sum()
+    /// Checkpoint size (u64: a browser module's usize is 32-bit, checkpoints can be larger).
+    pub fn total_bytes(&self) -> u64 {
+        self.shards.iter().map(|s| s.len() as u64).sum()
     }
 
     pub fn preload(&self) {

@@ -35,6 +35,7 @@ mod imp {
     pub fn read_host(_f: HostFile, _offset: u64, _buf: &mut [u8]) -> Result<()> {
         anyhow::bail!("host-backed files exist only in the browser build")
     }
+    pub fn release_host(_f: HostFile) {}
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -52,6 +53,8 @@ mod imp {
     unsafe extern "C" {
         /// Copies `len` bytes at `offset` of host file `id` into `ptr`; returns 0 on success.
         fn host_read(id: u32, offset: f64, ptr: *mut u8, len: usize) -> i32;
+        /// The module will not read host file `id` again: the host may drop it.
+        fn host_release(id: u32);
     }
 
     /// Registers a file the host keeps (see `HostFile`).
@@ -70,6 +73,10 @@ mod imp {
             anyhow::bail!("host read of file {} failed ({rc})", f.id);
         }
         Ok(())
+    }
+
+    pub fn release_host(f: HostFile) {
+        unsafe { host_release(f.id) }
     }
 
     fn key(path: &Path) -> String {

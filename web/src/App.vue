@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onMounted, reactive, ref } from 'vue';
 import { Oxinfer, WebGpuHost, hasJspi } from './lib/oxinfer.js';
-import { cachedBytes, clearCache, loadFromFolder, loadFromUrl, sourceBase } from './lib/loader.js';
+import { cachedBytes, clearCache, loadFromFolder, loadModel } from './lib/loader.js';
 import Reply from './components/Reply.vue';
 import ImageStudio from './components/ImageStudio.vue';
 import { TOOL_SPECS, runTool, systemPrompt } from './lib/tools.js';
@@ -9,6 +9,8 @@ import { TOOL_SPECS, runTool, systemPrompt } from './lib/tools.js';
 const WASM_URL = `${import.meta.env.BASE_URL}oxinfer.wasm`;
 const REPO = 'https://github.com/KarpelesLab/oxinfer';
 const PRESET = { repo: 'Qwen/Qwen3.5-0.8B', name: 'Qwen 3.5 0.8B' };
+// MLX 4-bit checkpoints the mirror carries (they load as 4-bit whatever the precision setting).
+const SUGGESTIONS = ['mlx-community/gemma-4-e2b-it-4bit', 'mlx-community/Qwen3-4B-4bit', 'mlx-community/gemma-3-4b-it-4bit', 'mlx-community/gemma-4-e4b-it-4bit'];
 
 const params = new URLSearchParams(location.search);
 const auto = params.get('auto') === '1';
@@ -115,7 +117,7 @@ async function load() {
     } else {
       const spec = source.value === 'preset' ? PRESET.repo : custom.value;
       modelName.value = source.value === 'preset' ? PRESET.name : spec.split('/').filter(Boolean).pop();
-      await loadFromUrl(engine, sourceBase(spec), onProgress);
+      await loadModel(engine, spec, onProgress);
     }
     phase.value = 'preparing';
     await nextTick();
@@ -312,7 +314,7 @@ onMounted(async () => {
             <input v-model="source" type="radio" value="custom" />
             <span>
               <strong>Another model</strong>
-              <small>A Hugging Face repo id or a URL to a model folder.</small>
+              <small>A repo id, from the ATOnline mirror when it has the model and Hugging Face otherwise (MLX 4-bit repos work too), or a URL to a model folder.</small>
             </span>
           </label>
           <input
@@ -321,14 +323,18 @@ onMounted(async () => {
             class="field"
             type="text"
             placeholder="org/name, https://… or ./folder"
-            aria-label="Hugging Face repo id or folder URL"
+            aria-label="Repo id or folder URL"
+            list="model-suggestions"
             spellcheck="false"
           />
+          <datalist id="model-suggestions">
+            <option v-for="m in SUGGESTIONS" :key="m" :value="m"></option>
+          </datalist>
           <label class="choice">
             <input v-model="source" type="radio" value="folder" />
             <span>
               <strong>A folder on this computer</strong>
-              <small>Gemma 4 fits only this way: write the folder with <code>oxinfer --save-quantized</code>.</small>
+              <small>A model folder, such as an MLX download or one written by <code>oxinfer --save-quantized</code>.</small>
             </span>
           </label>
           <input v-if="source === 'folder'" class="field" type="file" webkitdirectory directory multiple aria-label="Model folder" @change="onFolder" />
@@ -345,7 +351,7 @@ onMounted(async () => {
           </label>
           <label v-if="device.gpu && hasJspi" class="inline"><input v-model="useGpu" type="checkbox" /> Use the GPU</label>
         </div>
-        <p class="hint">Precision applies to original checkpoints. Folders from <code>--save-quantized</code> keep their own.</p>
+        <p class="hint">Precision applies to original checkpoints. MLX models and folders from <code>--save-quantized</code> keep their own.</p>
 
         <button class="primary" type="button" :disabled="!canLoad" @click="load">
           {{ phase === 'ready' || phase === 'generating' ? 'Load again' : 'Load model' }}

@@ -615,6 +615,9 @@ export class Oxinfer {
         g.u8(p, n).set(src.subarray(off, off + n));
         return 0;
       },
+      host_release: (id) => {
+        g.hostFiles[id] = null;
+      },
       host_now_ms: () => performance.now(),
       host_random: (p, n) => {
         const v = g.u8(p, n);
