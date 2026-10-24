@@ -859,11 +859,13 @@ fn continue_with_tools<M: TextLm>(
             .map_err(|e| anyhow::anyhow!("encode: {e}"))?
             .get_ids()
             .to_vec();
+        let t0 = Instant::now();
         let hs = prefill_mm(model, sess, &ids, args.prefill_chunk.unwrap_or(256), &[]);
         let h = model.hidden_size();
         let logits = model.logits(&hs[hs.len() - h..], 1);
+        let prefill_secs = t0.elapsed().as_secs_f64();
         let (o, n, secs) = generate(model, sess, tok, logits, sampler, eos, args.max_tokens, fmt, args.think);
-        report(ids.len(), 0.0, n, secs);
+        report(ids.len(), prefill_secs, n, secs);
         out = o;
     }
     Ok(out)

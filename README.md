@@ -6,15 +6,17 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **[Try it in your browser](https://karpeleslab.github.io/oxinfer/)**: Qwen 3.5 0.8B downloads from
-Hugging Face and runs in the tab, with WebGPU when the browser has it. Early days: the crate is
-at 0.0.0 and the API and file formats may still change.
+Hugging Face and runs in the tab, with WebGPU when the browser has it; MLX 4-bit Gemma 4, Gemma 3
+and Qwen3 models load from the mirror too. Early days: the crate is at 0.0.x and the API and file
+formats may still change.
 
-Local LLM inference in pure Rust: Gemma 4 (text, images, audio) and Qwen 3.5 / 3.8 today, more
-model families as they come. No BLAS, no ML framework: weights are read straight out of the
-HuggingFace safetensors files and every operation (matmuls, attention, norms, RoPE, sampling) is
-implemented here, with hand-written SIMD kernels (NEON, AVX2, wasm simd128) and its own thread
-pool. The CPU path runs everywhere; GPUs (Metal, CUDA, WebGPU in the browser) are detected at
-run time and used for prefill when present, with nothing linked at build time.
+Local LLM inference in pure Rust: Gemma 4 (text, images, audio), Gemma 3 and Qwen 3 / 3.5 / 3.8
+today, more model families as they come. No BLAS, no ML framework: weights are read straight out
+of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
+(matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
+(NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
+CUDA, WebGPU in the browser) are detected at run time and used for prefill when present, with
+nothing linked at build time.
 
 Output is validated against the `transformers` float32 reference: on Gemma 4 E2B-it the
 last-token logits agree to a max absolute difference of about 1e-4 and greedy decoding produces
@@ -31,6 +33,9 @@ identical tokens.
 | google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
 | Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text only; matches the bf16 reference; see below |
 | Qwen/Qwen3.5-0.8B | 0.8B | 1.7 GB | text only; the small one used for the wasm measurements |
+| mlx-community/gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit | 5.1B / 8.0B | 3.6 / 5.2 GB (MLX 4-bit) | text, images and audio; see [MLX checkpoints](#mlx-checkpoints) |
+| mlx-community/Qwen3-4B-4bit (Qwen3 dense) | 4.0B | 2.3 GB (MLX 4-bit) | text; matches the reference on the same weights (same top 10) |
+| mlx-community/gemma-3-4b-it-4bit (Gemma 3) | 4.3B | 3.4 GB (MLX 4-bit) | text only; matches the reference, also past the 1024-token window |
 | stabilityai/sd-turbo | 1.3B | 2.6 GB (fp16) | text-to-image in one step; matches diffusers (see Image generation) |
 | stable-diffusion-v1-5/stable-diffusion-v1-5 (and SD 1.x / 2.x fine-tunes) | 1.1B | 2.0 GB (fp16) | text-to-image; matches diffusers |
 
@@ -160,6 +165,45 @@ done
 
 For 31B, fetch `model.safetensors.index.json` and the `model-0000N-of-0000M.safetensors` shards instead of `model.safetensors`.
 For speculative decoding also fetch `google/gemma-4-E4B-it-assistant` (160 MB) the same way.
+
+### The ATOnline mirror
+
+Repo ids are looked up on the [ATOnline](https://www.atonline.com/) mirror first: its
+`AI/Model:get` method (`https://ws.atonline.com/_special/rest/AI/Model:get?key=org/name`) lists a
+repo's files with download URLs, small ones inlined. Repos it does not carry come from
+huggingface.co. `OXINFER_HUB=mirror` or `OXINFER_HUB=hf` pins one source; the HuggingFace token is
+only ever sent to huggingface.co. The browser build uses the same lookup (the mirror allows
+cross-origin requests).
+
+### MLX checkpoints
+
+MLX repos (mlx-community and the like) store each matrix as packed 4-bit values (`.weight`, eight
+per uint32) plus a bf16 scale and bias per group of 64: `w = scale * q + bias`. Since
+`scale * q + bias = scale * (q - 8) + (bias + 8 * scale)`, the nibbles carry over unchanged into
+the Q4 kernels' layout, and the extra term becomes one bf16 offset per group. Decoding adds
+`offset * sum(x over the group)` per row after the int8 dot products, and prefill dequantizes it
+into the f32 tiles (on the CPU, Metal, CUDA and WebGPU alike). Other bit widths, and quantized
+tensors that are read as plain bf16 (Gemma 4's vision and audio projections), are dequantized on
+load; embedding tables are dequantized one row at a time straight from the checkpoint. The MLX
+names (`language_model.model.*`, `vision_tower.*`) map to the transformers ones, and channels-last
+convolution weights are permuted back.
+
+```sh
+./target/release/oxinfer --model mlx-community/gemma-4-e2b-it-4bit -p "Hello"
+./target/release/oxinfer --model mlx-community/gemma-4-e2b-it-4bit --audio clip.wav -p "Transcribe this."
+```
+
+Against transformers float32 on the dequantized MLX weights, last-token logits agree to a mean
+absolute difference of 0.016 (Gemma 4 E4B), 0.026 (Qwen3-4B) and 0.055 (Gemma 3 4B), with the
+same top 10; the difference to the original bf16 models is MLX's own quantization.
+
+M5 Max, 200-token replies: Gemma 4 E2B 110 tok/s (120 for oxinfer's own Q4 file, which has no
+offsets), Gemma 4 E4B 71 tok/s, Gemma 3 4B 77 tok/s, Qwen3-4B 70 tok/s. Prefill of 2153 tokens on
+Gemma 3 4B takes 4.0 s with Metal (12.9 s on the CPU).
+
+`tools/mlx_to_hf.py` dequantizes an MLX checkpoint into a float32 transformers folder, which is
+the exact reference for those weights; `tools/ref_logits.py` then compares logits. LiteRT-LM
+files (`.litertlm`, TFLite graphs) are not supported.
 
 ## Build and run
 
@@ -362,7 +406,11 @@ The `web` feature (`src/web/`) turns the library into a plain C-ABI wasm module,
 the command line, so native builds never link a shared library). `web/` is the site deployed to
 [GitHub Pages](https://karpeleslab.github.io/oxinfer/) by `.github/workflows/pages.yml`: a Vue 3 +
 Vite app around the JavaScript host `web/src/lib/oxinfer.js`; it is not a crate. Downloads go to
-the browser's Cache Storage, so a model is fetched once per browser. The host registers the model files in the module's in-memory filesystem (streamed straight from
+the browser's Cache Storage, so a model is fetched once per browser. MLX checkpoints load too
+(Gemma 4 E2B and E4B, Gemma 3 4B and Qwen3-4B from the mirror were checked in headless Chrome):
+the host splits each one into shards of at most 1 GiB kept in JavaScript memory as it streams in,
+since a 5 GB file fits neither one allocation nor a 32-bit module, and the module converts the
+matrices into its own memory, then lets the host drop every shard but the embedding tables. The host registers the model files in the module's in-memory filesystem (streamed straight from
 `fetch` or a local folder into module memory) and drives a chat session token by token.
 
 GPU work goes the other way round: the module imports `gpu_upload` / `gpu_matmul`, which the

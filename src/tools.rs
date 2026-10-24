@@ -702,6 +702,17 @@ mod tests {
     }
 
     #[test]
+    fn qwen3_json_calls_parse() {
+        let raw = "<think>\n\n</think>\n\n<tool_call>\n{\"name\": \"calculate\", \"arguments\": {\"expression\": \"2 ^ 10\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_current_datetime\", \"arguments\": \"{}\"}\n</tool_call>";
+        let c = qwen::parse_calls(raw);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].name, "calculate");
+        assert_eq!(c[0].arguments["expression"], json!("2 ^ 10"));
+        assert_eq!(c[1].name, "get_current_datetime");
+        assert!(c[1].arguments.is_empty());
+    }
+
+    #[test]
     fn qwen_calls_parse() {
         let raw = "<tool_call>\n<function=run_javascript>\n<parameter=code>\nconst x = 1;\nreturn x + 1;\n</parameter>\n<parameter=timeout>\n5\n</parameter>\n</function>\n</tool_call>";
         let c = qwen::parse_calls(raw);
