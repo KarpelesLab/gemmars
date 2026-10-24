@@ -99,11 +99,44 @@ pub fn matmul_multi(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[
     }
     // Prefill: pack activations as [tile][k][8 tokens] so the GEMM kernel can broadcast weights by lane.
     let xt = if t >= 8 { Some(pack_xt(x, t, n_in)) } else { None };
-    pool::run(blocks.len(), &|b| {
-        let (j, r0, r1) = blocks[b];
+    let (tchunks, tc) = token_split(blocks.len(), t, nthreads);
+    pool::run(blocks.len() * tchunks, &|b| {
+        let (j, r0, r1) = blocks[b / tchunks];
+        let c0 = (b % tchunks) * tc;
+        if c0 >= t {
+            return;
+        }
+        let c1 = (c0 + tc).min(t);
         let job = refs[j as usize];
-        unsafe { matmul_block(job.w, job.n_out, n_in, x, xt.as_deref(), t, r0 as usize, r1 as usize, job.y.get()) }
+        // A token range is a contiguous slice of x, whole tiles of xt, and an offset into y.
+        let xs = &x[c0 * n_in..c1 * n_in];
+        let xts = xt.as_deref().map(|xt| &xt[c0 / TN * n_in * TN..]);
+        unsafe {
+            matmul_block(
+                job.w,
+                job.n_out,
+                n_in,
+                xs,
+                xts,
+                c1 - c0,
+                r0 as usize,
+                r1 as usize,
+                job.y.get().add(c0 * job.n_out),
+            )
+        }
     });
+}
+
+/// When the weights split into too few row blocks to occupy the pool (small matrices over many
+/// tokens: convolutions, attention products), also split the tokens, in whole TN-token tiles.
+/// Returns the number of token chunks and their length.
+fn token_split(row_blocks: usize, t: usize, nthreads: usize) -> (usize, usize) {
+    if t < 64 || row_blocks >= nthreads * 2 {
+        return (1, t);
+    }
+    let chunks = (nthreads * 3).div_ceil(row_blocks).min(t / 32).max(1);
+    let len = t.div_ceil(chunks).next_multiple_of(TN);
+    (t.div_ceil(len), len)
 }
 
 /// Tokens per prefill GEMM tile (8 rows x 8 tokens = 16 accumulators; 12 tokens measured slower, register pressure).
@@ -684,24 +717,40 @@ unsafe fn matmul_block(w: &[u16], n_out: usize, n_in: usize, x: &[f32], xt: Opti
     let xp = x.as_ptr();
     let mut r = r0;
     if let Some(xt) = xt {
-        // Prefill: 8x8 outer-product tiles; weights stay in L2 across token tiles.
+        // Prefill: 8x8 outer-product tiles; weights stay in L2 across token tiles. When the packed
+        // activations are larger than L2 (convolutions over thousands of pixels), walk the tokens
+        // in groups of tiles instead, so each group stays cached while every row passes over it.
         let tiles = t.div_ceil(TN);
-        while r + 8 <= r1 {
-            for tile in 0..tiles {
-                let c0 = tile * TN;
-                gemm_8x8::<u16>(
-                    wp.add(r * n_in),
-                    n_in,
-                    xt.as_ptr().add(tile * n_in * TN),
-                    y,
-                    n_out,
-                    r,
-                    c0,
-                    (t - c0).min(TN),
-                );
-            }
-            r += 8;
+        let group = if t * n_in * 4 > 8 << 20 {
+            (256 << 10) / (n_in * TN * 4)
+        } else {
+            tiles
         }
+        .max(1);
+        let full = r0 + (r1 - r0) / 8 * 8;
+        let mut g0 = 0;
+        while g0 < tiles {
+            let g1 = (g0 + group).min(tiles);
+            let mut rr = r0;
+            while rr < full {
+                for tile in g0..g1 {
+                    let c0 = tile * TN;
+                    gemm_8x8::<u16>(
+                        wp.add(rr * n_in),
+                        n_in,
+                        xt.as_ptr().add(tile * n_in * TN),
+                        y,
+                        n_out,
+                        rr,
+                        c0,
+                        (t - c0).min(TN),
+                    );
+                }
+                rr += 8;
+            }
+            g0 = g1;
+        }
+        r = full;
     }
     // Decode (and leftover rows): streaming dot-product tiles over up to 4 tokens at a time.
     if r < r1 {
@@ -991,10 +1040,28 @@ pub fn matmul_quant_multi<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: 
     }
     if t >= 8 {
         let xt = pack_xt(x, t, n_in);
-        pool::run(blocks.len(), &|b| {
-            let (j, r0, r1) = blocks[b];
+        let (tchunks, tc) = token_split(blocks.len(), t, nthreads);
+        pool::run(blocks.len() * tchunks, &|b| {
+            let (j, r0, r1) = blocks[b / tchunks];
+            let c0 = (b % tchunks) * tc;
+            if c0 >= t {
+                return;
+            }
+            let c1 = (c0 + tc).min(t);
             let job = refs[j as usize];
-            unsafe { matmul_quant_block_prefill(job.m, x, &xt, t, r0 as usize, r1 as usize, job.y.get()) }
+            let xs = &x[c0 * n_in..c1 * n_in];
+            let xts = &xt[c0 / TN * n_in * TN..];
+            unsafe {
+                matmul_quant_block_prefill(
+                    job.m,
+                    xs,
+                    xts,
+                    c1 - c0,
+                    r0 as usize,
+                    r1 as usize,
+                    job.y.get().add(c0 * job.m.n_out()),
+                )
+            }
         });
     } else {
         let xa = quantize_act(x, t, n_in);

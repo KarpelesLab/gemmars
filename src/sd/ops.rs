@@ -11,6 +11,49 @@ use crate::safetensors::SafeTensors;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
+// ---- profiling ---------------------------------------------------------------------------------
+
+/// Wall time per operation kind, reported by `--profile` in image mode.
+pub mod timing {
+    use crate::clock::Instant;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub const NAMES: [&str; 7] = [
+        "conv unfold",
+        "conv matmul",
+        "linear",
+        "attention",
+        "group norm",
+        "layer norm",
+        "other",
+    ];
+    static NS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    pub struct T(usize, Instant);
+    pub fn start(k: usize) -> T {
+        T(k, Instant::now())
+    }
+    impl Drop for T {
+        fn drop(&mut self) {
+            NS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+    pub fn report() -> String {
+        let mut s = String::new();
+        for (i, n) in NAMES.iter().enumerate() {
+            let ms = NS[i].load(Ordering::Relaxed) as f64 / 1e6;
+            if ms > 0.5 {
+                s.push_str(&format!("  {n:12} {ms:9.1} ms\n"));
+            }
+        }
+        s
+    }
+    pub const UNFOLD: usize = 0;
+    pub const CONV: usize = 1;
+    pub const LINEAR: usize = 2;
+    pub const ATTN: usize = 3;
+    pub const GN: usize = 4;
+    pub const LN: usize = 5;
+}
+
 /// One safetensors file of a diffusers component (`unet/`, `vae/`, `text_encoder/`).
 pub struct Tensors {
     st: SafeTensors,
@@ -132,6 +175,11 @@ impl Linear {
 
     /// `x` is `[rows, n_in]`; returns `[rows, n_out]`.
     pub fn forward(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        let _t = timing::start(timing::LINEAR);
+        self.forward_untimed(x, rows)
+    }
+
+    fn forward_untimed(&self, x: &[f32], rows: usize) -> Vec<f32> {
         let mut y = vec![0f32; rows * self.n_out];
         linear(&self.w, self.n_out, self.n_in, x, rows, &mut y);
         if let Some(b) = &self.b {
@@ -191,7 +239,11 @@ impl Conv {
         let oh = (h + 2 * pad - k) / stride + 1;
         let ow = (w + 2 * pad - k) / stride + 1;
         if k == 1 && stride == 1 {
-            return (self.lin.forward(x, h * w), h, w);
+            let _t = timing::start(timing::CONV);
+            return (self.lin.forward_untimed(x, h * w), h, w);
+        }
+        if let Some(y) = self.forward_device(x, h, w, stride, oh, ow) {
+            return (y, oh, ow);
         }
         let row = k * k * cin;
         let chunk = (UNFOLD_BYTES / (row * 4)).max(ow).min(oh * ow);
@@ -200,6 +252,7 @@ impl Conv {
         let mut p0 = 0;
         while p0 < oh * ow {
             let n = chunk.min(oh * ow - p0);
+            let tu = timing::start(timing::UNFOLD);
             for_chunks(&mut cols[..n * row], row, true, |i, r| {
                 let p = p0 + i;
                 let (oy, ox) = (p / ow, p % ow);
@@ -217,11 +270,55 @@ impl Conv {
                     }
                 }
             });
-            let y = self.lin.forward(&cols[..n * row], n);
+            drop(tu);
+            let _t = timing::start(timing::CONV);
+            let y = self.lin.forward_untimed(&cols[..n * row], n);
             out[p0 * cout..(p0 + n) * cout].copy_from_slice(&y);
             p0 += n;
         }
         (out, oh, ow)
+    }
+}
+
+impl Conv {
+    /// The convolution on the active accelerator, when it takes this shape.
+    fn forward_device(&self, x: &[f32], h: usize, w: usize, stride: usize, oh: usize, ow: usize) -> Option<Vec<f32>> {
+        let be = crate::gpu::active()?;
+        let (n_out, n_in) = (self.lin.n_out, self.lin.n_in);
+        // Big enough to beat the submission cost, and in the shapes the device kernels tile.
+        let flops = 2.0 * (oh * ow) as f64 * n_out as f64 * n_in as f64;
+        if flops < 3e8 || !self.cin.is_multiple_of(32) || !n_out.is_multiple_of(64) {
+            return None;
+        }
+        let _t = timing::start(timing::CONV);
+        let dev = self.lin.w.device_weight(n_out, n_in)?;
+        let mut y = vec![0f32; oh * ow * n_out];
+        let g = crate::gpu::ConvGeom {
+            h,
+            w,
+            cin: self.cin,
+            k: self.k,
+            stride,
+            oh,
+            ow,
+        };
+        let mut job = crate::gpu::Job {
+            w: self.lin.w.as_ref(),
+            dev,
+            n_out,
+            y: &mut y,
+        };
+        if !be.conv2d(x, &g, &mut job) {
+            return None;
+        }
+        if let Some(b) = &self.lin.b {
+            for_chunks(&mut y, n_out, true, |_, r| {
+                for (v, &bb) in r.iter_mut().zip(b) {
+                    *v += bb;
+                }
+            });
+        }
+        Some(y)
     }
 }
 
@@ -244,6 +341,7 @@ impl GroupNorm {
     }
 
     pub fn apply(&self, x: &mut [f32], n: usize, silu_after: bool) {
+        let _t = timing::start(timing::GN);
         let c = self.w.len();
         let g = self.groups;
         let cpg = c / g;
@@ -323,6 +421,7 @@ impl LayerNorm {
     }
 
     pub fn forward(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        let _t = timing::start(timing::LN);
         let c = self.w.len();
         let mut y = x.to_vec();
         let (w, b, eps) = (&self.w, &self.b, self.eps);
@@ -476,6 +575,7 @@ fn matmul_f32(m: &[f32], n_out: usize, n_in: usize, x: &[f32], t: usize) -> Vec<
 /// `[tq, heads*dh]`. `causal` masks keys after each query (CLIP's text encoder).
 #[allow(clippy::too_many_arguments)]
 pub fn attention(q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, dh: usize, causal: bool) -> Vec<f32> {
+    let _t = timing::start(timing::ATTN);
     let d = heads * dh;
     // Zero padding to multiples of 32 keeps the SIMD GEMM tiles on (and changes no dot product).
     let dhp = dh.next_multiple_of(32);

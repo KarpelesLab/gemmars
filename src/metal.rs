@@ -108,11 +108,87 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
                  uint sg [[simdgroup_index_in_threadgroup]]) { \
     threadgroup float Ws[64 * LD]; \
     WT w = MAKE; gemm_body<WT>(w, x, y, p, tg, tid, sg, Ws); }
+// ---- Convolution as an implicit GEMM -------------------------------------------------------------
+// K runs over (ky, kx, ci) with cin % 32 == 0, so each 32-wide block of K is one tap's contiguous
+// channel slice. Every threadgroup gathers its 64 pixels x 32 channels into threadgroup memory
+// (zeros outside the image), then runs the same simdgroup MMAs as the GEMM.
+struct CP { uint n_out; uint n_in; uint w_off; uint s_off; uint h; uint w; uint cin; uint k; uint stride; uint ow; uint npix; uint pad; };
+template <typename W>
+inline void conv_body(W wt, device const float* x, device float* y, constant CP& p, uint2 tg, uint tid, uint sg, threadgroup float* Ws, threadgroup float* Xs) {
+    uint o0 = tg.x * 64, t0 = tg.y * 64;
+    uint nblk = p.n_in / 32;
+    simdgroup_float8x8 c00(0.f), c01(0.f), c02(0.f), c03(0.f), c10(0.f), c11(0.f), c12(0.f), c13(0.f),
+                       c20(0.f), c21(0.f), c22(0.f), c23(0.f), c30(0.f), c31(0.f), c32(0.f), c33(0.f);
+    uint sr = (sg / 2) * 32, sc = (sg % 2) * 32;
+    uint drow = tid / 2, dhalf = tid % 2;
+    uint pix = t0 + drow;
+    int oy = int(pix / p.ow), ox = int(pix % p.ow);
+    for (uint b = 0; b < nblk; b++) {
+        float4 wv[8];
+        load(wt, o0 + drow, b, wv);
+        threadgroup float4* wd = (threadgroup float4*)(Ws + drow * LD + dhalf * 16);
+        wd[0] = wv[dhalf * 4]; wd[1] = wv[dhalf * 4 + 1]; wd[2] = wv[dhalf * 4 + 2]; wd[3] = wv[dhalf * 4 + 3];
+        uint kk = b * 32, tap = kk / p.cin, ci0 = kk - tap * p.cin;
+        int ky = int(tap / p.k), kx = int(tap % p.k);
+        int iy = oy * int(p.stride) + ky - int(p.pad), ix = ox * int(p.stride) + kx - int(p.pad);
+        threadgroup float4* xd = (threadgroup float4*)(Xs + drow * LD + dhalf * 16);
+        if (pix < p.npix && iy >= 0 && ix >= 0 && iy < int(p.h) && ix < int(p.w)) {
+            device const float4* src = (device const float4*)(x + ((ulong)iy * p.w + ix) * p.cin + ci0 + dhalf * 16);
+            xd[0] = src[0]; xd[1] = src[1]; xd[2] = src[2]; xd[3] = src[3];
+        } else {
+            xd[0] = 0.f; xd[1] = 0.f; xd[2] = 0.f; xd[3] = 0.f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint k = 0; k < 32; k += 8) {
+            simdgroup_float8x8 a0, a1, a2, a3, b0, b1, b2, b3;
+            simdgroup_load(a0, Ws + (sr + 0) * LD + k, LD);
+            simdgroup_load(a1, Ws + (sr + 8) * LD + k, LD);
+            simdgroup_load(a2, Ws + (sr + 16) * LD + k, LD);
+            simdgroup_load(a3, Ws + (sr + 24) * LD + k, LD);
+            simdgroup_load(b0, Xs + (sc + 0) * LD + k, LD, ulong2(0, 0), true);
+            simdgroup_load(b1, Xs + (sc + 8) * LD + k, LD, ulong2(0, 0), true);
+            simdgroup_load(b2, Xs + (sc + 16) * LD + k, LD, ulong2(0, 0), true);
+            simdgroup_load(b3, Xs + (sc + 24) * LD + k, LD, ulong2(0, 0), true);
+            MMA(0, 0); MMA(0, 1); MMA(0, 2); MMA(0, 3); MMA(1, 0); MMA(1, 1); MMA(1, 2); MMA(1, 3);
+            MMA(2, 0); MMA(2, 1); MMA(2, 2); MMA(2, 3); MMA(3, 0); MMA(3, 1); MMA(3, 2); MMA(3, 3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    ST(0, 0); ST(0, 1); ST(0, 2); ST(0, 3); ST(1, 0); ST(1, 1); ST(1, 2); ST(1, 3);
+    ST(2, 0); ST(2, 1); ST(2, 2); ST(2, 3); ST(3, 0); ST(3, 1); ST(3, 2); ST(3, 3);
+}
+#define CONV(NAME, WT, MAKE) \
+kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], \
+                 device const float* x [[buffer(2)]], device float* y [[buffer(3)]], constant CP& p [[buffer(4)]], \
+                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                 uint sg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float Ws[64 * LD]; threadgroup float Xs[64 * LD]; \
+    WT w = MAKE; conv_body<WT>(w, x, y, p, tg, tid, sg, Ws, Xs); }
+
 #define MK_Q4 Q4W{ (device const uchar*)qb + p.w_off, (device const half*)sb + p.s_off, p.n_in / 32, p.n_in / 2 }
 #define MK_Q8 Q8W{ (device const char*)qb + p.w_off, (device const float*)sb + p.s_off, p.n_in / 32, p.n_in }
 #define MK_BF BfW{ (device const ushort*)qb + p.w_off, p.n_in }
 GEMM(gemm_bf, BfW, MK_BF) GEMM(gemm_q8, Q8W, MK_Q8) GEMM(gemm_q4, Q4W, MK_Q4)
+CONV(conv_bf, BfW, MK_BF) CONV(conv_q8, Q8W, MK_Q8) CONV(conv_q4, Q4W, MK_Q4)
 "#;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConvParams {
+    n_out: u32,
+    n_in: u32,
+    w_off: u32,
+    s_off: u32,
+    h: u32,
+    w: u32,
+    cin: u32,
+    k: u32,
+    stride: u32,
+    ow: u32,
+    npix: u32,
+    pad: u32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -166,6 +242,8 @@ pub struct MetalBackend {
     queue: Id,
     /// GEMM pipelines indexed by format: bf16, q8, q4.
     pipes: [Id; 3],
+    /// Implicit-GEMM convolution pipelines, same order.
+    conv_pipes: [Id; 3],
     staging: Mutex<Staging>,
     sels: Sels,
 }
@@ -274,6 +352,7 @@ impl MetalBackend {
             Ok(p)
         };
         let pipes = [pipeline(c"gemm_bf")?, pipeline(c"gemm_q8")?, pipeline(c"gemm_q4")?];
+        let conv_pipes = [pipeline(c"conv_bf")?, pipeline(c"conv_q8")?, pipeline(c"conv_q4")?];
         let pool_push = unsafe { o.objc.get::<unsafe extern "C" fn() -> *mut c_void>(c"objc_autoreleasePoolPush") }
             .map_err(|e| anyhow!("{e}"))?
             .into_inner_unsafe();
@@ -305,6 +384,7 @@ impl MetalBackend {
             device,
             queue,
             pipes,
+            conv_pipes,
             staging: Mutex::new(Staging {
                 x: std::ptr::null_mut(),
                 x_cap: 0,
@@ -409,6 +489,96 @@ impl Backend for MetalBackend {
             },
         };
         Some(Box::new(mw))
+    }
+
+    fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, job: &mut Job) -> bool {
+        let n_in = g.k * g.k * g.cin;
+        let t = g.oh * g.ow;
+        if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(TILE) || x.len() < g.h * g.w * g.cin || job.y.len() < t * job.n_out {
+            return false;
+        }
+        let Some(mw) = job.dev.downcast_ref::<MetalWeight>() else {
+            return false;
+        };
+        let t_pad = t.div_ceil(TILE) * TILE;
+        let mut st = self.staging.lock().unwrap();
+        if !self.ensure_staging(&mut st, g.h * g.w * g.cin * 4, t_pad * job.n_out * 4) {
+            return false;
+        }
+        let contents: MsgPtr = self.o.msg_send();
+        let t0 = Instant::now();
+        unsafe {
+            let xp = contents(st.x, self.sels.contents) as *mut f32;
+            std::ptr::copy_nonoverlapping(x.as_ptr(), xp, g.h * g.w * g.cin);
+        }
+        let msg0: Msg0 = self.o.msg_send();
+        let set_pipe: MsgSetPipe = self.o.msg_send();
+        let set_buf: MsgSetBuffer = self.o.msg_send();
+        let set_bytes: MsgSetBytes = self.o.msg_send();
+        let dispatch: MsgDispatch = self.o.msg_send();
+        let void: MsgVoid = self.o.msg_send();
+        let status: MsgU = self.o.msg_send();
+        unsafe {
+            let t1 = Instant::now();
+            let pool = (self.sels.pool_push)();
+            let cb = msg0(self.queue, self.sels.command_buffer);
+            let enc = msg0(cb, self.sels.compute_encoder);
+            let (fi, elem_bytes, scale_bytes) = format_index(&job.w);
+            let params = ConvParams {
+                n_out: job.n_out as u32,
+                n_in: n_in as u32,
+                w_off: (mw.data.offset_bytes / elem_bytes) as u32,
+                s_off: mw.scales.as_ref().map(|s| s.offset_bytes / scale_bytes).unwrap_or(0) as u32,
+                h: g.h as u32,
+                w: g.w as u32,
+                cin: g.cin as u32,
+                k: g.k as u32,
+                stride: g.stride as u32,
+                ow: g.ow as u32,
+                npix: t as u32,
+                pad: (g.k / 2) as u32,
+            };
+            set_pipe(enc, self.sels.set_pipeline, self.conv_pipes[fi]);
+            set_buf(enc, self.sels.set_buffer, mw.data.id, 0, 0);
+            set_buf(
+                enc,
+                self.sels.set_buffer,
+                mw.scales.as_ref().map(|s| s.id).unwrap_or(mw.data.id),
+                0,
+                1,
+            );
+            set_buf(enc, self.sels.set_buffer, st.x, 0, 2);
+            set_buf(enc, self.sels.set_buffer, st.y, 0, 3);
+            set_bytes(
+                enc,
+                self.sels.set_bytes,
+                &params as *const ConvParams as *const c_void,
+                std::mem::size_of::<ConvParams>(),
+                4,
+            );
+            let groups = MtlSize {
+                w: job.n_out / TILE,
+                h: t_pad / TILE,
+                d: 1,
+            };
+            let threads = MtlSize { w: 128, h: 1, d: 1 };
+            dispatch(enc, self.sels.dispatch, &groups, &threads);
+            void(enc, self.sels.end_encoding);
+            void(cb, self.sels.commit);
+            void(cb, self.sels.wait);
+            let ok = status(cb, self.sels.status) == 4;
+            let t2 = Instant::now();
+            if ok {
+                let yp = contents(st.y, self.sels.contents) as *const f32;
+                std::ptr::copy_nonoverlapping(yp, job.y.as_mut_ptr(), t * job.n_out);
+            }
+            (self.sels.pool_pop)(pool);
+            self.stats.calls.fetch_add(1, Ordering::Relaxed);
+            self.stats.copy_in_ns.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+            self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+            self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            ok
+        }
     }
 
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool {

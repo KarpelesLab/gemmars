@@ -276,6 +276,12 @@ impl<'a> Lin<'a> {
             Weight::Q4(m) => crate::gpu::WeightRef::Q4(m),
         }
     }
+    /// Device-side state for this layer on the active accelerator, whatever the op size (callers
+    /// that bypass `Backend::wants`, such as convolutions, decide for themselves).
+    pub(crate) fn device_weight(&self, n_out: usize, n_in: usize) -> Option<&crate::gpu::DeviceWeight> {
+        let be = crate::gpu::active()?;
+        self.dev.get_or_init(|| be.upload(&self.as_ref(), n_out, n_in)).as_ref()
+    }
     /// Device-side state for this layer if the active accelerator wants the op at this size.
     fn device_state(&self, n_out: usize, n_in: usize, t: usize) -> Option<&crate::gpu::DeviceWeight> {
         let be = crate::gpu::active()?;

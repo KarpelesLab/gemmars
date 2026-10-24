@@ -67,7 +67,12 @@ fn bench_gpu(n_out: usize, n_in: usize) {
     for (name, wr) in refs.iter() {
         let dev = be.upload(wr, n_out, n_in).expect("upload");
         println!("\n{name} [{n_out} x {n_in}] on {}:", be.name());
-        for &t in &[1usize, 2, 4, 8, 16, 64, 256, 512] {
+        // T=a,b,c overrides the token counts (e.g. convolution-sized batches).
+        let ts: Vec<usize> = std::env::var("T")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_else(|| vec![1, 2, 4, 8, 16, 64, 256, 512]);
+        for &t in &ts {
             let x: Vec<f32> = (0..t * n_in).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
             let mut y_ref = vec![0f32; t * n_out];
             match wr {

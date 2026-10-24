@@ -831,7 +831,10 @@ fn run_image(args: &Args) -> Result<()> {
         out.display()
     );
     if args.profile {
-        prof::report(tm.text + tm.denoise + tm.decode, tm.unet_calls.max(1));
+        eprint!("[time by operation]\n{}", oxinfer::sd::ops::timing::report());
+        if let Some(s) = oxinfer::gpu::active().and_then(|b| b.stats()) {
+            eprintln!("  gpu: {s}");
+        }
     }
     Ok(())
 }

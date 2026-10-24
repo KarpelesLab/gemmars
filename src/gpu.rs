@@ -34,6 +34,19 @@ pub struct Job<'a> {
     pub y: &'a mut [f32],
 }
 
+/// Geometry of a k x k convolution with padding k/2 over channels-last input `[h*w, cin]`,
+/// producing `[oh*ow, n_out]`; the weights are in the unfolded `[n_out][ky][kx][cin]` layout.
+#[derive(Clone, Copy, Debug)]
+pub struct ConvGeom {
+    pub h: usize,
+    pub w: usize,
+    pub cin: usize,
+    pub k: usize,
+    pub stride: usize,
+    pub oh: usize,
+    pub ow: usize,
+}
+
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
     /// Whether this backend should run a matmul of these dimensions. Dispatch has a fixed cost
@@ -44,6 +57,12 @@ pub trait Backend: Send + Sync {
     /// Runs a batch of matmuls over one shared input in a single submission. Returns false if
     /// nothing was computed (the caller then runs the whole batch on the CPU).
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool;
+    /// Runs a convolution directly on the device (gathering the k x k neighbourhoods itself, so
+    /// the unfolded input never exists in host memory). `job.y` is `[oh*ow, n_out]`. Returns
+    /// false when the backend does not handle this case (the caller unfolds on the CPU).
+    fn conv2d(&self, _x: &[f32], _g: &ConvGeom, _job: &mut Job) -> bool {
+        false
+    }
     /// Cumulative timing summary for `--profile`.
     fn stats(&self) -> Option<String> {
         None
