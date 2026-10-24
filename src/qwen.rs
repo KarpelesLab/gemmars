@@ -2,7 +2,7 @@
 //! short conv and a delta-rule recurrent state) interleaved with gated full attention, SiLU MLPs
 //! and zero-centered RMSNorm; plain Qwen3 (full attention only) runs on the same code, and so does
 //! Qwen3.5 MoE (top-k routed SiLU experts plus a sigmoid-gated shared expert in place of the MLP).
-//! Text only (the vision encoder and MTP head are not loaded).
+//! Text only (no vision encoder); the MTP head for speculative decoding is in `qwen_mtp.rs`.
 
 use crate::config::QwenConfig;
 use crate::kernels::*;
@@ -26,7 +26,7 @@ struct Gdn<'a> {
     out: Lin<'a>,     // [H, value_dim]
 }
 
-struct Attn<'a> {
+pub(crate) struct Attn<'a> {
     q: Lin<'a>, // [nh*hd*2, H] (query and gate interleaved per head)
     k: Lin<'a>,
     v: Lin<'a>,
@@ -42,7 +42,7 @@ enum Mixer<'a> {
     Attn(Attn<'a>),
 }
 
-struct Mlp<'a> {
+pub(crate) struct Mlp<'a> {
     gate: Lin<'a>,
     up: Lin<'a>,
     down: Lin<'a>,
@@ -70,7 +70,7 @@ impl Mlp<'_> {
 
 /// Sparse MoE block: softmax router, top-k experts with renormalized weights, plus a shared
 /// expert scaled by `sigmoid(shared_gate . x)`.
-struct Moe<'a> {
+pub(crate) struct Moe<'a> {
     router: Vec<f32>,         // [n_exp, H]
     gate_up: Vec<GateUp<'a>>, // per expert
     down: Vec<Lin<'a>>,       // per expert [H, inter]
@@ -82,7 +82,7 @@ struct Moe<'a> {
 
 /// An expert's input projections: fused (`experts.gate_up_proj`, `[2 * inter, H]`, gate rows then
 /// up rows) or separate (`experts.{e}.gate_proj` / `up_proj`, as transformers saves them).
-enum GateUp<'a> {
+pub(crate) enum GateUp<'a> {
     Fused(Lin<'a>),
     Split(Lin<'a>, Lin<'a>),
 }
@@ -98,9 +98,33 @@ impl GateUp<'_> {
 
 // One per layer, built once.
 #[allow(clippy::large_enum_variant)]
-enum Ffn<'a> {
+pub(crate) enum Ffn<'a> {
     Dense(Mlp<'a>),
     Moe(Moe<'a>),
+}
+
+impl Ffn<'_> {
+    pub(crate) fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
+        match self {
+            Ffn::Dense(m) => m.forward(x, t, h, y),
+            Ffn::Moe(m) => m.forward(x, t, h, y),
+        }
+    }
+
+    /// Weight bytes read per token.
+    pub(crate) fn streamed_bytes(&self) -> usize {
+        match self {
+            Ffn::Dense(m) => m.bytes(),
+            // The shared expert and top_k of the routed ones.
+            Ffn::Moe(m) => m.shared.bytes() + m.top_k * (m.gate_up[0].bytes() + m.down[0].bytes()),
+        }
+    }
+}
+
+impl Attn<'_> {
+    pub(crate) fn bytes(&self) -> usize {
+        self.q.bytes() + self.k.bytes() + self.v.bytes() + self.o.bytes()
+    }
 }
 
 struct QLayer<'a> {
@@ -113,23 +137,84 @@ struct QLayer<'a> {
 pub struct QwenModel<'a> {
     pub cfg: QwenConfig,
     pub quant: Quant,
-    embed: Table<'a>,
+    pub(crate) embed: Table<'a>,
     layers: Vec<QLayer<'a>>,
     final_norm: Vec<f32>,
-    lm_head: Lin<'a>,
-    inv_freq: Vec<f32>,
+    pub(crate) lm_head: Lin<'a>,
+    pub(crate) inv_freq: Vec<f32>,
 }
 
 /// Recurrent state of one Gated DeltaNet layer.
+#[derive(Clone)]
 pub struct GdnState {
     s: Vec<f32>,    // [n_v, hd_k, hd_v]
     conv: Vec<f32>, // [K-1, conv_dim]: the last K-1 raw conv inputs (oldest first)
 }
 
+/// What a recording forward (`QwenModel::forward_hidden_rec`) keeps of one Gated DeltaNet layer
+/// so the session can rewind to any position inside the span: unlike a KV cache, the recurrent
+/// state cannot be truncated, so the state after every token is stored (buffers are reused).
+#[derive(Clone, Default)]
+struct GdnRecord {
+    states: Vec<f32>, // [t - 1, n_v * hd_k * hd_v]: `s` after each token but the last
+    qkv: Vec<f32>,    // [t, conv_dim]: raw conv inputs
+    conv0: Vec<f32>,  // conv state before the span
+    conv_dim: usize,
+}
+
+#[derive(Clone)]
 pub struct QwenSession {
     kv: Vec<Option<LayerCache>>,
     gdn: Vec<Option<GdnState>>,
+    rec: Vec<GdnRecord>,
+    /// `(start, len)` of the positions recorded by the last forward, if it recorded.
+    rec_span: Option<(usize, usize)>,
     pub pos: usize,
+}
+
+impl QwenSession {
+    /// Rewinds to `pos` tokens (dropping later KV entries and restoring the recurrent states).
+    /// Positions up to the end of the last forward are always fine; earlier ones need that
+    /// forward to have been a recording one (`forward_hidden_rec`) that started before `pos`.
+    pub fn rewind(&mut self, pos: usize) -> Result<()> {
+        if pos >= self.pos {
+            return Ok(());
+        }
+        let has_gdn = self.gdn.iter().any(|g| g.is_some());
+        if has_gdn {
+            let Some((start, len)) = self.rec_span else {
+                bail!("cannot rewind the recurrent state to {pos}: the last forward did not record");
+            };
+            if pos <= start || pos > start + len {
+                bail!("cannot rewind to {pos}: recorded span is {start}..{}", start + len);
+            }
+            let i = pos - start - 1; // the last kept token, within the span
+            for (st, rec) in self.gdn.iter_mut().zip(&self.rec) {
+                let Some(st) = st else { continue };
+                let n = st.s.len();
+                st.s.copy_from_slice(&rec.states[i * n..(i + 1) * n]);
+                // The conv state is the last K-1 raw inputs up to and including token i.
+                let cd = rec.conv_dim;
+                let keep = st.conv.len() / cd;
+                for slot in 0..keep {
+                    let ti = (i + 1) as isize - keep as isize + slot as isize;
+                    let src = if ti >= 0 {
+                        &rec.qkv[ti as usize * cd..(ti as usize + 1) * cd]
+                    } else {
+                        let o = (keep as isize + ti) as usize;
+                        &rec.conv0[o * cd..(o + 1) * cd]
+                    };
+                    st.conv[slot * cd..(slot + 1) * cd].copy_from_slice(src);
+                }
+            }
+            self.rec_span = Some((start, i + 1));
+        }
+        for c in self.kv.iter_mut().flatten() {
+            c.truncate(pos);
+        }
+        self.pos = pos;
+        Ok(())
+    }
 }
 
 fn norm_weight(w: Vec<f32>, zero_centered: bool) -> Vec<f32> {
@@ -137,33 +222,131 @@ fn norm_weight(w: Vec<f32>, zero_centered: bool) -> Vec<f32> {
     w.into_iter().map(|v| o + v).collect()
 }
 
+/// Tensor loading shared by the main model and the MTP head (whose weights may come from a
+/// separate sidecar `ModelFiles`): shape checks, precision, zero-centered norms.
+pub(crate) struct Loader<'a, 'c> {
+    pub files: &'a ModelFiles,
+    pub cfg: &'c QwenConfig,
+    pub quant: Quant,
+}
+
+impl<'a> Loader<'a, '_> {
+    pub fn has(&self, n: &str) -> bool {
+        let f = self.files;
+        f.has(n) || f.has(&format!("{n}.q8")) || f.has(&format!("{n}.q4"))
+    }
+
+    /// Small parameter vectors are stored as BF16 in some checkpoints and F32 in others.
+    pub fn getf(&self, full: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        let info = self.files.info(full).with_context(|| format!("missing tensor {full}"))?;
+        if info.shape != shape {
+            bail!("tensor {full} has shape {:?}, expected {:?}", info.shape, shape);
+        }
+        self.files.f32(full)
+    }
+
+    pub fn lin(&self, full: &str, n_out: usize, n_in: usize) -> Result<Lin<'a>> {
+        load_lin(self.files, full, n_out, n_in, self.quant)
+    }
+
+    /// An RMSNorm weight of `n` as applied (`1 + w` when zero-centered), read in f32 (GGUF stores
+    /// norms as f32 with the 1 folded in).
+    pub fn norm(&self, full: &str, n: usize) -> Result<Vec<f32>> {
+        Ok(norm_weight(self.getf(full, &[n])?, self.cfg.zero_centered_norm))
+    }
+
+    fn mlp(&self, p: &str, inter: usize) -> Result<Mlp<'a>> {
+        let h = self.cfg.hidden_size;
+        Ok(Mlp {
+            gate: self.lin(&format!("{p}gate_proj.weight"), inter, h)?,
+            up: self.lin(&format!("{p}up_proj.weight"), inter, h)?,
+            down: self.lin(&format!("{p}down_proj.weight"), h, inter)?,
+            inter,
+        })
+    }
+
+    /// Gated full attention under `ap` (`...self_attn.`).
+    pub fn attn(&self, ap: &str) -> Result<Attn<'a>> {
+        let cfg = self.cfg;
+        let h = cfg.hidden_size;
+        let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
+        let qw = 2 * nh * hd; // q and gate
+        Ok(Attn {
+            q: self.lin(&format!("{ap}q_proj.weight"), if cfg.attn_output_gate { qw } else { nh * hd }, h)?,
+            k: self.lin(&format!("{ap}k_proj.weight"), nkv * hd, h)?,
+            v: self.lin(&format!("{ap}v_proj.weight"), nkv * hd, h)?,
+            o: self.lin(&format!("{ap}o_proj.weight"), h, nh * hd)?,
+            q_norm: self.norm(&format!("{ap}q_norm.weight"), hd)?,
+            k_norm: self.norm(&format!("{ap}k_norm.weight"), hd)?,
+        })
+    }
+
+    /// The MLP (dense or MoE, per the config) under `mp` (`...mlp.`).
+    pub fn ffn(&self, mp: &str) -> Result<Ffn<'a>> {
+        let cfg = self.cfg;
+        let (h, quant, files) = (cfg.hidden_size, self.quant, self.files);
+        let Some(n_exp) = cfg.num_experts else {
+            return Ok(Ffn::Dense(self.mlp(mp, cfg.intermediate_size)?));
+        };
+        let mi = cfg.moe_intermediate_size;
+        if cfg.num_experts_per_tok == 0 || cfg.num_experts_per_tok > n_exp {
+            bail!("num_experts_per_tok {} with {n_exp} experts", cfg.num_experts_per_tok);
+        }
+        let fused = format!("{mp}experts.gate_up_proj");
+        let (gate_up, down) = if self.has(&fused) {
+            (
+                load_lin_experts(files, &fused, n_exp, 2 * mi, h, quant)?
+                    .into_iter()
+                    .map(GateUp::Fused)
+                    .collect(),
+                load_lin_experts(files, &format!("{mp}experts.down_proj"), n_exp, h, mi, quant)?,
+            )
+        } else if self.has(&format!("{mp}experts.gate_proj")) {
+            // Separate 3D gate and up tensors (GGUF).
+            let g = load_lin_experts(files, &format!("{mp}experts.gate_proj"), n_exp, mi, h, quant)?;
+            let u = load_lin_experts(files, &format!("{mp}experts.up_proj"), n_exp, mi, h, quant)?;
+            let d = load_lin_experts(files, &format!("{mp}experts.down_proj"), n_exp, h, mi, quant)?;
+            (g.into_iter().zip(u).map(|(g, u)| GateUp::Split(g, u)).collect(), d)
+        } else {
+            let (mut gu, mut d) = (Vec::with_capacity(n_exp), Vec::with_capacity(n_exp));
+            for e in 0..n_exp {
+                let ep = format!("{mp}experts.{e}.");
+                gu.push(GateUp::Split(
+                    self.lin(&format!("{ep}gate_proj.weight"), mi, h)?,
+                    self.lin(&format!("{ep}up_proj.weight"), mi, h)?,
+                ));
+                d.push(self.lin(&format!("{ep}down_proj.weight"), h, mi)?);
+            }
+            (gu, d)
+        };
+        Ok(Ffn::Moe(Moe {
+            router: self.getf(&format!("{mp}gate.weight"), &[n_exp, h])?,
+            gate_up,
+            down,
+            shared: self.mlp(&format!("{mp}shared_expert."), cfg.shared_expert_intermediate_size)?,
+            shared_gate: self.getf(&format!("{mp}shared_expert_gate.weight"), &[1, h])?,
+            top_k: cfg.num_experts_per_tok,
+            inter: mi,
+        }))
+    }
+}
+
 impl<'a> QwenModel<'a> {
     pub fn load(cfg: QwenConfig, files: &'a ModelFiles, quant: Quant) -> Result<Self> {
         let quant = Quant::stored(files).unwrap_or(quant);
-        let has = |n: &str| files.has(n) || files.has(&format!("{n}.q8")) || files.has(&format!("{n}.q4"));
-        let prefix = if has("model.language_model.embed_tokens.weight") {
+        let ld = Loader { files, cfg: &cfg, quant };
+        let prefix = if ld.has("model.language_model.embed_tokens.weight") {
             "model.language_model."
-        } else if has("model.embed_tokens.weight") {
+        } else if ld.has("model.embed_tokens.weight") {
             "model."
-        } else if has("embed_tokens.weight") {
+        } else if ld.has("embed_tokens.weight") {
             "" // a bare text model (embedding checkpoints)
         } else {
             bail!("cannot find embed_tokens in checkpoint");
         };
         let h = cfg.hidden_size;
-        // Small parameter vectors are stored as BF16 in some checkpoints and F32 in others.
-        let getf = |full: &str, shape: &[usize]| -> Result<Vec<f32>> {
-            let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
-            if info.shape != shape {
-                bail!("tensor {full} has shape {:?}, expected {:?}", info.shape, shape);
-            }
-            files.f32(full)
-        };
-        let lin = |full: &str, n_out: usize, n_in: usize| load_lin(files, full, n_out, n_in, quant);
-        // Norm weights in f32 (GGUF stores them as f32 with the 1 folded in).
-        let one_plus = |w: Vec<f32>| norm_weight(w, cfg.zero_centered_norm);
 
-        let tied = cfg.tie_word_embeddings || !has("lm_head.weight");
+        let tied = cfg.tie_word_embeddings || !ld.has("lm_head.weight");
         // Lookups use the head's precision when tied (one copy in a pre-quantized file), else bf16.
         let embed = Table::load(
             files,
@@ -173,13 +356,12 @@ impl<'a> QwenModel<'a> {
             if tied { quant } else { table_quant(quant) },
         )?;
         let lm_head = if tied {
-            lin(&format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h)?
+            ld.lin(&format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h)?
         } else {
-            lin("lm_head.weight", cfg.vocab_size, h)?
+            ld.lin("lm_head.weight", cfg.vocab_size, h)?
         };
-        let final_norm = one_plus(getf(&format!("{prefix}norm.weight"), &[h])?);
+        let final_norm = ld.norm(&format!("{prefix}norm.weight"), h)?;
 
-        let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
         let (nk, nv, hdk, hdv) = (
             cfg.linear_num_key_heads,
             cfg.linear_num_value_heads,
@@ -189,99 +371,36 @@ impl<'a> QwenModel<'a> {
         let (key_dim, value_dim) = (nk * hdk, nv * hdv);
         let conv_dim = 2 * key_dim + value_dim;
         let kc = cfg.linear_conv_kernel_dim;
-        let inter = cfg.intermediate_size;
-        let mlp = |p: &str, inter: usize| -> Result<Mlp<'a>> {
-            Ok(Mlp {
-                gate: lin(&format!("{p}gate_proj.weight"), inter, h)?,
-                up: lin(&format!("{p}up_proj.weight"), inter, h)?,
-                down: lin(&format!("{p}down_proj.weight"), h, inter)?,
-                inter,
-            })
-        };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             let lp = format!("{prefix}layers.{l}.");
             let mixer = if cfg.is_full(l) {
-                let ap = format!("{lp}self_attn.");
-                let qw = 2 * nh * hd; // q and gate
-                Mixer::Attn(Attn {
-                    q: lin(&format!("{ap}q_proj.weight"), if cfg.attn_output_gate { qw } else { nh * hd }, h)?,
-                    k: lin(&format!("{ap}k_proj.weight"), nkv * hd, h)?,
-                    v: lin(&format!("{ap}v_proj.weight"), nkv * hd, h)?,
-                    o: lin(&format!("{ap}o_proj.weight"), h, nh * hd)?,
-                    q_norm: one_plus(getf(&format!("{ap}q_norm.weight"), &[hd])?),
-                    k_norm: one_plus(getf(&format!("{ap}k_norm.weight"), &[hd])?),
-                })
+                Mixer::Attn(ld.attn(&format!("{lp}self_attn."))?)
             } else {
                 let gp = format!("{lp}linear_attn.");
-                let conv_w = getf(&format!("{gp}conv1d.weight"), &[conv_dim, 1, kc])?;
+                let conv_w = ld.getf(&format!("{gp}conv1d.weight"), &[conv_dim, 1, kc])?;
                 // GGUF stores -exp(A_log) directly.
-                let decay_coef = match getf(&format!("{gp}A_log"), &[nv]) {
+                let decay_coef = match ld.getf(&format!("{gp}A_log"), &[nv]) {
                     Ok(a_log) => a_log.iter().map(|&v| -v.exp()).collect(),
-                    Err(_) => getf(&format!("{gp}ssm_a"), &[nv])?,
+                    Err(_) => ld.getf(&format!("{gp}ssm_a"), &[nv])?,
                 };
                 Mixer::Gdn(Gdn {
-                    qkv: lin(&format!("{gp}in_proj_qkv.weight"), conv_dim, h)?,
-                    z: lin(&format!("{gp}in_proj_z.weight"), value_dim, h)?,
-                    b: lin(&format!("{gp}in_proj_b.weight"), nv, h)?,
-                    a: lin(&format!("{gp}in_proj_a.weight"), nv, h)?,
+                    qkv: ld.lin(&format!("{gp}in_proj_qkv.weight"), conv_dim, h)?,
+                    z: ld.lin(&format!("{gp}in_proj_z.weight"), value_dim, h)?,
+                    b: ld.lin(&format!("{gp}in_proj_b.weight"), nv, h)?,
+                    a: ld.lin(&format!("{gp}in_proj_a.weight"), nv, h)?,
                     conv_w,
                     decay_coef,
-                    dt_bias: getf(&format!("{gp}dt_bias"), &[nv])?,
-                    norm_w: getf(&format!("{gp}norm.weight"), &[hdv])?,
-                    out: lin(&format!("{gp}out_proj.weight"), h, value_dim)?,
+                    dt_bias: ld.getf(&format!("{gp}dt_bias"), &[nv])?,
+                    norm_w: ld.getf(&format!("{gp}norm.weight"), &[hdv])?,
+                    out: ld.lin(&format!("{gp}out_proj.weight"), h, value_dim)?,
                 })
-            };
-            let ffn = match cfg.num_experts {
-                Some(n_exp) => {
-                    let (mi, mp) = (cfg.moe_intermediate_size, format!("{lp}mlp."));
-                    if cfg.num_experts_per_tok == 0 || cfg.num_experts_per_tok > n_exp {
-                        bail!("num_experts_per_tok {} with {n_exp} experts", cfg.num_experts_per_tok);
-                    }
-                    let fused = format!("{mp}experts.gate_up_proj");
-                    let (gate_up, down) = if has(&fused) {
-                        (
-                            load_lin_experts(files, &fused, n_exp, 2 * mi, h, quant)?
-                                .into_iter()
-                                .map(GateUp::Fused)
-                                .collect(),
-                            load_lin_experts(files, &format!("{mp}experts.down_proj"), n_exp, h, mi, quant)?,
-                        )
-                    } else if has(&format!("{mp}experts.gate_proj")) {
-                        // Separate 3D gate and up tensors (GGUF).
-                        let g = load_lin_experts(files, &format!("{mp}experts.gate_proj"), n_exp, mi, h, quant)?;
-                        let u = load_lin_experts(files, &format!("{mp}experts.up_proj"), n_exp, mi, h, quant)?;
-                        let d = load_lin_experts(files, &format!("{mp}experts.down_proj"), n_exp, h, mi, quant)?;
-                        (g.into_iter().zip(u).map(|(g, u)| GateUp::Split(g, u)).collect(), d)
-                    } else {
-                        let (mut gu, mut d) = (Vec::with_capacity(n_exp), Vec::with_capacity(n_exp));
-                        for e in 0..n_exp {
-                            let ep = format!("{mp}experts.{e}.");
-                            gu.push(GateUp::Split(
-                                lin(&format!("{ep}gate_proj.weight"), mi, h)?,
-                                lin(&format!("{ep}up_proj.weight"), mi, h)?,
-                            ));
-                            d.push(lin(&format!("{ep}down_proj.weight"), h, mi)?);
-                        }
-                        (gu, d)
-                    };
-                    Ffn::Moe(Moe {
-                        router: getf(&format!("{mp}gate.weight"), &[n_exp, h])?,
-                        gate_up,
-                        down,
-                        shared: mlp(&format!("{mp}shared_expert."), cfg.shared_expert_intermediate_size)?,
-                        shared_gate: getf(&format!("{mp}shared_expert_gate.weight"), &[1, h])?,
-                        top_k: cfg.num_experts_per_tok,
-                        inter: mi,
-                    })
-                }
-                None => Ffn::Dense(mlp(&format!("{lp}mlp."), inter)?),
             };
             layers.push(QLayer {
                 mixer,
-                ln_in: one_plus(getf(&format!("{lp}input_layernorm.weight"), &[h])?),
-                ln_post: one_plus(getf(&format!("{lp}post_attention_layernorm.weight"), &[h])?),
-                ffn,
+                ln_in: ld.norm(&format!("{lp}input_layernorm.weight"), h)?,
+                ln_post: ld.norm(&format!("{lp}post_attention_layernorm.weight"), h)?,
+                ffn: ld.ffn(&format!("{lp}mlp."))?,
             });
         }
         let rot = cfg.rotary_dim();
@@ -303,14 +422,10 @@ impl<'a> QwenModel<'a> {
     pub fn streamed_bytes(&self) -> usize {
         let mut n = self.lm_head.bytes();
         for l in &self.layers {
-            n += match &l.ffn {
-                Ffn::Dense(m) => m.bytes(),
-                // Per token: the shared expert and top_k of the routed ones.
-                Ffn::Moe(m) => m.shared.bytes() + m.top_k * (m.gate_up[0].bytes() + m.down[0].bytes()),
-            };
+            n += l.ffn.streamed_bytes();
             n += match &l.mixer {
                 Mixer::Gdn(g) => g.qkv.bytes() + g.z.bytes() + g.b.bytes() + g.a.bytes() + g.out.bytes(),
-                Mixer::Attn(a) => a.q.bytes() + a.k.bytes() + a.v.bytes() + a.o.bytes(),
+                Mixer::Attn(a) => a.bytes(),
             };
         }
         n
@@ -333,7 +448,14 @@ impl<'a> QwenModel<'a> {
                 }));
             }
         }
-        QwenSession { kv, gdn, pos: 0 }
+        let rec = (0..cfg.num_hidden_layers).map(|_| GdnRecord::default()).collect();
+        QwenSession {
+            kv,
+            gdn,
+            rec,
+            rec_span: None,
+            pos: 0,
+        }
     }
 
     pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
@@ -351,6 +473,17 @@ impl<'a> QwenModel<'a> {
 
     /// Final-normed hidden states `[t, hidden]` for `tokens` appended at `sess.pos`.
     pub fn forward_hidden_mm(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        self.forward_impl(sess, tokens, mm, false)
+    }
+
+    /// `forward_hidden_mm` without overrides that also records the recurrent states after every
+    /// token, so `sess.rewind` can then go back to any position inside `tokens` (speculative
+    /// verification). Costs one extra write of the Gated DeltaNet states per token.
+    pub fn forward_hidden_rec(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
+        self.forward_impl(sess, tokens, &[], true)
+    }
+
+    fn forward_impl(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])], record: bool) -> Vec<f32> {
         let t = tokens.len();
         assert!(t > 0);
         let cfg = &self.cfg;
@@ -377,24 +510,35 @@ impl<'a> QwenModel<'a> {
         for (l, layer) in self.layers.iter().enumerate() {
             rmsnorm_f32w_rows(&x, h, &layer.ln_in, eps, &mut hn);
             match &layer.mixer {
-                Mixer::Gdn(gd) => self.gdn_forward(gd, sess.gdn[l].as_mut().unwrap(), &hn, t, &mut y),
+                Mixer::Gdn(gd) => {
+                    let rec = if record { Some(&mut sess.rec[l]) } else { None };
+                    self.gdn_forward(gd, sess.gdn[l].as_mut().unwrap(), rec, &hn, t, &mut y)
+                }
                 Mixer::Attn(at) => self.attn_forward(at, sess.kv[l].as_mut().unwrap(), &hn, t, start, &cos, &sin, &mut y),
             }
             add_inplace(&mut x, &y);
             rmsnorm_f32w_rows(&x, h, &layer.ln_post, eps, &mut hn);
-            match &layer.ffn {
-                Ffn::Dense(m) => m.forward(&hn, t, h, &mut y),
-                Ffn::Moe(m) => m.forward(&hn, t, h, &mut y),
-            }
+            layer.ffn.forward(&hn, t, h, &mut y);
             add_inplace(&mut x, &y);
         }
         rmsnorm_f32w_rows(&x.clone(), h, &self.final_norm, eps, &mut x);
+        sess.rec_span = if record { Some((start, t)) } else { None };
         sess.pos += t;
         x
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn attn_forward(&self, at: &Attn, cache: &mut LayerCache, hn: &[f32], t: usize, start: usize, cos: &[f32], sin: &[f32], y: &mut [f32]) {
+    pub(crate) fn attn_forward(
+        &self,
+        at: &Attn,
+        cache: &mut LayerCache,
+        hn: &[f32],
+        t: usize,
+        start: usize,
+        cos: &[f32],
+        sin: &[f32],
+        y: &mut [f32],
+    ) {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
@@ -476,7 +620,7 @@ impl<'a> QwenModel<'a> {
         linear(&at.o, h, nh * hd, &att, t, y);
     }
 
-    fn gdn_forward(&self, gd: &Gdn, st: &mut GdnState, hn: &[f32], t: usize, y: &mut [f32]) {
+    fn gdn_forward(&self, gd: &Gdn, st: &mut GdnState, mut rec: Option<&mut GdnRecord>, hn: &[f32], t: usize, y: &mut [f32]) {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps as f32;
@@ -529,6 +673,13 @@ impl<'a> QwenModel<'a> {
                 }
             });
         }
+        let state_len = st.s.len();
+        if let Some(r) = rec.as_deref_mut() {
+            r.conv0.clone_from(&st.conv);
+            r.qkv.clone_from(&qkv);
+            r.conv_dim = conv_dim;
+            r.states.resize((t - 1) * state_len, 0.0);
+        }
         // Update conv state with the last kc-1 raw inputs.
         {
             let keep = kc - 1;
@@ -552,6 +703,7 @@ impl<'a> QwenModel<'a> {
         let op = SendPtrF(out.as_mut_ptr());
         let sp = SendPtrF(st.s.as_mut_ptr());
         let qscale = (hdk as f32).powf(-0.5);
+        let rp = rec.map(|r| SendPtrF(r.states.as_mut_ptr()));
         pool::run(nv, &|hv| {
             let hk = if cfg.v_heads_tiled { hv % nk } else { hv / rep };
             // SAFETY: each head owns its own state slab and output columns.
@@ -598,6 +750,12 @@ impl<'a> QwenModel<'a> {
                         srow[j] += kd * delta[j];
                         o[j] += srow[j] * qd;
                     }
+                }
+                // The state after the last token is the session's own.
+                if let Some(rp) = rp.filter(|_| i + 1 < t) {
+                    // SAFETY: each (token, head) slab of the record is written by this head only.
+                    let dst = unsafe { std::slice::from_raw_parts_mut(rp.get().add(i * state_len + hv * hdk * hdv), hdk * hdv) };
+                    dst.copy_from_slice(s);
                 }
             }
         });
@@ -667,6 +825,51 @@ impl Moe<'_> {
                 silu_mul(g, u);
                 linear(&self.down[e], h, mi, g, 1, &mut o);
                 axpy(y, w, &o);
+            }
+            return;
+        }
+        if t < TN {
+            // Short passes (speculative verification): each chosen expert runs over its own tokens
+            // with the decode kernels, so every row matches a one-token forward bit for bit.
+            let mut used: Vec<usize> = routes.iter().flatten().map(|r| r.0).collect();
+            used.sort_unstable();
+            used.dedup();
+            let mut outs: Vec<(Vec<usize>, Vec<f32>)> = Vec::with_capacity(used.len());
+            for &e in &used {
+                let toks: Vec<usize> = (0..t).filter(|&ti| routes[ti].iter().any(|r| r.0 == e)).collect();
+                let n = toks.len();
+                let mut xs = vec![0f32; n * h];
+                for (row, &ti) in xs.chunks_mut(h).zip(&toks) {
+                    row.copy_from_slice(&x[ti * h..(ti + 1) * h]);
+                }
+                let mut a = vec![0f32; n * mi];
+                match &self.gate_up[e] {
+                    GateUp::Fused(l) => {
+                        let mut gu = vec![0f32; n * 2 * mi];
+                        linear(l, 2 * mi, h, &xs, n, &mut gu);
+                        for (ar, r) in a.chunks_mut(mi).zip(gu.chunks_mut(2 * mi)) {
+                            let (g, u) = r.split_at_mut(mi);
+                            silu_mul(g, u);
+                            ar.copy_from_slice(g);
+                        }
+                    }
+                    GateUp::Split(g, u) => {
+                        let mut ub = vec![0f32; n * mi];
+                        linear_multi(&mut [(g, mi, &mut a[..]), (u, mi, &mut ub[..])], h, &xs, n);
+                        silu_mul(&mut a, &ub);
+                    }
+                }
+                let mut o = vec![0f32; n * h];
+                linear(&self.down[e], h, mi, &a, n, &mut o);
+                outs.push((toks, o));
+            }
+            for (ti, r) in routes.iter().enumerate() {
+                let yr = &mut y[ti * h..(ti + 1) * h];
+                for &(e, w) in r {
+                    let (toks, o) = &outs[used.binary_search(&e).unwrap()];
+                    let i = toks.iter().position(|&x| x == ti).unwrap();
+                    axpy(yr, w, &o[i * h..(i + 1) * h]);
+                }
             }
             return;
         }

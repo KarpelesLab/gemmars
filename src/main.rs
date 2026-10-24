@@ -38,7 +38,10 @@ struct Args {
     show_tokens: bool,
     prefill_chunk: Option<usize>,
     draft: Option<PathBuf>,
-    draft_tokens: usize,
+    draft_tokens: Option<usize>,
+    mtp: bool,
+    mtp_fixed: bool,
+    mtp_from: Option<PathBuf>,
     images: Vec<PathBuf>,
     audios: Vec<PathBuf>,
     dump_mm: Option<PathBuf>,
@@ -92,7 +95,13 @@ fn usage() -> ! {
          \x20 --profile            print per-operation timing breakdown\n\
          \x20 --prefill-chunk N    tokens per prefill chunk (default 256 on CPU, 1024 with a GPU backend)\n\
          \x20 --draft DIR          speculative decoding with a Gemma 4 assistant (drafter) model; greedy only\n\
-         \x20 --draft-tokens N     max draft tokens per round (default 6; adaptive from 3)\n\
+         \x20 --draft-tokens N     max draft tokens per round (default 6 with --draft, adaptive from 3;\n\
+         \x20                      3 with --mtp)\n\
+         \x20 --mtp                Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token\n\
+         \x20                      prediction layer (greedy and sampled; same output distribution)\n\
+         \x20 --mtp-fixed          with --mtp, always draft --draft-tokens (default: adaptive 1..N)\n\
+         \x20 --mtp-from DIR       implies --mtp, with the MTP weights from another checkpoint (e.g. the\n\
+         \x20                      original one when the model is a converted copy without them)\n\
          \x20 --image FILE         attach an image (repeatable; PNG/JPEG/WebP/GIF/BMP via oxideav)\n\
          \x20 --audio FILE         attach an audio clip (repeatable; WAV/MP3/FLAC/AAC/OGG via oxideav)\n\
          \x20 --max-soft-tokens N  image soft-token budget: 70, 140, 280 (default), 560 or 1120\n\
@@ -152,7 +161,10 @@ fn parse_args() -> Result<Args> {
         show_tokens: false,
         prefill_chunk: None,
         draft: None,
-        draft_tokens: 6,
+        draft_tokens: None,
+        mtp: false,
+        mtp_fixed: false,
+        mtp_from: None,
         images: Vec::new(),
         audios: Vec::new(),
         dump_mm: None,
@@ -208,7 +220,13 @@ fn parse_args() -> Result<Args> {
             "--profile" => a.profile = true,
             "--prefill-chunk" => a.prefill_chunk = Some(val()?.parse()?),
             "--draft" => a.draft = Some(PathBuf::from(val()?)),
-            "--draft-tokens" => a.draft_tokens = val()?.parse()?,
+            "--draft-tokens" => a.draft_tokens = Some(val()?.parse()?),
+            "--mtp" => a.mtp = true,
+            "--mtp-fixed" => a.mtp_fixed = true,
+            "--mtp-from" => {
+                a.mtp_from = Some(PathBuf::from(val()?));
+                a.mtp = true;
+            }
             "--image" => a.images.push(PathBuf::from(val()?)),
             "--audio" => a.audios.push(PathBuf::from(val()?)),
             "--dump-mm" => a.dump_mm = Some(PathBuf::from(val()?)),
@@ -821,6 +839,10 @@ fn main() -> Result<()> {
         let spec = d.to_string_lossy().to_string();
         args.draft = Some(resolve_model(&spec, args.cache_dir.as_deref())?);
     }
+    if let Some(d) = &args.mtp_from {
+        let spec = d.to_string_lossy().to_string();
+        args.mtp_from = Some(resolve_model(&spec, args.cache_dir.as_deref())?);
+    }
     for l in &mut args.loras {
         l.path = resolve_file(&l.path.to_string_lossy(), args.cache_dir.as_deref())?;
     }
@@ -1176,7 +1198,7 @@ fn run_embed(args: &Args) -> Result<()> {
 fn run_qwen(args: Args) -> Result<()> {
     let t0 = Instant::now();
     if args.draft.is_some() || !args.images.is_empty() || !args.audios.is_empty() {
-        bail!("speculative decoding and attachments are not supported for Qwen models yet");
+        bail!("--draft and attachments are not supported for Qwen models yet (see --mtp)");
     }
     let cfg = config::QwenConfig::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
@@ -1200,10 +1222,176 @@ fn run_qwen(args: Args) -> Result<()> {
         pool::threads(),
         t0.elapsed().as_secs_f64()
     );
+    // Converted checkpoints keep the MTP layer (loading it marks its tensors for writing).
+    let side = match &args.mtp_from {
+        Some(d) => Some(safetensors::ModelFiles::open(d, false)?),
+        None => None,
+    };
+    let mtp = if args.mtp || (args.save_quantized.is_some() && oxinfer::qwen_mtp::mtp_prefix(&files).is_some()) {
+        let t1 = Instant::now();
+        let mut m = model.load_mtp(side.as_ref().unwrap_or(&files))?;
+        if let Some(side) = &side
+            && m.attach_sidecar(&model.cfg, side, model.quant)?
+        {
+            eprintln!("[draft head from the sidecar: {} tokens]", m.draft_head().map_or(0, |d| d.vocab()));
+        }
+        eprintln!(
+            "[MTP layer loaded: {:.2} GB read per draft step, {:.2}s]",
+            m.step_bytes(&model) as f64 / 1e9,
+            t1.elapsed().as_secs_f64()
+        );
+        Some(m)
+    } else {
+        None
+    };
     if let Some(out) = &args.save_quantized {
         return save_quantized(&args.model, out, &files, model.quant);
     }
-    run_text(&args, &model, &tok, &eos, fmt)
+    match &mtp {
+        Some(m) if args.mtp => run_qwen_mtp(&args, &model, m, &tok, &eos, fmt),
+        _ => run_text(&args, &model, &tok, &eos, fmt),
+    }
+}
+
+/// Generation (single prompt or chat) with MTP speculative decoding.
+fn run_qwen_mtp(
+    args: &Args,
+    model: &qwen::QwenModel,
+    mtp: &oxinfer::qwen_mtp::QwenMtp,
+    tok: &Tokenizer,
+    eos: &[u32],
+    fmt: &dyn ChatFormat,
+) -> Result<()> {
+    use oxinfer::qwen_mtp::{MtpDecoder, MtpOptions};
+    if args.tools || args.dump_logits.is_some() || args.print_prompt {
+        bail!("--mtp does not combine with --tools, --dump-logits or --print-prompt");
+    }
+    let encode = |text: &str| -> Result<Vec<u32>> {
+        let enc = tok.encode(text, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        Ok(enc.get_ids().to_vec())
+    };
+    let opts = MtpOptions {
+        draft_tokens: args.draft_tokens.unwrap_or(3),
+        adaptive: !args.mtp_fixed,
+        stop: eos.to_vec(),
+    };
+    eprintln!(
+        "[MTP speculative decoding: {} draft tokens{}, {}]",
+        opts.draft_tokens,
+        if opts.adaptive { " max (adaptive)" } else { "" },
+        if args.temperature > 0.0 { "sampled" } else { "greedy" }
+    );
+    if opts.draft_tokens > oxinfer::qwen_mtp::MAX_EXACT_DRAFT {
+        eprintln!(
+            "[note: verifying more than {} drafts runs the prefill GEMM kernels, whose rounding differs from decoding: \
+             the output can drift from plain decoding at near-ties]",
+            oxinfer::qwen_mtp::MAX_EXACT_DRAFT
+        );
+    }
+    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
+    let mut dec = MtpDecoder::new(model, mtp, opts);
+    let chunk = args.prefill_chunk.unwrap_or(256);
+    let mut turn = |dec: &mut MtpDecoder, text: &str| -> Result<()> {
+        let ids = encode(text)?;
+        if ids.is_empty() {
+            bail!("empty prompt");
+        }
+        if args.show_tokens {
+            eprintln!("[prompt ids ({}): {ids:?}]", ids.len());
+        }
+        let t = Instant::now();
+        let logits = dec.prefill(&ids, chunk);
+        let prefill_secs = t.elapsed().as_secs_f64();
+        prof::reset();
+        let before = dec.stats.clone();
+        let t = Instant::now();
+        let mut printer = Printer::new(fmt, args.think, tok);
+        let first = sampler.sample(&logits);
+        let mut out = vec![first];
+        dec.push(first);
+        if !eos.contains(&first) {
+            printer.on_token(first);
+            printer.flush_text(tok, &out, false);
+        }
+        while !eos.contains(out.last().unwrap()) && out.len() < args.max_tokens {
+            for &id in &dec.step(&mut sampler, args.max_tokens - out.len()) {
+                out.push(id);
+                if !eos.contains(&id) {
+                    printer.on_token(id);
+                    printer.flush_text(tok, &out, false);
+                }
+            }
+        }
+        let decode_secs = t.elapsed().as_secs_f64();
+        let shown = if out.last().is_some_and(|e| eos.contains(e)) {
+            &out[..out.len() - 1]
+        } else {
+            &out[..]
+        };
+        printer.flush_text(tok, shown, true);
+        println!();
+        if args.show_tokens {
+            eprintln!("[output ids: {out:?}]");
+        }
+        let st = &dec.stats;
+        let (rounds, drafted, accepted) = (
+            st.rounds - before.rounds,
+            st.drafted - before.drafted,
+            st.accepted - before.accepted,
+        );
+        report(ids.len(), prefill_secs, out.len().saturating_sub(1), decode_secs);
+        eprintln!(
+            "[MTP: {} main forwards for {} tokens = {:.2} tok/forward; drafts accepted {}/{} = {:.0}%; per-round histogram {:?}]",
+            rounds,
+            out.len().saturating_sub(1),
+            out.len().saturating_sub(1) as f64 / rounds.max(1) as f64,
+            accepted,
+            drafted,
+            100.0 * accepted as f64 / drafted.max(1) as f64,
+            st.per_round
+        );
+        if args.profile {
+            prof::report(decode_secs, out.len());
+        }
+        Ok(())
+    };
+    if !args.chat {
+        let prompt = match &args.prompt {
+            Some(p) => p.clone(),
+            None => {
+                let mut s = String::new();
+                std::io::stdin().lock().read_to_string(&mut s)?;
+                s
+            }
+        };
+        let text = if args.raw {
+            prompt
+        } else {
+            fmt.first_turn(system_prompt(args).as_deref(), args.think, &[], &prompt)
+        };
+        return turn(&mut dec, &text);
+    }
+    let mut first = true;
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("> ");
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let text = if first {
+            first = false;
+            fmt.first_turn(system_prompt(args).as_deref(), args.think, &[], line)
+        } else {
+            fmt.end_of_model_turn() + &fmt.user_turn(line, args.think)
+        };
+        turn(&mut dec, &text)?;
+    }
+    Ok(())
 }
 
 /// The model's tokenizer: `tokenizer.json`, or rebuilt from a GGUF file's vocabulary.
@@ -1276,7 +1464,9 @@ fn run_gemma(args: Args) -> Result<()> {
             }
             eprintln!(
                 "[drafter loaded: {} layers, hidden {}, {} draft tokens/round]",
-                dr.cfg.num_hidden_layers, dr.cfg.hidden_size, args.draft_tokens
+                dr.cfg.num_hidden_layers,
+                dr.cfg.hidden_size,
+                args.draft_tokens.unwrap_or(6)
             );
             Some(dr)
         }
@@ -1328,8 +1518,16 @@ fn run_gemma(args: Args) -> Result<()> {
                 let h = model.cfg.hidden_size;
                 let hidden_last = hs[hs.len() - h..].to_vec();
                 let prefill_secs = t.elapsed().as_secs_f64();
-                let (out, st, secs) =
-                    generate_speculative(&model, dr, &mut sess, &tok, hidden_last, args.draft_tokens, &eos, args.max_tokens);
+                let (out, st, secs) = generate_speculative(
+                    &model,
+                    dr,
+                    &mut sess,
+                    &tok,
+                    hidden_last,
+                    args.draft_tokens.unwrap_or(6),
+                    &eos,
+                    args.max_tokens,
+                );
                 if args.show_tokens {
                     eprintln!("[output ids: {out:?}]");
                 }
@@ -1409,7 +1607,16 @@ fn run_gemma(args: Args) -> Result<()> {
         let hidden_last = hs[hs.len() - h..].to_vec();
         let prefill_secs = t.elapsed().as_secs_f64();
         prof::reset();
-        let (out, st, secs) = generate_speculative(&model, dr, &mut sess, &tok, hidden_last, args.draft_tokens, &eos, args.max_tokens);
+        let (out, st, secs) = generate_speculative(
+            &model,
+            dr,
+            &mut sess,
+            &tok,
+            hidden_last,
+            args.draft_tokens.unwrap_or(6),
+            &eos,
+            args.max_tokens,
+        );
         if args.show_tokens {
             eprintln!("[output ids: {out:?}]");
         }
@@ -1424,7 +1631,10 @@ fn run_gemma(args: Args) -> Result<()> {
             st.drafted,
             100.0 * st.accepted as f64 / st.drafted.max(1) as f64
         );
-        eprintln!("[accepted-per-round histogram: {:?}]", &st.per_pos[..=args.draft_tokens.min(15)]);
+        eprintln!(
+            "[accepted-per-round histogram: {:?}]",
+            &st.per_pos[..=args.draft_tokens.unwrap_or(6).min(15)]
+        );
         if args.profile {
             eprintln!("-- decode --");
             prof::report(secs, st.forwards);

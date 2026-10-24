@@ -36,6 +36,7 @@ pub mod pool;
 pub mod prof;
 pub mod quant;
 pub mod qwen;
+pub mod qwen_mtp;
 pub mod safetensors;
 pub mod sampler;
 pub mod sd;

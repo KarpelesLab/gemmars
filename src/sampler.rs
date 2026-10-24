@@ -28,10 +28,19 @@ impl Sampler {
         (r >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    pub fn sample(&mut self, logits: &[f32]) -> u32 {
-        if self.temperature <= 0.0 {
-            return argmax(logits);
-        }
+    /// A uniform draw in [0, 1) from the sampler's generator (speculative acceptance tests).
+    pub fn uniform(&mut self) -> f32 {
+        self.next_f32()
+    }
+
+    /// Whether `sample` is greedy (argmax).
+    pub fn greedy(&self) -> bool {
+        self.temperature <= 0.0
+    }
+
+    /// The candidates `sample` draws from: token ids by decreasing probability, the
+    /// (unnormalized over the cut) probabilities, how many survive top-p, and their total.
+    fn candidates(&self, logits: &[f32]) -> (Vec<u32>, Vec<f32>, usize, f32) {
         let k = if self.top_k == 0 {
             logits.len()
         } else {
@@ -70,6 +79,38 @@ impl Sampler {
             }
         }
         let total: f32 = probs[..cut].iter().sum();
+        (idx, probs, cut, total)
+    }
+
+    /// The exact distribution `sample` draws from (temperature, top-k, top-p applied), as
+    /// `(token, probability)` pairs summing to 1 by decreasing probability; one token with
+    /// probability 1 when greedy.
+    pub fn distribution(&self, logits: &[f32]) -> Vec<(u32, f32)> {
+        if self.greedy() {
+            return vec![(argmax(logits), 1.0)];
+        }
+        let (idx, probs, cut, total) = self.candidates(logits);
+        idx[..cut].iter().zip(&probs[..cut]).map(|(&i, &p)| (i, p / total)).collect()
+    }
+
+    /// Draws from a distribution such as `distribution` returns.
+    pub fn sample_from(&mut self, dist: &[(u32, f32)]) -> u32 {
+        let total: f32 = dist.iter().map(|d| d.1).sum();
+        let mut r = self.next_f32() * total;
+        for &(i, p) in dist {
+            r -= p;
+            if r <= 0.0 {
+                return i;
+            }
+        }
+        dist.last().map_or(0, |d| d.0)
+    }
+
+    pub fn sample(&mut self, logits: &[f32]) -> u32 {
+        if self.greedy() {
+            return argmax(logits);
+        }
+        let (idx, probs, cut, total) = self.candidates(logits);
         let mut r = self.next_f32() * total;
         for i in 0..cut {
             r -= probs[i];

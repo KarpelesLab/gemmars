@@ -34,6 +34,10 @@ required-features = ["hf"]
 name = "sd_lora"
 required-features = ["hf"]
 
+[[example]]
+name = "qwen_mtp"
+required-features = ["hf"]
+
 [features]
 default = ["media", "hf", "gpu"]
 # Image / audio file decoding through oxideav.

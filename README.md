@@ -52,8 +52,8 @@ The Qwen3.5-family dense models are a different architecture (`qwen.rs`): 48 Gat
 value head) interleaved with 16 gated full-attention layers (24 query / 4 KV heads of 256, partial
 RoPE on 64 dims, a sigmoid output gate), SiLU MLPs and zero-centred RMSNorm. The recurrent layers
 keep a fixed-size state instead of a KV cache, so memory does not grow with context for 48 of the
-64 layers. The vision encoder and the MTP head in the checkpoint are not loaded yet, and
-speculative decoding is not available for this family yet.
+64 layers. The vision encoder is not loaded yet; the MTP head drives speculative decoding with
+`--mtp` (see Speculative decoding).
 
 The MoE variants (`qwen3_5_moe`, Qwen3.5/3.6-35B-A3B) replace each MLP with 256 routed SiLU
 experts of width 512 (softmax router, top 8, weights renormalised) plus a shared expert scaled by
@@ -294,6 +294,25 @@ huggingface.co. `OXINFER_HUB=mirror` or `OXINFER_HUB=hf` (`oxinfer::hf::set_hub`
 only ever sent to huggingface.co. The browser build uses the same lookup (the mirror allows
 cross-origin requests).
 
+### GGUF files
+
+`--model` also takes llama.cpp GGUF files, as a path or as `org/repo:QUANT` (the one file of a
+GGUF repository whose name ends in `QUANT.gguf`, e.g.
+`HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q4_K_P`). Architectures: `qwen35`
+(Qwen3.5 / 3.6 / 3.8), `qwen35moe` and `qwen3`. The tokenizer and chat template come from the
+GGUF metadata (the rebuilt tokenizer matches Qwen3.8's `tokenizer.json` on 305 test texts), and
+llama.cpp's conversions are undone at load (`gguf.rs`): norms with the 1 folded in, `ssm_a`, the
+tiled Gated DeltaNet value-head order, separate 3D expert tensors. Weights stay in their GGUF
+format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K-Q6_K, IQ1_S/IQ1_M, IQ2_XXS/XS/S,
+IQ3_XXS/S and IQ4_NL/XS (`ggml.rs`, dequantization bit-exact with gguf-py), with NEON decode
+kernels for every type and Metal prefill kernels. The i-quants (IQ1-IQ3) decode several times
+slower than Q4_K on the CPU (table lookups); Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0 are close to
+oxinfer's own Q4/Q8. Embedded MTP layers (`blk.N.nextn.*`) work with `--mtp`.
+
+On HauhauCS's Qwen3.8-27B Q4_K_P the next-token distribution matches llama.cpp on the same file
+(same top 10, log-probabilities within 0.03, mean 0.013). F32/BF16 GGUFs from llama.cpp's
+converter match transformers to 5e-5. `--save-quantized` does not take GGUF input.
+
 ### MLX checkpoints
 
 MLX repos (mlx-community and the like) store each matrix as packed 4-bit values (`.weight`, eight
@@ -348,7 +367,10 @@ Useful flags:
 | `--quant q8` | quantize streamed weights to int8 at load (blocks of 32, f32 scales); ~1.8x less memory traffic |
 | `--quant q4` | GGUF-style Q4_0 (blocks of 32, 4-bit, f16 scale) for all streamed weights; ~3.5x less traffic |
 | `--draft DIR` | speculative decoding with Google's `gemma-4-E4B-it-assistant` drafter (greedy only; output identical to plain greedy) |
-| `--draft-tokens N` | max draft tokens per round (default 6; the length adapts between 2 and N) |
+| `--draft-tokens N` | max draft tokens per round (default 6 with `--draft`, 3 with `--mtp`; the length adapts) |
+| `--mtp` | Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token-prediction layer (greedy and sampled) |
+| `--mtp-fixed` | with `--mtp`, always draft `--draft-tokens` instead of adapting between 1 and N |
+| `--mtp-from DIR` | `--mtp` with the MTP weights taken from another checkpoint (e.g. the original of a converted copy) |
 | `--mmap` | map weights from disk instead of copying them into RAM |
 | `--save-quantized DIR` | write a pre-quantized, text-only checkpoint at `--quant` precision (see below) and exit |
 | `--devices` | list detected CPU features and GPUs (Metal, CUDA, Vulkan) and exit |
@@ -375,9 +397,9 @@ On an M5 Max (18 cores, ~280 GB/s measured CPU read bandwidth):
 | E4B-it | bf16 | 9.3 GB | ~28 tok/s (≈245 GB/s) | 41 / 47 tok/s | ~135 tok/s |
 | E4B-it | `--quant q8` | 5.2 GB | ~45 tok/s | 66 / 82 tok/s | ~135 tok/s |
 | E4B-it | `--quant q4` | 2.6 GB | ~76 tok/s | 75 / 99 tok/s | ~135 tok/s |
-| Qwen3.8-27B | bf16 | 51 GB | ~5.3 tok/s (≈270 GB/s) | n/a | ~19 tok/s |
-| Qwen3.8-27B | `--quant q8` | 29 GB | ~8.8 tok/s | n/a | ~19 tok/s |
-| Qwen3.8-27B | `--quant q4` | 14 GB | ~16 tok/s | n/a | ~20 tok/s |
+| Qwen3.8-27B | bf16 | 51 GB | ~5.3 tok/s (≈270 GB/s) | | ~19 tok/s |
+| Qwen3.8-27B | `--quant q8` | 29 GB | ~8.8 tok/s | `--mtp`: 1.5x / 2.0x | ~19 tok/s |
+| Qwen3.8-27B | `--quant q4` | 14 GB | ~16 tok/s | `--mtp`: 1.1-1.2x / 1.6x | ~20 tok/s |
 
 For the 27B model `--mmap` is recommended: quantization then reads the checkpoint straight from
 the page cache (about 3 s to quantize 27.8B parameters on 18 threads) instead of copying 55 GB
@@ -452,6 +474,47 @@ and 55–65% on code, giving 2–4 tokens per forward. The drafter's own drafts 
 the transformers implementation token for token. It pays off most where the verification pass
 is bandwidth-bound (bf16, Q8); at Q4 the multi-token int8 kernels are instruction-bound, so it
 only helps on predictable text.
+
+`--mtp` does the same for Qwen3.5 / Qwen3.8 with the checkpoint's own multi-token-prediction
+layer (`mtp.*`, `qwen_mtp.rs`): one gated-attention decoder layer that takes the main model's
+final-normed hidden state at position i and the embedding of token i+1 (each RMS-normed,
+concatenated embedding first, projected by `mtp.fc`), runs at position i with its own KV cache,
+and predicts token i+2 through the shared LM head; further drafts feed it its own output (the
+vLLM `qwen3_5_mtp` scheme). The default is 3 drafts per round, adapting between 1 and 3. Both
+greedy and sampled decoding are supported: greedy output is identical to plain greedy (the
+decode kernels give bit-identical rows for up to 7 tokens per pass, so the verification logits
+equal one-token logits; checked on long outputs with and without `--think`, bf16 / Q8 / Q4,
+dense and MoE), and sampling uses the standard speculative-sampling acceptance rule, so every
+token is drawn from exactly the distribution `--temp` / `--top-k` / `--top-p` define (the
+random stream differs from plain sampling, so the same seed gives a different text). Rejected
+drafts are undone exactly: the verification forward records the Gated DeltaNet states after
+each token (one extra state write per token, ~5% of a 4-token pass) and restores the one at the
+last accepted token; KV caches are truncated. On Qwen3.8-27B (M5 Max, under load from other
+jobs):
+
+| Precision | Plain | `--mtp` (code) | `--mtp` (prose) | Acceptance (code / prose) |
+|---|---|---|---|---|
+| `--quant q8` | 7.5 tok/s | 15.2 tok/s (3.75 tok/forward) | 10.5 tok/s (2.55 tok/forward) | 94% / 59% |
+| `--quant q4` | 14.6 tok/s | 24.0 tok/s | 14.7-16.1 tok/s | 94% / 57% |
+
+Q4 gains less because a 4-token Q4 pass costs about twice a one-token pass (SDOT-bound). On
+Qwen3.5-0.8B every draft step reads the 248k-row LM head (a third of the model), so `--mtp`
+gains ~20-25% on code and loses a little on prose; a trimmed draft head (`DraftHead`: a
+`[V_draft, H]` matrix plus a draft-to-target id map, FastMTP style) can replace it through the
+library. The MoE models (Qwen3.6-35B-A3B) work the same way, with an MoE MTP layer. A converted
+checkpoint (`--save-quantized`) keeps the MTP weights; older converted copies can take them from
+the original checkpoint with `--mtp-from DIR`.
+
+From the library: `QwenModel::load_mtp(&files)` (or `QwenMtp::load(cfg, sidecar_files, quant)`),
+then `MtpDecoder::new(&model, &mtp, MtpOptions { .. })`: `prefill` the prompt, `push` the first
+token, call `step` until a stop token (`examples/qwen_mtp.rs`).
+
+FastMTP sidecars (a GGUF holding only an MTP layer, a trimmed output head and a `d2t` map, such as
+HauhauCS's `...-FastMTP-32K.gguf`) load with `--mtp-from FILE` (or `org/repo:FastMTP-32K`): the
+sidecar's layer, token embedding and 32k-row head replace the target's, as in HauhauCS's
+llama.cpp patch (`QwenMtp::attach_sidecar` in the library). With HauhauCS's Qwen3.8-27B Q4_K_P
+GGUF, greedy output with the embedded MTP layer or the FastMTP sidecar is token-for-token the
+plain greedy output.
 
 ## Platforms and accelerators
 
@@ -607,6 +670,8 @@ Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex bac
   quantization of weights at load time, plus per-matmul activation quantization; decode kernels use
   int8 SDOT over four blocks at a time, with multi-token variants for speculative verification.
 - `drafter.rs`: the Gemma 4 assistant model (drafter) and its centroid-masked LM head.
+- `qwen_mtp.rs`: the Qwen3.5 MTP layer and the speculative decoder (drafting, verification with
+  recorded recurrent states, speculative sampling).
 - `vision.rs`, `audio.rs`: the two encoders plus preprocessing (resize/patching, mel features) and
   the embedders; `media.rs`: file decoding through oxideav; `mm_config.rs`: tower configs and
   placeholder token ids.

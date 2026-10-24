@@ -438,6 +438,9 @@ pub struct QwenConfig {
     /// Qwen3 keeps the RoPE base at the top level.
     #[serde(default)]
     pub rope_theta: Option<f64>,
+    /// Multi-token-prediction ("NextN") layers stored under `mtp.*` (Qwen3.5: 1).
+    #[serde(default)]
+    pub mtp_num_hidden_layers: usize,
     /// RMSNorm scales by `1 + weight` (Qwen3.5) rather than `weight` (Qwen3, and GGUF files,
     /// whose norm weights already include the 1).
     #[serde(skip, default = "d_true")]
