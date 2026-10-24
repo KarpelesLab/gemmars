@@ -4,7 +4,7 @@
 //! `~/.cache/oxinfer/hub`), downloading the config, tokenizer, template and safetensors files that
 //! are missing or incomplete. Downloads are resumable. Gated repos need `HF_TOKEN`.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use rsurl::{DownloadOptions, Request};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -38,7 +38,10 @@ pub fn resolve(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn token() -> Option<String> {
-    std::env::var("HF_TOKEN").ok().or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok()).filter(|t| !t.is_empty())
+    std::env::var("HF_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
+        .filter(|t| !t.is_empty())
 }
 
 fn request(url: &str) -> Result<Request> {
@@ -94,11 +97,22 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     let info: RepoInfo = serde_json::from_slice(&resp.body).with_context(|| format!("parse {api}"))?;
     let sizes: HashMap<String, Option<u64>> = info.siblings.into_iter().map(|s| (s.rfilename, s.size)).collect();
 
-    let mut files: Vec<String> = SMALL_FILES.iter().filter(|f| sizes.contains_key(**f)).map(|f| f.to_string()).collect();
+    let mut files: Vec<String> = SMALL_FILES
+        .iter()
+        .filter(|f| sizes.contains_key(**f))
+        .map(|f| f.to_string())
+        .collect();
     if sizes.contains_key("model.safetensors") {
         files.push("model.safetensors".into());
     } else if sizes.contains_key("model.safetensors.index.json") {
-        fetch_file(repo, dir, "model.safetensors.index.json", sizes["model.safetensors.index.json"], 0, 0)?;
+        fetch_file(
+            repo,
+            dir,
+            "model.safetensors.index.json",
+            sizes["model.safetensors.index.json"],
+            0,
+            0,
+        )?;
         let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json"))?)?;
         let mut shards: Vec<String> = idx["weight_map"]
             .as_object()
@@ -120,7 +134,11 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
 }
 
 fn human_gb(b: u64) -> String {
-    if b >= 1_000_000_000 { format!("{:.2} GB", b as f64 / 1e9) } else { format!("{:.1} MB", b as f64 / 1e6) }
+    if b >= 1_000_000_000 {
+        format!("{:.2} GB", b as f64 / 1e9)
+    } else {
+        format!("{:.1} MB", b as f64 / 1e6)
+    }
 }
 
 /// Renders a progress line: `[=====>     ]  42.0%  3.21/7.64 GB  31 MB/s  eta 2m10s`.
@@ -132,7 +150,17 @@ fn progress_line(label: &str, done: u64, total: Option<u64>, secs: f64) -> Strin
             let frac = (done as f64 / t as f64).clamp(0.0, 1.0);
             let width = 30usize;
             let filled = (frac * width as f64) as usize;
-            let bar: String = (0..width).map(|i| if i < filled { '=' } else if i == filled { '>' } else { ' ' }).collect();
+            let bar: String = (0..width)
+                .map(|i| {
+                    if i < filled {
+                        '='
+                    } else if i == filled {
+                        '>'
+                    } else {
+                        ' '
+                    }
+                })
+                .collect();
             let eta = if rate > 0.0 { ((t - done) as f64 / rate) as u64 } else { 0 };
             // The rate is noise for the first second; show no estimate yet.
             let eta_s = if secs < 1.0 {
@@ -144,7 +172,12 @@ fn progress_line(label: &str, done: u64, total: Option<u64>, secs: f64) -> Strin
             } else {
                 format!("{eta}s")
             };
-            format!("  {label} [{bar}] {:5.1}%  {}/{}  {speed}  eta {eta_s}", frac * 100.0, human_gb(done), human_gb(t))
+            format!(
+                "  {label} [{bar}] {:5.1}%  {}/{}  {speed}  eta {eta_s}",
+                frac * 100.0,
+                human_gb(done),
+                human_gb(t)
+            )
         }
         _ => format!("  {label} {}  {speed}", human_gb(done)),
     }
@@ -153,10 +186,11 @@ fn progress_line(label: &str, done: u64, total: Option<u64>, secs: f64) -> Strin
 fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, index: usize, count: usize) -> Result<()> {
     use std::io::IsTerminal;
     let path = dir.join(name);
-    if let Ok(md) = std::fs::metadata(&path) {
-        if md.len() > 0 && expected.is_none_or(|s| s == md.len()) {
-            return Ok(());
-        }
+    if let Ok(md) = std::fs::metadata(&path)
+        && md.len() > 0
+        && expected.is_none_or(|s| s == md.len())
+    {
+        return Ok(());
     }
     let url = format!("https://huggingface.co/{repo}/resolve/main/{name}");
     let t0 = Instant::now();
@@ -189,8 +223,13 @@ fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, index: 
         })),
         ..Default::default()
     };
-    eprintln!("[fetching {repo}/{name}{}]", expected.map(|s| format!(" ({})", human_gb(s))).unwrap_or_default());
-    let out = request(&url)?.download_resumable(&path, opts).map_err(|e| anyhow!("download {url}: {e}"))?;
+    eprintln!(
+        "[fetching {repo}/{name}{}]",
+        expected.map(|s| format!(" ({})", human_gb(s))).unwrap_or_default()
+    );
+    let out = request(&url)?
+        .download_resumable(&path, opts)
+        .map_err(|e| anyhow!("download {url}: {e}"))?;
     let secs = t0.elapsed().as_secs_f64().max(1e-3);
     if tty {
         eprint!("\r\x1b[K");
@@ -200,12 +239,16 @@ fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, index: 
         human_gb(out.bytes_written + out.resumed_from),
         secs,
         out.bytes_written as f64 / secs / 1e6,
-        if out.resumed_from > 0 { format!(", resumed from {}", human_gb(out.resumed_from)) } else { String::new() }
-    );
-    if let (Some(exp), Ok(md)) = (expected, std::fs::metadata(&path)) {
-        if md.len() != exp {
-            bail!("{}: size {} after download, expected {exp}", path.display(), md.len());
+        if out.resumed_from > 0 {
+            format!(", resumed from {}", human_gb(out.resumed_from))
+        } else {
+            String::new()
         }
+    );
+    if let (Some(exp), Ok(md)) = (expected, std::fs::metadata(&path))
+        && md.len() != exp
+    {
+        bail!("{}: size {} after download, expected {exp}", path.display(), md.len());
     }
     Ok(())
 }

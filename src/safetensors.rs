@@ -1,16 +1,16 @@
 //! Minimal zero-copy safetensors reader (single file or sharded directory).
 
-use anyhow::{bail, Context, Result};
-#[cfg(not(target_arch = "wasm32"))]
-use memmap2::Mmap;
 use crate::pool;
 use crate::quant::PageVec;
 use crate::quant::{Q4Matrix, QBuf, QKind, QMatrix};
+use anyhow::{Context, Result, bail};
+#[cfg(not(target_arch = "wasm32"))]
+use memmap2::Mmap;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
@@ -206,7 +206,7 @@ impl SafeTensors {
             bail!("tensor {name} has dtype {}, expected BF16", t.dtype);
         }
         let b = &self.mmap[t.start..t.end];
-        if b.as_ptr() as usize % 2 != 0 {
+        if !(b.as_ptr() as usize).is_multiple_of(2) {
             bail!("tensor {name} is not 2-byte aligned");
         }
         Ok(unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len() / 2) })
@@ -217,6 +217,10 @@ impl SafeTensors {
             Storage::Host(h) => h.len,
             m => m.len(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Touch every page so the weights are resident before the first forward pass.
@@ -297,7 +301,12 @@ impl ModelFiles {
                 index.insert(n.clone(), i);
             }
         }
-        Ok(Self { shards, index, touched: Mutex::new(BTreeMap::new()), uses: Mutex::new(HashMap::new()) })
+        Ok(Self {
+            shards,
+            index,
+            touched: Mutex::new(BTreeMap::new()),
+            uses: Mutex::new(HashMap::new()),
+        })
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -376,12 +385,12 @@ impl ModelFiles {
                 "F16" => 2,
                 _ => 1,
             };
-            if b.as_ptr() as usize % align != 0 {
+            if !(b.as_ptr() as usize).is_multiple_of(align) {
                 bail!("tensor {t} is not {align}-byte aligned");
             }
             Ok(b)
         };
-        if n_in % crate::quant::QBLOCK != 0 {
+        if !n_in.is_multiple_of(crate::quant::QBLOCK) {
             return Ok(None);
         }
         let bpr = n_in / crate::quant::QBLOCK;
@@ -393,14 +402,24 @@ impl ModelFiles {
             self.touched.lock().unwrap().insert(name.to_string(), Some(QKind::Q8));
             let q = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const i8, q.len()) };
             let sc = unsafe { std::slice::from_raw_parts(sc.as_ptr() as *const f32, sc.len() / 4) };
-            return Ok(Some(Stored::Q8(QMatrix { q: unsafe { QBuf::borrowed(q) }, scales: unsafe { QBuf::borrowed(sc) }, n_out, n_in })));
+            return Ok(Some(Stored::Q8(QMatrix {
+                q: unsafe { QBuf::borrowed(q) },
+                scales: unsafe { QBuf::borrowed(sc) },
+                n_out,
+                n_in,
+            })));
         }
         if self.has(&q4) {
             let q = check(&q4, "U8", &[n_out, n_in / 2])?;
             let sc = check(&format!("{name}.q4s"), "F16", &[n_out, bpr])?;
             self.touched.lock().unwrap().insert(name.to_string(), Some(QKind::Q4));
             let sc = unsafe { std::slice::from_raw_parts(sc.as_ptr() as *const u16, sc.len() / 2) };
-            return Ok(Some(Stored::Q4(Q4Matrix { q: unsafe { QBuf::borrowed(q) }, scales: unsafe { QBuf::borrowed(sc) }, n_out, n_in })));
+            return Ok(Some(Stored::Q4(Q4Matrix {
+                q: unsafe { QBuf::borrowed(q) },
+                scales: unsafe { QBuf::borrowed(sc) },
+                n_out,
+                n_in,
+            })));
         }
         Ok(None)
     }
@@ -432,7 +451,13 @@ impl ModelFiles {
                         "U8" => "U8",
                         other => bail!("tensor {name}: dtype {other} not supported by the writer"),
                     };
-                    dst.push(Planned { name: name.clone(), dtype, shape: info.shape.clone(), bytes: info.end - info.start, src: Some((name.clone(), None, false)) });
+                    dst.push(Planned {
+                        name: name.clone(),
+                        dtype,
+                        shape: info.shape.clone(),
+                        bytes: info.end - info.start,
+                        src: Some((name.clone(), None, false)),
+                    });
                 }
                 Some(k) => {
                     if info.dtype != "BF16" {
@@ -440,7 +465,7 @@ impl ModelFiles {
                     }
                     let n_out = info.shape[0];
                     let n_in: usize = info.shape[1..].iter().product();
-                    if n_in % QBLOCK != 0 {
+                    if !n_in.is_multiple_of(QBLOCK) {
                         bail!("tensor {name}: row length {n_in} is not a multiple of {QBLOCK}");
                     }
                     let bpr = n_in / QBLOCK;
@@ -448,8 +473,20 @@ impl ModelFiles {
                         QKind::Q8 => ("I8", vec![n_out, n_in], n_out * n_in, "F32", n_out * bpr * 4),
                         QKind::Q4 => ("U8", vec![n_out, n_in / 2], n_out * n_in / 2, "F16", n_out * bpr * 2),
                     };
-                    dst.push(Planned { name: format!("{name}.{}", k.suffix()), dtype: qd, shape: qshape, bytes: qbytes, src: Some((name.clone(), Some(*k), false)) });
-                    dst.push(Planned { name: format!("{name}.{}s", k.suffix()), dtype: sd, shape: vec![n_out, bpr], bytes: sbytes, src: Some((name.clone(), Some(*k), true)) });
+                    dst.push(Planned {
+                        name: format!("{name}.{}", k.suffix()),
+                        dtype: qd,
+                        shape: qshape,
+                        bytes: qbytes,
+                        src: Some((name.clone(), Some(*k), false)),
+                    });
+                    dst.push(Planned {
+                        name: format!("{name}.{}s", k.suffix()),
+                        dtype: sd,
+                        shape: vec![n_out, bpr],
+                        bytes: sbytes,
+                        src: Some((name.clone(), Some(*k), true)),
+                    });
                 }
             }
         }
@@ -457,7 +494,10 @@ impl ModelFiles {
         for e in std::fs::read_dir(dir)? {
             let e = e?;
             let n = e.file_name().to_string_lossy().to_string();
-            if n == "model.safetensors" || n == "model.safetensors.index.json" || ((n.starts_with("model-weights") || n.starts_with("model-tables")) && n.ends_with(".safetensors")) {
+            if n == "model.safetensors"
+                || n == "model.safetensors.index.json"
+                || ((n.starts_with("model-weights") || n.starts_with("model-tables")) && n.ends_with(".safetensors"))
+            {
                 std::fs::remove_file(e.path()).with_context(|| format!("remove {}", e.path().display()))?;
             }
         }
@@ -526,7 +566,13 @@ impl ModelFiles {
             let align = if o.bytes >= BIG { PAGE_ALIGN } else { 64 };
             let pad = off.next_multiple_of(align) - off;
             if pad > 0 {
-                layout.push(Planned { name: format!("__pad.{i}"), dtype: "U8", shape: vec![pad], bytes: pad, src: None });
+                layout.push(Planned {
+                    name: format!("__pad.{i}"),
+                    dtype: "U8",
+                    shape: vec![pad],
+                    bytes: pad,
+                    src: None,
+                });
                 off += pad;
             }
             off += o.bytes;
@@ -540,7 +586,10 @@ impl ModelFiles {
         header.insert("__metadata__".into(), serde_json::Value::Object(meta));
         let mut off = 0usize;
         for o in &layout {
-            header.insert(o.name.clone(), serde_json::json!({ "dtype": o.dtype, "shape": o.shape, "data_offsets": [off, off + o.bytes] }));
+            header.insert(
+                o.name.clone(),
+                serde_json::json!({ "dtype": o.dtype, "shape": o.shape, "data_offsets": [off, off + o.bytes] }),
+            );
             off += o.bytes;
         }
         let mut hjson = serde_json::to_vec(&header)?;
@@ -616,7 +665,10 @@ mod tests {
         let mut header = serde_json::Map::new();
         let mut off = 0;
         for (n, r, c, _) in tensors {
-            header.insert(n.to_string(), serde_json::json!({"dtype": "BF16", "shape": [r, c], "data_offsets": [off, off + r * c * 2]}));
+            header.insert(
+                n.to_string(),
+                serde_json::json!({"dtype": "BF16", "shape": [r, c], "data_offsets": [off, off + r * c * 2]}),
+            );
             off += r * c * 2;
         }
         let mut h = serde_json::to_vec(&header).unwrap();
@@ -635,9 +687,22 @@ mod tests {
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let (r, c) = (48, 96);
-        let mk = |seed: u32| -> Vec<u16> { (0..r * c).map(|i| ((((i as u32).wrapping_mul(2654435761) ^ seed) >> 20) as f32 / 4096.0 - 0.5).to_bits()).map(|b| (b >> 16) as u16).collect() };
+        let mk = |seed: u32| -> Vec<u16> {
+            (0..r * c)
+                .map(|i| ((((i as u32).wrapping_mul(2654435761) ^ seed) >> 20) as f32 / 4096.0 - 0.5).to_bits())
+                .map(|b| (b >> 16) as u16)
+                .collect()
+        };
         let (a, b, t, n) = (mk(1), mk(2), mk(3), mk(4));
-        write_bf16(&dir.join("model.safetensors"), &[("a", r, c, a.clone()), ("b", r, c, b.clone()), ("tab", r, c, t.clone()), ("norm", 1, c, n[..c].to_vec())]);
+        write_bf16(
+            &dir.join("model.safetensors"),
+            &[
+                ("a", r, c, a.clone()),
+                ("b", r, c, b.clone()),
+                ("tab", r, c, t.clone()),
+                ("norm", 1, c, n[..c].to_vec()),
+            ],
+        );
         let files = ModelFiles::open(&dir, true).unwrap();
         // What a loader does: two matmul weights (q8, q4), a lookup-only table (q4), a raw tensor.
         files.bf16("a").unwrap();

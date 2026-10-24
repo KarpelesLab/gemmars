@@ -4,9 +4,9 @@
 use crate::config::TextConfig;
 use crate::kernels::*;
 use crate::prof::{self, Cat};
-use crate::quant::{quantize_bf16, quantize_q4, Q4Matrix, QKind, QMatrix};
+use crate::quant::{Q4Matrix, QKind, QMatrix, quantize_bf16, quantize_q4};
 use crate::safetensors::{ModelFiles, Stored};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Weight precision for the streamed (linear) weights.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,7 +51,10 @@ impl Quant {
 /// token at a time, so they are never streamed in full): `OXINFER_TABLE_QUANT=bf16|q8|q4`,
 /// default the model precision.
 pub fn table_quant(quant: Quant) -> Quant {
-    std::env::var("OXINFER_TABLE_QUANT").ok().and_then(|v| Quant::parse(&v)).unwrap_or(quant)
+    std::env::var("OXINFER_TABLE_QUANT")
+        .ok()
+        .and_then(|v| Quant::parse(&v))
+        .unwrap_or(quant)
 }
 
 /// An embedding table `[rows, cols]` read one row at a time: borrowed bf16 or pre-quantized.
@@ -61,7 +64,14 @@ pub enum Table<'a> {
     Q4(Q4Matrix),
     /// Pre-quantized rows kept by the browser host, fetched one row per lookup.
     /// Values and scales can sit in different shards, hence two files.
-    Host { qf: crate::fsx::HostFile, sf: crate::fsx::HostFile, kind: QKind, q_off: u64, s_off: u64, cols: usize },
+    Host {
+        qf: crate::fsx::HostFile,
+        sf: crate::fsx::HostFile,
+        kind: QKind,
+        q_off: u64,
+        s_off: u64,
+        cols: usize,
+    },
 }
 
 impl<'a> Table<'a> {
@@ -76,7 +86,14 @@ impl<'a> Table<'a> {
             }
             Table::Q8(m) => crate::quant::dequantize_rows(m, r, r + 1, out),
             Table::Q4(m) => crate::quant::dequantize_rows_q4(m, r, r + 1, out),
-            &Table::Host { qf, sf, kind, q_off, s_off, cols } => {
+            &Table::Host {
+                qf,
+                sf,
+                kind,
+                q_off,
+                s_off,
+                cols,
+            } => {
                 use crate::quant::{PageVec, QBLOCK};
                 let bpr = cols / QBLOCK;
                 let (qb, sb) = match kind {
@@ -86,7 +103,8 @@ impl<'a> Table<'a> {
                 let mut buf = PageVec::<u64>::zeroed((qb + sb).div_ceil(8));
                 let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, qb + sb) };
                 let (qbuf, sbuf) = bytes.split_at_mut(qb);
-                let ok = crate::fsx::read_host(qf, q_off + (r * qb) as u64, qbuf).and_then(|_| crate::fsx::read_host(sf, s_off + (r * sb) as u64, sbuf));
+                let ok = crate::fsx::read_host(qf, q_off + (r * qb) as u64, qbuf)
+                    .and_then(|_| crate::fsx::read_host(sf, s_off + (r * sb) as u64, sbuf));
                 if let Err(e) = ok {
                     panic!("table row {r}: {e}");
                 }
@@ -97,12 +115,22 @@ impl<'a> Table<'a> {
                         QKind::Q8 => {
                             let q = std::slice::from_raw_parts(qbuf.as_ptr() as *const i8, qb);
                             let sc = std::slice::from_raw_parts(sbuf.as_ptr() as *const f32, bpr);
-                            let m = QMatrix { q: crate::quant::QBuf::borrowed(q), scales: crate::quant::QBuf::borrowed(sc), n_out: 1, n_in: cols };
+                            let m = QMatrix {
+                                q: crate::quant::QBuf::borrowed(q),
+                                scales: crate::quant::QBuf::borrowed(sc),
+                                n_out: 1,
+                                n_in: cols,
+                            };
                             crate::quant::dequantize_rows(&m, 0, 1, out);
                         }
                         QKind::Q4 => {
                             let sc = std::slice::from_raw_parts(sbuf.as_ptr() as *const u16, bpr);
-                            let m = Q4Matrix { q: crate::quant::QBuf::borrowed(qbuf), scales: crate::quant::QBuf::borrowed(sc), n_out: 1, n_in: cols };
+                            let m = Q4Matrix {
+                                q: crate::quant::QBuf::borrowed(qbuf),
+                                scales: crate::quant::QBuf::borrowed(sc),
+                                n_out: 1,
+                                n_in: cols,
+                            };
                             crate::quant::dequantize_rows_q4(&m, 0, 1, out);
                         }
                     }
@@ -135,10 +163,21 @@ impl<'a> Table<'a> {
                 };
                 let (qi, si) = (files.info(&qn).unwrap(), files.info(&sn).unwrap());
                 if qi.shape != qshape || si.shape != [rows, bpr] || si.dtype != sdt {
-                    bail!("table {full}: stored shapes {:?} / {:?} do not match [{rows}, {cols}]", qi.shape, si.shape);
+                    bail!(
+                        "table {full}: stored shapes {:?} / {:?} do not match [{rows}, {cols}]",
+                        qi.shape,
+                        si.shape
+                    );
                 }
                 files.mark_quant(full, kind);
-                return Ok(Table::Host { qf, sf, kind, q_off, s_off, cols });
+                return Ok(Table::Host {
+                    qf,
+                    sf,
+                    kind,
+                    q_off,
+                    s_off,
+                    cols,
+                });
             }
         }
         // SAFETY: the table borrows `files` for 'a, which outlives every model holding it.
@@ -201,13 +240,22 @@ pub enum Weight<'a> {
 
 impl<'a> Lin<'a> {
     pub fn bf16(w: &'a [u16]) -> Self {
-        Self { w: Weight::Bf16(w), dev: std::sync::OnceLock::new() }
+        Self {
+            w: Weight::Bf16(w),
+            dev: std::sync::OnceLock::new(),
+        }
     }
     pub fn q8(m: QMatrix) -> Self {
-        Self { w: Weight::Q8(m), dev: std::sync::OnceLock::new() }
+        Self {
+            w: Weight::Q8(m),
+            dev: std::sync::OnceLock::new(),
+        }
     }
     pub fn q4(m: Q4Matrix) -> Self {
-        Self { w: Weight::Q4(m), dev: std::sync::OnceLock::new() }
+        Self {
+            w: Weight::Q4(m),
+            dev: std::sync::OnceLock::new(),
+        }
     }
     pub fn bytes(&self) -> usize {
         self.as_ref().bytes()
@@ -242,7 +290,12 @@ pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, 
     for (l, n, y) in jobs.iter_mut() {
         match be.and_then(|_| l.device_state(*n, n_in, t)) {
             Some(dev) => {
-                gpu.push(crate::gpu::Job { w: l.as_ref(), dev, n_out: *n, y: &mut **y });
+                gpu.push(crate::gpu::Job {
+                    w: l.as_ref(),
+                    dev,
+                    n_out: *n,
+                    y,
+                });
                 gpu_meta.push((l, *n));
             }
             None => rest.push((l, *n, &mut **y)),
@@ -363,7 +416,13 @@ pub struct LayerCache {
 
 impl LayerCache {
     pub(crate) fn new(n_kv: usize, hd: usize) -> Self {
-        Self { k: Vec::new(), v: Vec::new(), n_kv, hd, len: 0 }
+        Self {
+            k: Vec::new(),
+            v: Vec::new(),
+            n_kv,
+            hd,
+            len: 0,
+        }
     }
     pub(crate) fn push(&mut self, k: &[f32], v: &[f32], t: usize) {
         debug_assert_eq!(k.len(), t * self.n_kv * self.hd);
@@ -442,7 +501,11 @@ impl<'a> Model<'a> {
         // The PLE projection feeds every layer directly: keep it at Q8 under Q4. The LM head follows
         // OXINFER_HEAD_Q8=1 (Q8) or defaults to the model precision.
         let hi_quant = if quant == Quant::Q4 { Quant::Q8 } else { quant };
-        let head_quant = if quant == Quant::Q4 && std::env::var("OXINFER_HEAD_Q8").is_ok() { Quant::Q8 } else { quant };
+        let head_quant = if quant == Quant::Q4 && std::env::var("OXINFER_HEAD_Q8").is_ok() {
+            Quant::Q8
+        } else {
+            quant
+        };
 
         // Tied: lookups and the LM head read the same tensor (one copy in a pre-quantized file).
         let embed = Table::load(files, &format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h, head_quant)?;
@@ -450,7 +513,13 @@ impl<'a> Model<'a> {
         let final_norm = get("norm.weight", &[h])?;
         let ple = if cfg.has_ple() {
             Some(PleGlobal {
-                embed: Table::load(files, &format!("{prefix}embed_tokens_per_layer.weight"), cfg.vocab_size_per_layer_input, nl * p, table_quant(quant))?,
+                embed: Table::load(
+                    files,
+                    &format!("{prefix}embed_tokens_per_layer.weight"),
+                    cfg.vocab_size_per_layer_input,
+                    nl * p,
+                    table_quant(quant),
+                )?,
                 proj: lin_with("per_layer_model_projection.weight", nl * p, h, hi_quant)?,
                 norm: get("per_layer_projection_norm.weight", &[p])?,
             })
@@ -472,7 +541,11 @@ impl<'a> Model<'a> {
             let (k, v, k_norm) = if own_kv {
                 (
                     Some(gl("self_attn.k_proj.weight", n_kv * hd, h)?),
-                    if k_eq_v { None } else { Some(gl("self_attn.v_proj.weight", n_kv * hd, h)?) },
+                    if k_eq_v {
+                        None
+                    } else {
+                        Some(gl("self_attn.v_proj.weight", n_kv * hd, h)?)
+                    },
                     Some(g("self_attn.k_norm.weight", &[hd])?),
                 )
             } else {
@@ -522,7 +595,17 @@ impl<'a> Model<'a> {
         let inv_freq_sliding = rope_inv_freq(cfg.head_dim, rs.theta, rs.proportion);
         let inv_freq_full = rope_inv_freq(cfg.global_head_dim, rf.theta, rf.proportion);
 
-        Ok(Self { cfg, quant, embed, head, ple, layers, final_norm, inv_freq_sliding, inv_freq_full })
+        Ok(Self {
+            cfg,
+            quant,
+            embed,
+            head,
+            ple,
+            layers,
+            final_norm,
+            inv_freq_sliding,
+            inv_freq_full,
+        })
     }
 
     /// Bytes of linear weights streamed per decoded token.

@@ -153,11 +153,25 @@ fn total_memory() -> Option<u64> {
     {
         // sysctlbyname("hw.memsize") from the already-loaded libSystem.
         let lib = dlsym::Library::this().ok()?;
-        type F = unsafe extern "C" fn(*const std::ffi::c_char, *mut std::ffi::c_void, *mut usize, *mut std::ffi::c_void, usize) -> std::ffi::c_int;
+        type F = unsafe extern "C" fn(
+            *const std::ffi::c_char,
+            *mut std::ffi::c_void,
+            *mut usize,
+            *mut std::ffi::c_void,
+            usize,
+        ) -> std::ffi::c_int;
         let f = unsafe { lib.get::<F>(c"sysctlbyname") }.ok()?;
         let mut v: u64 = 0;
         let mut len = std::mem::size_of::<u64>();
-        let rc = unsafe { f.call((c"hw.memsize".as_ptr(), &mut v as *mut u64 as *mut _, &mut len, std::ptr::null_mut(), 0)) };
+        let rc = unsafe {
+            f.call((
+                c"hw.memsize".as_ptr(),
+                &mut v as *mut u64 as *mut _,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ))
+        };
         return if rc == 0 { Some(v) } else { None };
     }
     #[allow(unreachable_code)]
@@ -174,13 +188,14 @@ pub fn detect() -> Platform {
     };
     #[allow(unused_mut)]
     let mut gpus = Vec::new();
-    let mut notes = Vec::new();
     #[cfg(feature = "gpu")]
-    {
-        gpu::probe_all(&mut gpus, &mut notes);
-    }
+    let notes = {
+        let mut n = Vec::new();
+        gpu::probe_all(&mut gpus, &mut n);
+        n
+    };
     #[cfg(not(feature = "gpu"))]
-    notes.push("gpu feature disabled at build time".to_string());
+    let notes = vec!["gpu feature disabled at build time".to_string()];
     Platform { cpu, gpus, notes }
 }
 
@@ -205,7 +220,15 @@ impl Platform {
     pub fn report(&self) -> String {
         let mut s = String::new();
         let _ = writeln!(s, "CPU: {} on {}, {} logical cores", self.cpu.arch, self.cpu.os, self.cpu.cores);
-        let _ = writeln!(s, "  features: {}", if self.cpu.features.is_empty() { "(baseline)".to_string() } else { self.cpu.features.join(" ") });
+        let _ = writeln!(
+            s,
+            "  features: {}",
+            if self.cpu.features.is_empty() {
+                "(baseline)".to_string()
+            } else {
+                self.cpu.features.join(" ")
+            }
+        );
         if let Some(m) = self.cpu.memory_bytes {
             let _ = writeln!(s, "  memory: {:.1} GB", m as f64 / 1e9);
         }
@@ -215,7 +238,12 @@ impl Platform {
         for g in &self.gpus {
             let _ = writeln!(s, "GPU ({} #{}): {}", g.kind.as_str(), g.index, g.name);
             if let Some(m) = g.memory_bytes {
-                let _ = writeln!(s, "  memory: {:.1} GB{}", m as f64 / 1e9, if g.unified_memory { " (unified with CPU)" } else { "" });
+                let _ = writeln!(
+                    s,
+                    "  memory: {:.1} GB{}",
+                    m as f64 / 1e9,
+                    if g.unified_memory { " (unified with CPU)" } else { "" }
+                );
             }
             if !g.driver.is_empty() {
                 let _ = writeln!(s, "  driver: {}", g.driver);
@@ -240,7 +268,7 @@ impl Platform {
 #[cfg(feature = "gpu")]
 pub mod gpu {
     use super::{GpuInfo, GpuKind};
-    use std::ffi::{c_char, c_int, c_void, CStr};
+    use std::ffi::{CStr, c_char, c_int, c_void};
 
     pub fn probe_all(gpus: &mut Vec<GpuInfo>, notes: &mut Vec<String>) {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -302,7 +330,10 @@ pub mod gpu {
             use dlsym::Bindings;
             let mut last = String::new();
             for c in CANDIDATES {
-                match unsafe { dlsym::Library::open(c) }.map_err(|e| e.to_string()).and_then(|l| Cuda::load(l).map_err(|e| e.to_string())) {
+                match unsafe { dlsym::Library::open(c) }
+                    .map_err(|e| e.to_string())
+                    .and_then(|l| Cuda::load(l).map_err(|e| e.to_string()))
+                {
                     Ok(l) => return Ok(l),
                     Err(e) => last = e,
                 }
@@ -361,7 +392,8 @@ pub mod gpu {
 
         impl Objc {
             pub fn open() -> Result<Self, String> {
-                let metal = unsafe { dlsym::Library::open("/System/Library/Frameworks/Metal.framework/Metal") }.map_err(|e| e.to_string())?;
+                let metal =
+                    unsafe { dlsym::Library::open("/System/Library/Frameworks/Metal.framework/Metal") }.map_err(|e| e.to_string())?;
                 let objc = unsafe { dlsym::Library::open("/usr/lib/libobjc.A.dylib") }.map_err(|e| e.to_string())?;
                 Ok(Self { metal, objc })
             }
@@ -382,7 +414,11 @@ pub mod gpu {
                     Err(_) => std::ptr::null_mut(),
                 }
             }
-            pub fn nsstring_to_string(&self, s: Id) -> String {
+            /// Copies an `NSString` into a Rust string (empty for null).
+            ///
+            /// # Safety
+            /// `s` must be null or a valid `NSString` object pointer.
+            pub unsafe fn nsstring_to_string(&self, s: Id) -> String {
                 if s.is_null() {
                     return String::new();
                 }
@@ -400,7 +436,8 @@ pub mod gpu {
             let send_id: unsafe extern "C" fn(Id, Sel) -> Id = o.msg_send();
             let send_u64: unsafe extern "C" fn(Id, Sel) -> u64 = o.msg_send();
             let send_bool: unsafe extern "C" fn(Id, Sel) -> u8 = o.msg_send();
-            let name = o.nsstring_to_string(unsafe { send_id(dev, o.sel(c"name")) });
+            // SAFETY: `name` returns an NSString owned by the device.
+            let name = unsafe { o.nsstring_to_string(send_id(dev, o.sel(c"name"))) };
             let mem = unsafe { send_u64(dev, o.sel(c"recommendedMaxWorkingSetSize")) };
             let unified = unsafe { send_bool(dev, o.sel(c"hasUnifiedMemory")) } != 0;
             Ok(Some(GpuInfo {
@@ -429,7 +466,14 @@ pub mod gpu {
                 }
             }
         }
-        pub const CANDIDATES: &[&str] = &["libvulkan.so.1", "libvulkan.so", "vulkan-1.dll", "libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib"];
+        pub const CANDIDATES: &[&str] = &[
+            "libvulkan.so.1",
+            "libvulkan.so",
+            "vulkan-1.dll",
+            "libvulkan.1.dylib",
+            "libvulkan.dylib",
+            "libMoltenVK.dylib",
+        ];
 
         #[repr(C)]
         struct InstanceCreateInfo {
@@ -448,7 +492,10 @@ pub mod gpu {
             let mut lib = None;
             let mut last = String::new();
             for c in CANDIDATES {
-                match unsafe { dlsym::Library::open(c) }.map_err(|e| e.to_string()).and_then(|l| Vk::load(l).map_err(|e| e.to_string())) {
+                match unsafe { dlsym::Library::open(c) }
+                    .map_err(|e| e.to_string())
+                    .and_then(|l| Vk::load(l).map_err(|e| e.to_string()))
+                {
                     Ok(l) => {
                         lib = Some(l);
                         break;

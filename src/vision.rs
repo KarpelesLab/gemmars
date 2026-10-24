@@ -6,7 +6,7 @@ use crate::kernels::*;
 use crate::mm_config::VisionConfig;
 use crate::pool;
 use crate::safetensors::ModelFiles;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 pub const SUPPORTED_SOFT_TOKENS: [usize; 5] = [70, 140, 280, 560, 1120];
 
@@ -209,7 +209,7 @@ pub struct VisionTower<'a> {
     input_proj: &'a [u16], // [H, 3*p*p]
     pos_table: &'a [u16],  // [2, P, H]
     layers: Vec<VLayer<'a>>,
-    inv_freq: Vec<f32>, // head_dim/4 frequencies per spatial axis
+    inv_freq: Vec<f32>,    // head_dim/4 frequencies per spatial axis
     embed_proj: &'a [u16], // [text_hidden, H]
     pub text_hidden: usize,
 }
@@ -254,7 +254,9 @@ impl<'a> VisionTower<'a> {
         // Axial RoPE: spatial_dim = head_dim/2, inv_freq over arange(0, spatial_dim, 2)/spatial_dim.
         let spatial = hd / 2;
         let theta = cfg.rope_theta();
-        let inv_freq: Vec<f32> = (0..spatial / 2).map(|i| (1.0 / theta.powf((2 * i) as f64 / spatial as f64)) as f32).collect();
+        let inv_freq: Vec<f32> = (0..spatial / 2)
+            .map(|i| (1.0 / theta.powf((2 * i) as f64 / spatial as f64)) as f32)
+            .collect();
         let embed_name = "model.embed_vision.embedding_projection.weight";
         let embed_proj = {
             let info = files.info(embed_name).context("missing embed_vision projection")?;

@@ -34,6 +34,8 @@ pub trait ChatFormat {
     /// A user turn followed by the generation prompt.
     fn user_turn(&self, content: &str, think: bool) -> String;
     fn end_of_model_turn(&self) -> String;
+    /// The special token that closes a model turn (generation stops on it).
+    fn end_of_turn_token(&self) -> &'static str;
     /// Token ids that open / close a thinking block in generated text, and whether
     /// generation starts inside one when thinking is enabled.
     fn think_ids(&self) -> (u32, u32);
@@ -50,6 +52,9 @@ impl ChatFormat for GemmaChat {
     }
     fn end_of_model_turn(&self) -> String {
         end_of_model_turn()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        EOT
     }
     fn think_ids(&self) -> (u32, u32) {
         (100, 101)
@@ -81,10 +86,23 @@ impl ChatFormat for QwenChat {
     fn end_of_model_turn(&self) -> String {
         "<|im_end|>\n".to_string()
     }
+    fn end_of_turn_token(&self) -> &'static str {
+        "<|im_end|>"
+    }
     fn think_ids(&self) -> (u32, u32) {
         (248068, 248069)
     }
     fn starts_in_thinking(&self, think: bool) -> bool {
         think
     }
+}
+
+/// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
+pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &tokenizers::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
+    if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())
+        && !eos.contains(&id)
+    {
+        eos.push(id);
+    }
+    eos
 }

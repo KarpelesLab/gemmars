@@ -1,10 +1,16 @@
 //! CPU compute kernels: bf16 weights, f32 activations, multi-threaded via the spin pool.
-#![allow(unsafe_op_in_unsafe_fn)]
+//!
+//! # Safety
+//! The `unsafe fn` kernels here and in the `simd` modules share one contract: every pointer
+//! argument must be valid for the extent implied by the dimensions passed alongside it (rows times
+//! `n_in` weights, `t` or `tc` activation rows of `n_in`, outputs indexed as documented on each
+//! function), and output ranges written concurrently by different threads must not overlap. They
+//! are documented once here rather than on every tile variant.
+#![allow(unsafe_op_in_unsafe_fn, clippy::missing_safety_doc)]
 
 use crate::pool;
 use crate::prof::{self, Cat};
-use crate::quant::{dequantize_rows, dequantize_rows_q4, quantize_act, Q4Matrix, QAct, QMatrix, QBLOCK};
-use std::cell::RefCell;
+use crate::quant::{Q4Matrix, QAct, QBLOCK, QMatrix, dequantize_rows, dequantize_rows_q4, quantize_act};
 
 #[inline(always)]
 pub fn bf16_to_f32(x: u16) -> f32 {
@@ -35,9 +41,15 @@ struct JobRef<'a> {
     y: SendPtr,
 }
 
-thread_local! {
-    static SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+// Already `const`; clippy misreads the emulated-TLS expansion on Android.
+#[allow(clippy::missing_const_for_thread_local)]
+mod scratch {
+    use std::cell::RefCell;
+    thread_local! {
+        pub(super) static SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    }
 }
+use scratch::SCRATCH;
 
 /// y[t][o] = sum_i w[o][i] * x[t][i]
 ///
@@ -62,7 +74,11 @@ pub fn matmul_multi(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[
             assert_eq!(w.len(), *n_out * n_in, "weight shape mismatch");
             assert_eq!(y.len(), t * *n_out, "output shape mismatch");
             total_bytes += w.len() * 2;
-            JobRef { w, n_out: *n_out, y: SendPtr(y.as_mut_ptr()) }
+            JobRef {
+                w,
+                n_out: *n_out,
+                y: SendPtr(y.as_mut_ptr()),
+            }
         })
         .collect();
     let _timer = prof::start(Cat::Matmul);
@@ -135,10 +151,7 @@ pub mod simd {
         unsafe fn load8(p: *const u16) -> (float32x4_t, float32x4_t) {
             let w = vld1q_u16(p);
             let z = vdupq_n_u16(0);
-            (
-                vreinterpretq_f32_u16(vzip1q_u16(z, w)),
-                vreinterpretq_f32_u16(vzip2q_u16(z, w)),
-            )
+            (vreinterpretq_f32_u16(vzip1q_u16(z, w)), vreinterpretq_f32_u16(vzip2q_u16(z, w)))
         }
     }
     impl Load8 for f32 {
@@ -293,13 +306,7 @@ pub mod simd {
     /// Four blocks (128 weights) per step: SDOT into int32, pairwise-add into one vector of block
     /// sums, convert, and FMA with the product of weight and activation scales.
     #[inline(never)]
-    pub unsafe fn q8_dot_rows<const R: usize>(
-        q: *const i8,
-        s: *const f32,
-        n_in: usize,
-        xq: *const i8,
-        xs: *const f32,
-    ) -> [f32; R] {
+    pub unsafe fn q8_dot_rows<const R: usize>(q: *const i8, s: *const f32, n_in: usize, xq: *const i8, xs: *const f32) -> [f32; R] {
         let bpr = n_in / 32;
         let zero = vdupq_n_s32(0);
         let mut accf = [vdupq_n_f32(0.0); R];
@@ -317,10 +324,10 @@ pub mod simd {
             let sxv = vld1q_f32(xs.add(b));
             for r in 0..R {
                 let wp = q.add(r * n_in + k);
-                let a0 = vdotq_s32(vdotq_s32(zero, vld1q_s8(wp), x0), vld1q_s8(wp.add(16)), x1);
-                let a1 = vdotq_s32(vdotq_s32(zero, vld1q_s8(wp.add(32)), x2), vld1q_s8(wp.add(48)), x3);
-                let a2 = vdotq_s32(vdotq_s32(zero, vld1q_s8(wp.add(64)), x4), vld1q_s8(wp.add(80)), x5);
-                let a3 = vdotq_s32(vdotq_s32(zero, vld1q_s8(wp.add(96)), x6), vld1q_s8(wp.add(112)), x7);
+                let a0 = sdot(sdot(zero, vld1q_s8(wp), x0), vld1q_s8(wp.add(16)), x1);
+                let a1 = sdot(sdot(zero, vld1q_s8(wp.add(32)), x2), vld1q_s8(wp.add(48)), x3);
+                let a2 = sdot(sdot(zero, vld1q_s8(wp.add(64)), x4), vld1q_s8(wp.add(80)), x5);
+                let a3 = sdot(sdot(zero, vld1q_s8(wp.add(96)), x6), vld1q_s8(wp.add(112)), x7);
                 let sums = vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3));
                 let swv = vld1q_f32(s.add(r * bpr + b));
                 accf[r] = vfmaq_f32(accf[r], vcvtq_f32_s32(sums), vmulq_f32(swv, sxv));
@@ -338,7 +345,7 @@ pub mod simd {
             let sx = *xs.add(b);
             for r in 0..R {
                 let wp = q.add(r * n_in + k);
-                let a = vdotq_s32(vdotq_s32(zero, vld1q_s8(wp), x0), vld1q_s8(wp.add(16)), x1);
+                let a = sdot(sdot(zero, vld1q_s8(wp), x0), vld1q_s8(wp.add(16)), x1);
                 out[r] += vaddvq_s32(a) as f32 * *s.add(r * bpr + b) * sx;
             }
             b += 1;
@@ -361,6 +368,24 @@ pub mod simd {
             let o = q8_dot_rows::<1>(m.q.as_ptr().add(r * n_in), m.scales.as_ptr().add(r * bpr), n_in, xq, xs);
             *y.add(r) = o[0];
         }
+    }
+
+    /// SDOT: each 32-bit lane of `acc` gains the dot product of four int8 pairs from `a` and `b`.
+    /// Inline asm rather than `vdotq_s32`: the intrinsic is stable only from Rust 1.98 (MSRV is
+    /// 1.95), and it is not inlined into code built without the `dotprod` target feature (the
+    /// default for the iOS and Android targets), where every call would go out of line.
+    #[inline(always)]
+    pub unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        let mut r = acc;
+        std::arch::asm!(
+            ".arch_extension dotprod",
+            "sdot {r:v}.4s, {a:v}.16b, {b:v}.16b",
+            r = inout(vreg) r,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack)
+        );
+        r
     }
 
     /// Four f16 values -> f32 (FCVTL; the intrinsic is not stable yet).
@@ -408,7 +433,7 @@ pub mod simd {
                         let v = vld1q_u8(wp.add(16 * $i));
                         let lo = vreinterpretq_s8_u8(vandq_u8(v, m0f));
                         let hi = vreinterpretq_s8_u8(vshrq_n_u8::<4>(v));
-                        vdotq_s32(vdotq_s32(zero, lo, $xa), hi, $xb)
+                        sdot(sdot(zero, lo, $xa), hi, $xb)
                     }};
                 }
                 let a0 = blk!(0, x0, x1);
@@ -435,7 +460,7 @@ pub mod simd {
                 let v = vld1q_u8(q.add(r * half_row + b * 16));
                 let lo = vreinterpretq_s8_u8(vandq_u8(v, m0f));
                 let hi = vreinterpretq_s8_u8(vshrq_n_u8::<4>(v));
-                let a = vdotq_s32(vdotq_s32(zero, lo, x0), hi, x1);
+                let a = sdot(sdot(zero, lo, x0), hi, x1);
                 let sum = vaddvq_s32(a) - xoff;
                 out[r] += sum as f32 * crate::quant::f16_to_f32(*s.add(r * bpr + b)) * sx;
             }
@@ -498,10 +523,10 @@ pub mod simd {
                 let swv = vld1q_f32(s.add(r * bpr + b));
                 for c in 0..TC {
                     let x = &xv[c];
-                    let a0 = vdotq_s32(vdotq_s32(zero, w0, x[0]), w1, x[1]);
-                    let a1 = vdotq_s32(vdotq_s32(zero, w2, x[2]), w3, x[3]);
-                    let a2 = vdotq_s32(vdotq_s32(zero, w4, x[4]), w5, x[5]);
-                    let a3 = vdotq_s32(vdotq_s32(zero, w6, x[6]), w7, x[7]);
+                    let a0 = sdot(sdot(zero, w0, x[0]), w1, x[1]);
+                    let a1 = sdot(sdot(zero, w2, x[2]), w3, x[3]);
+                    let a2 = sdot(sdot(zero, w4, x[4]), w5, x[5]);
+                    let a3 = sdot(sdot(zero, w6, x[6]), w7, x[7]);
                     let sums = vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3));
                     let sxv = vld1q_f32(xs.add(c * bpr + b));
                     accf[r][c] = vfmaq_f32(accf[r][c], vcvtq_f32_s32(sums), vmulq_f32(swv, sxv));
@@ -523,7 +548,7 @@ pub mod simd {
                 let sw = *s.add(r * bpr + b);
                 for c in 0..TC {
                     let xp = xq.add(c * n_in + k);
-                    let a = vdotq_s32(vdotq_s32(zero, w0, vld1q_s8(xp)), w1, vld1q_s8(xp.add(16)));
+                    let a = sdot(sdot(zero, w0, vld1q_s8(xp)), w1, vld1q_s8(xp.add(16)));
                     out[r][c] += vaddvq_s32(a) as f32 * sw * *xs.add(c * bpr + b);
                 }
             }
@@ -564,7 +589,10 @@ pub mod simd {
                 macro_rules! unpack {
                     ($i:expr) => {{
                         let v = vld1q_u8(wp.add(16 * $i));
-                        (vreinterpretq_s8_u8(vandq_u8(v, m0f)), vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)))
+                        (
+                            vreinterpretq_s8_u8(vandq_u8(v, m0f)),
+                            vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)),
+                        )
                     }};
                 }
                 let (l0, h0) = unpack!(0);
@@ -574,10 +602,10 @@ pub mod simd {
                 let swv = f16x4_to_f32(s.add(r * bpr + b));
                 for c in 0..TC {
                     let x = &xv[c];
-                    let a0 = vdotq_s32(vdotq_s32(zero, l0, x[0]), h0, x[1]);
-                    let a1 = vdotq_s32(vdotq_s32(zero, l1, x[2]), h1, x[3]);
-                    let a2 = vdotq_s32(vdotq_s32(zero, l2, x[4]), h2, x[5]);
-                    let a3 = vdotq_s32(vdotq_s32(zero, l3, x[6]), h3, x[7]);
+                    let a0 = sdot(sdot(zero, l0, x[0]), h0, x[1]);
+                    let a1 = sdot(sdot(zero, l1, x[2]), h1, x[3]);
+                    let a2 = sdot(sdot(zero, l2, x[4]), h2, x[5]);
+                    let a3 = sdot(sdot(zero, l3, x[6]), h3, x[7]);
                     let sums = vsubq_s32(vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3)), xoff[c]);
                     let sxv = vld1q_f32(xs.add(c * bpr + b));
                     accf[r][c] = vfmaq_f32(accf[r][c], vcvtq_f32_s32(sums), vmulq_f32(swv, sxv));
@@ -600,7 +628,7 @@ pub mod simd {
                 let sw = crate::quant::f16_to_f32(*s.add(r * bpr + b));
                 for c in 0..TC {
                     let xp = xq.add(c * n_in + k);
-                    let a = vdotq_s32(vdotq_s32(zero, lo, vld1q_s8(xp)), hi, vld1q_s8(xp.add(16)));
+                    let a = sdot(sdot(zero, lo, vld1q_s8(xp)), hi, vld1q_s8(xp.add(16)));
                     let sum = vaddvq_s32(a) - 8 * *xsums.add(c * bpr + b);
                     out[r][c] += sum as f32 * sw * *xs.add(c * bpr + b);
                 }
@@ -647,19 +675,9 @@ pub mod simd {
 /// Computes rows r0..r1 of the output for all t tokens.
 #[cfg(has_simd)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn matmul_block(
-    w: &[u16],
-    n_out: usize,
-    n_in: usize,
-    x: &[f32],
-    xt: Option<&[f32]>,
-    t: usize,
-    r0: usize,
-    r1: usize,
-    y: *mut f32,
-) {
+unsafe fn matmul_block(w: &[u16], n_out: usize, n_in: usize, x: &[f32], xt: Option<&[f32]>, t: usize, r0: usize, r1: usize, y: *mut f32) {
     use simd::{block_tc, gemm_8x8};
-    if n_in % 32 != 0 {
+    if !n_in.is_multiple_of(32) {
         return matmul_block_scalar(w, n_out, n_in, x, t, r0, r1, y);
     }
     let wp = w.as_ptr();
@@ -671,7 +689,16 @@ unsafe fn matmul_block(
         while r + 8 <= r1 {
             for tile in 0..tiles {
                 let c0 = tile * TN;
-                gemm_8x8::<u16>(wp.add(r * n_in), n_in, xt.as_ptr().add(tile * n_in * TN), y, n_out, r, c0, (t - c0).min(TN));
+                gemm_8x8::<u16>(
+                    wp.add(r * n_in),
+                    n_in,
+                    xt.as_ptr().add(tile * n_in * TN),
+                    y,
+                    n_out,
+                    r,
+                    c0,
+                    (t - c0).min(TN),
+                );
             }
             r += 8;
         }
@@ -689,31 +716,12 @@ unsafe fn matmul_block(
 
 #[cfg(not(has_simd))]
 #[allow(clippy::too_many_arguments)]
-unsafe fn matmul_block(
-    w: &[u16],
-    n_out: usize,
-    n_in: usize,
-    x: &[f32],
-    _xt: Option<&[f32]>,
-    t: usize,
-    r0: usize,
-    r1: usize,
-    y: *mut f32,
-) {
+unsafe fn matmul_block(w: &[u16], n_out: usize, n_in: usize, x: &[f32], _xt: Option<&[f32]>, t: usize, r0: usize, r1: usize, y: *mut f32) {
     matmul_block_scalar(w, n_out, n_in, x, t, r0, r1, y)
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn matmul_block_scalar(
-    w: &[u16],
-    n_out: usize,
-    n_in: usize,
-    x: &[f32],
-    t: usize,
-    r0: usize,
-    r1: usize,
-    y: *mut f32,
-) {
+unsafe fn matmul_block_scalar(w: &[u16], n_out: usize, n_in: usize, x: &[f32], t: usize, r0: usize, r1: usize, y: *mut f32) {
     SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
         if s.len() < n_in {
@@ -794,7 +802,8 @@ impl QMatrix {
                 ($TC:expr) => {{
                     let mut r = r0;
                     while r + 2 <= r1 {
-                        let o = simd::q8_dot_rows_tc::<2, $TC>(self.q.as_ptr().add(r * n_in), self.scales.as_ptr().add(r * bpr), n_in, xq, xs);
+                        let o =
+                            simd::q8_dot_rows_tc::<2, $TC>(self.q.as_ptr().add(r * n_in), self.scales.as_ptr().add(r * bpr), n_in, xq, xs);
                         for rr in 0..2 {
                             for c in 0..$TC {
                                 *y.add((c0 + c) * self.n_out + r + rr) = o[rr][c];
@@ -803,7 +812,8 @@ impl QMatrix {
                         r += 2;
                     }
                     if r < r1 {
-                        let o = simd::q8_dot_rows_tc::<1, $TC>(self.q.as_ptr().add(r * n_in), self.scales.as_ptr().add(r * bpr), n_in, xq, xs);
+                        let o =
+                            simd::q8_dot_rows_tc::<1, $TC>(self.q.as_ptr().add(r * n_in), self.scales.as_ptr().add(r * bpr), n_in, xq, xs);
                         for c in 0..$TC {
                             *y.add((c0 + c) * self.n_out + r) = o[0][c];
                         }
@@ -840,7 +850,14 @@ impl Q4Matrix {
                 ($TC:expr) => {{
                     let mut r = r0;
                     while r + 2 <= r1 {
-                        let o = simd::q4_dot_rows_tc::<2, $TC>(self.q.as_ptr().add(r * n_in / 2), self.scales.as_ptr().add(r * bpr), n_in, xq, xs, xsums);
+                        let o = simd::q4_dot_rows_tc::<2, $TC>(
+                            self.q.as_ptr().add(r * n_in / 2),
+                            self.scales.as_ptr().add(r * bpr),
+                            n_in,
+                            xq,
+                            xs,
+                            xsums,
+                        );
                         for rr in 0..2 {
                             for c in 0..$TC {
                                 *y.add((c0 + c) * self.n_out + r + rr) = o[rr][c];
@@ -849,7 +866,14 @@ impl Q4Matrix {
                         r += 2;
                     }
                     if r < r1 {
-                        let o = simd::q4_dot_rows_tc::<1, $TC>(self.q.as_ptr().add(r * n_in / 2), self.scales.as_ptr().add(r * bpr), n_in, xq, xs, xsums);
+                        let o = simd::q4_dot_rows_tc::<1, $TC>(
+                            self.q.as_ptr().add(r * n_in / 2),
+                            self.scales.as_ptr().add(r * bpr),
+                            n_in,
+                            xq,
+                            xs,
+                            xsums,
+                        );
                         for c in 0..$TC {
                             *y.add((c0 + c) * self.n_out + r) = o[0][c];
                         }
@@ -943,7 +967,10 @@ pub fn matmul_quant_multi<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: 
             assert_eq!(m.n_in(), n_in, "all jobs must share n_in");
             assert_eq!(y.len(), t * m.n_out(), "output shape mismatch");
             total_bytes += m.bytes();
-            QJobRef { m: *m, y: SendPtr(y.as_mut_ptr()) }
+            QJobRef {
+                m: *m,
+                y: SendPtr(y.as_mut_ptr()),
+            }
         })
         .collect();
     let _timer = prof::start(Cat::Matmul);
@@ -1013,7 +1040,7 @@ unsafe fn matmul_quant_block_prefill<M: QMat>(m: &M, x: &[f32], xt: &[f32], t: u
                         let c0 = tile * TN;
                         simd::gemm_8x8::<f32>(sp, n_in, xt.as_ptr().add(tile * n_in * TN), y, n_out, r, c0, (t - c0).min(TN));
                     }
-                } else if n_in % 32 == 0 {
+                } else if n_in.is_multiple_of(32) {
                     let mut c = 0;
                     while c < t {
                         let tc = (t - c).min(4);
@@ -1049,7 +1076,7 @@ pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
     debug_assert_eq!(w.len(), x.len());
     #[cfg(has_simd)]
     {
-        if w.len() % 32 == 0 {
+        if w.len().is_multiple_of(32) {
             let o = unsafe { simd::kernel::<u16, 1, 1, 4, 8>(w.as_ptr(), 0, x.as_ptr(), 0, w.len()) };
             return o[0][0];
         }
@@ -1194,17 +1221,15 @@ where
 pub fn fast_exp(x: f32) -> f32 {
     let x = x.clamp(-87.0, 88.0);
     let fx = (x * std::f32::consts::LOG2_E).round();
-    let r = (x - fx * 0.693_359_375) - fx * -2.121_944_4e-4;
-    let p = 1.0
-        + r * (1.0
-            + r * (0.5 + r * (0.166_666_67 + r * (0.041_666_668 + r * (0.008_333_334 + r * 0.001_388_888_9)))));
+    let r = (x - fx * 0.693_359_4) - fx * -2.121_944_4e-4;
+    let p = 1.0 + r * (1.0 + r * (0.5 + r * (0.166_666_67 + r * (0.041_666_668 + r * (0.008_333_334 + r * 0.001_388_888_9)))));
     f32::from_bits(((fx as i32 + 127) << 23) as u32) * p
 }
 
 /// GELU with tanh approximation (`gelu_pytorch_tanh`): x * sigmoid(2 * sqrt(2/pi) * (x + 0.044715 x^3)).
 #[inline(always)]
 pub fn gelu_tanh(x: f32) -> f32 {
-    const K2: f32 = 2.0 * 0.797_884_560_802_865_4;
+    const K2: f32 = 2.0 * 0.797_884_6;
     let u = K2 * (x + 0.044_715 * x * x * x);
     x / (1.0 + fast_exp(-u))
 }
@@ -1306,7 +1331,7 @@ pub fn softmax_inplace(x: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quant::{quantize_act, quantize_bf16, quantize_q4, dequantize_rows, dequantize_rows_q4};
+    use crate::quant::{dequantize_rows, dequantize_rows_q4, quantize_act, quantize_bf16, quantize_q4};
 
     fn lcg(seed: &mut u64) -> f32 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);

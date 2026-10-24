@@ -18,10 +18,10 @@
 use crate::gpu::{Backend, DeviceWeight, Job, WeightRef};
 use crate::platform::gpu::metal::{Id, Objc, Sel};
 use crate::quant::PAGE;
-use anyhow::{anyhow, bail, Result};
-use std::ffi::{c_void, CStr, CString};
-use std::sync::atomic::{AtomicU64, Ordering};
+use anyhow::{Result, anyhow, bail};
+use std::ffi::{CStr, CString, c_void};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const TILE: usize = 64; // out rows and tokens per threadgroup
@@ -218,7 +218,8 @@ impl<T: dlsym::FnPtr> IntoInnerUnsafe<T> for dlsym::Symbol<'_, T> {
 impl MetalBackend {
     pub fn new() -> Result<Self> {
         let o = Objc::open().map_err(|e| anyhow!(e))?;
-        let foundation = unsafe { dlsym::Library::open("/System/Library/Frameworks/Foundation.framework/Foundation") }.map_err(|e| anyhow!("{e}"))?;
+        let foundation =
+            unsafe { dlsym::Library::open("/System/Library/Frameworks/Foundation.framework/Foundation") }.map_err(|e| anyhow!("{e}"))?;
         let device = o.default_device();
         if device.is_null() {
             bail!("no Metal device");
@@ -228,21 +229,32 @@ impl MetalBackend {
         if queue.is_null() {
             bail!("newCommandQueue failed");
         }
-        let get_class: unsafe extern "C" fn(*const std::ffi::c_char) -> Id = unsafe { o.objc.get(c"objc_getClass") }.map_err(|e| anyhow!("{e}"))?.into_inner_unsafe();
+        let get_class: unsafe extern "C" fn(*const std::ffi::c_char) -> Id = unsafe { o.objc.get(c"objc_getClass") }
+            .map_err(|e| anyhow!("{e}"))?
+            .into_inner_unsafe();
         let nsstring_cls = unsafe { get_class(c"NSString".as_ptr()) };
         let msg_str: unsafe extern "C" fn(Id, Sel, *const std::ffi::c_char) -> Id = o.msg_send();
         let error_text = |err: Id| -> String {
             if err.is_null() {
                 return String::new();
             }
-            o.nsstring_to_string(unsafe { msg0(err, o.sel(c"localizedDescription")) })
+            // SAFETY: `localizedDescription` returns an NSString owned by the NSError.
+            unsafe { o.nsstring_to_string(msg0(err, o.sel(c"localizedDescription"))) }
         };
         // Compile the shader library from source.
         let src = CString::new(SHADER_SRC)?;
         let ns_src = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), src.as_ptr()) };
         let new_lib: MsgNewLib = o.msg_send();
         let mut err: Id = std::ptr::null_mut();
-        let lib = unsafe { new_lib(device, o.sel(c"newLibraryWithSource:options:error:"), ns_src, std::ptr::null_mut(), &mut err) };
+        let lib = unsafe {
+            new_lib(
+                device,
+                o.sel(c"newLibraryWithSource:options:error:"),
+                ns_src,
+                std::ptr::null_mut(),
+                &mut err,
+            )
+        };
         if lib.is_null() {
             bail!("Metal shader compilation failed: {}", error_text(err));
         }
@@ -262,8 +274,12 @@ impl MetalBackend {
             Ok(p)
         };
         let pipes = [pipeline(c"gemm_bf")?, pipeline(c"gemm_q8")?, pipeline(c"gemm_q4")?];
-        let pool_push = unsafe { o.objc.get::<unsafe extern "C" fn() -> *mut c_void>(c"objc_autoreleasePoolPush") }.map_err(|e| anyhow!("{e}"))?.into_inner_unsafe();
-        let pool_pop = unsafe { o.objc.get::<unsafe extern "C" fn(*mut c_void)>(c"objc_autoreleasePoolPop") }.map_err(|e| anyhow!("{e}"))?.into_inner_unsafe();
+        let pool_push = unsafe { o.objc.get::<unsafe extern "C" fn() -> *mut c_void>(c"objc_autoreleasePoolPush") }
+            .map_err(|e| anyhow!("{e}"))?
+            .into_inner_unsafe();
+        let pool_pop = unsafe { o.objc.get::<unsafe extern "C" fn(*mut c_void)>(c"objc_autoreleasePoolPop") }
+            .map_err(|e| anyhow!("{e}"))?
+            .into_inner_unsafe();
         let sels = Sels {
             command_buffer: o.sel(c"commandBuffer"),
             compute_encoder: o.sel(c"computeCommandEncoder"),
@@ -289,7 +305,12 @@ impl MetalBackend {
             device,
             queue,
             pipes,
-            staging: Mutex::new(Staging { x: std::ptr::null_mut(), x_cap: 0, y: std::ptr::null_mut(), y_cap: 0 }),
+            staging: Mutex::new(Staging {
+                x: std::ptr::null_mut(),
+                x_cap: 0,
+                y: std::ptr::null_mut(),
+                y_cap: 0,
+            }),
             sels,
         })
     }
@@ -300,9 +321,21 @@ impl MetalBackend {
         let start = (ptr as usize) & !(PAGE - 1);
         let end = (ptr as usize + len).div_ceil(PAGE) * PAGE;
         let nocopy: MsgNewBufNoCopy = self.o.msg_send();
-        let id = unsafe { nocopy(self.device, self.sels.new_buffer_nocopy, start as *mut c_void, end - start, 0, std::ptr::null_mut()) };
+        let id = unsafe {
+            nocopy(
+                self.device,
+                self.sels.new_buffer_nocopy,
+                start as *mut c_void,
+                end - start,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
         if !id.is_null() {
-            return Some(Buf { id, offset_bytes: ptr as usize - start });
+            return Some(Buf {
+                id,
+                offset_bytes: ptr as usize - start,
+            });
         }
         let copy: MsgNewBufBytes = self.o.msg_send();
         let id = unsafe { copy(self.device, self.sels.new_buffer_bytes, ptr as *const c_void, len, 0) };
@@ -357,18 +390,21 @@ impl Backend for MetalBackend {
     }
 
     fn wants(&self, n_out: usize, n_in: usize, t: usize) -> bool {
-        t >= MIN_T && n_out % TILE == 0 && n_in % 32 == 0 && 2.0 * (t * n_out * n_in) as f64 >= MIN_FLOPS
+        t >= MIN_T && n_out.is_multiple_of(TILE) && n_in.is_multiple_of(32) && 2.0 * (t * n_out * n_in) as f64 >= MIN_FLOPS
     }
 
     fn upload(&self, w: &WeightRef, _n_out: usize, _n_in: usize) -> Option<DeviceWeight> {
         let mw = match w {
-            WeightRef::Bf16(w) => MetalWeight { data: self.wrap(w.as_ptr() as *const u8, w.len() * 2)?, scales: None },
+            WeightRef::Bf16(w) => MetalWeight {
+                data: self.wrap(w.as_ptr() as *const u8, w.len() * 2)?,
+                scales: None,
+            },
             WeightRef::Q8(m) => MetalWeight {
                 data: self.wrap(m.q.as_ptr() as *const u8, m.q.len())?,
                 scales: Some(self.wrap(m.scales.as_ptr() as *const u8, m.scales.len() * 4)?),
             },
             WeightRef::Q4(m) => MetalWeight {
-                data: self.wrap(m.q.as_ptr() as *const u8, m.q.len())?,
+                data: self.wrap(m.q.as_ptr(), m.q.len())?,
                 scales: Some(self.wrap(m.scales.as_ptr() as *const u8, m.scales.len() * 2)?),
             },
         };
@@ -376,7 +412,7 @@ impl Backend for MetalBackend {
     }
 
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool {
-        if jobs.is_empty() || n_in % 32 != 0 || x.len() < t * n_in {
+        if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in {
             return false;
         }
         let t_pad = t.div_ceil(TILE) * TILE;
@@ -425,10 +461,26 @@ impl Backend for MetalBackend {
                 };
                 set_pipe(enc, self.sels.set_pipeline, self.pipes[fi]);
                 set_buf(enc, self.sels.set_buffer, mw.data.id, 0, 0);
-                set_buf(enc, self.sels.set_buffer, mw.scales.as_ref().map(|s| s.id).unwrap_or(mw.data.id), 0, 1);
+                set_buf(
+                    enc,
+                    self.sels.set_buffer,
+                    mw.scales.as_ref().map(|s| s.id).unwrap_or(mw.data.id),
+                    0,
+                    1,
+                );
                 set_buf(enc, self.sels.set_buffer, st.y, y_off * 4, 3);
-                set_bytes(enc, self.sels.set_bytes, &params as *const Params as *const c_void, std::mem::size_of::<Params>(), 4);
-                let groups = MtlSize { w: j.n_out / TILE, h: t_pad / TILE, d: 1 };
+                set_bytes(
+                    enc,
+                    self.sels.set_bytes,
+                    &params as *const Params as *const c_void,
+                    std::mem::size_of::<Params>(),
+                    4,
+                );
+                let groups = MtlSize {
+                    w: j.n_out / TILE,
+                    h: t_pad / TILE,
+                    d: 1,
+                };
                 let threads = MtlSize { w: 128, h: 1, d: 1 };
                 dispatch(enc, self.sels.dispatch, &groups, &threads);
                 y_off += t_pad * j.n_out;

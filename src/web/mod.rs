@@ -5,18 +5,24 @@
 //! implements with WebGPU, and the host wraps them with JSPI (`WebAssembly.Suspending`) so the
 //! synchronous `Backend::matmul` call can wait for the asynchronous buffer readback.
 //!
+//! # Safety
+//! The exports taking pointers are `unsafe`: the host must pass pointers into this module's memory
+//! that are valid for the lengths given (strings and buffers from `web_alloc`), and `*mut usize`
+//! out-parameters must point at writable module memory. `web/src/lib/oxinfer.js` upholds this.
+//!
 //! ABI: strings are (ptr, len) UTF-8 in module memory; buffers for the host are allocated with
 //! `web_alloc` and must be freed with `web_free`. Functions returning `i32` use `< 0` for errors
 //! (the message is available through `web_last_error`).
+#![allow(clippy::missing_safety_doc)] // the contract is documented once above
 
 mod webgpu;
 
-use anyhow::{anyhow, bail, Result};
 use crate::chat::{ChatFormat, GemmaChat, QwenChat};
 use crate::model::{Model, Quant, Session};
 use crate::qwen::{QwenModel, QwenSession};
 use crate::sampler::Sampler;
 use crate::{config, fsx, quant::PageVec, safetensors};
+use anyhow::{Result, anyhow, bail};
 use std::cell::RefCell;
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -116,7 +122,7 @@ pub extern "C" fn web_alloc(len: usize) -> *mut u8 {
 
 /// Frees a buffer from `web_alloc` that was not handed to `web_put_file`.
 #[unsafe(no_mangle)]
-pub extern "C" fn web_free(ptr: *mut u8, len: usize) {
+pub unsafe extern "C" fn web_free(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
         drop(unsafe { PageVec::<u64>::from_raw(ptr as *mut u64, len.div_ceil(8).max(1)) });
     }
@@ -125,7 +131,7 @@ pub extern "C" fn web_free(ptr: *mut u8, len: usize) {
 /// Registers the buffer (from `web_alloc`, `len` valid bytes) as file `path` in the virtual
 /// filesystem; the module takes ownership.
 #[unsafe(no_mangle)]
-pub extern "C" fn web_put_file(path: *const u8, path_len: usize, ptr: *mut u8, len: usize) {
+pub unsafe extern "C" fn web_put_file(path: *const u8, path_len: usize, ptr: *mut u8, len: usize) {
     let path = unsafe { str_arg(path, path_len) }.to_string();
     let v = unsafe { PageVec::<u64>::from_raw(ptr as *mut u64, len.div_ceil(8).max(1)) };
     fsx::put(&path, v, len);
@@ -135,7 +141,7 @@ pub extern "C" fn web_put_file(path: *const u8, path_len: usize, ptr: *mut u8, l
 /// used for lookup-table shards (`*-tables.safetensors`) so they do not count against the 4 GiB
 /// of module memory.
 #[unsafe(no_mangle)]
-pub extern "C" fn web_put_host_file(path: *const u8, path_len: usize, id: u32, len: f64) -> i32 {
+pub unsafe extern "C" fn web_put_host_file(path: *const u8, path_len: usize, id: u32, len: f64) -> i32 {
     let path = unsafe { str_arg(path, path_len) }.to_string();
     if len > usize::MAX as f64 {
         return set_error(&anyhow!("{path}: {len} bytes is too large for a host file in wasm32"));
@@ -149,7 +155,7 @@ pub extern "C" fn web_put_host_file(path: *const u8, path_len: usize, id: u32, l
 /// Loads the model in directory `dir` of the virtual filesystem. `quant`: 0 bf16, 1 q8, 2 q4.
 /// `gpu`: non-zero to use the host's WebGPU implementation for prefill matmuls.
 #[unsafe(no_mangle)]
-pub extern "C" fn web_load(dir: *const u8, dir_len: usize, quant: u32, gpu: u32, prefill_chunk: u32) -> i32 {
+pub unsafe extern "C" fn web_load(dir: *const u8, dir_len: usize, quant: u32, gpu: u32, prefill_chunk: u32) -> i32 {
     install_panic_hook();
     let dir = unsafe { str_arg(dir, dir_len) }.to_string();
     match load(Path::new(&dir), quant, gpu != 0, prefill_chunk as usize) {
@@ -192,6 +198,7 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
         Lm::Qwen(m, _) => (m.cfg.num_hidden_layers, m.cfg.hidden_size, m.streamed_bytes(), m.quant),
     };
     let _ = quant;
+    let eos = crate::chat::with_turn_end(lm.fmt(), &tok, eos);
     log(&format!(
         "[loaded {model_type}: {layers} layers, hidden {hidden}, {:.2} GB checkpoint, {stored:?} weights{} streaming {:.2} GB/token, device {}, {:.2}s]",
         files.total_bytes() as f64 / 1e9,
@@ -206,7 +213,13 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
         eos,
         sampler: Sampler::new(0.0, 0, 1.0, 0),
         // Each GPU batch costs a host round trip, so larger chunks amortize better there.
-        prefill_chunk: if prefill_chunk != 0 { prefill_chunk } else if crate::gpu::active().is_some() { 512 } else { 256 },
+        prefill_chunk: if prefill_chunk != 0 {
+            prefill_chunk
+        } else if crate::gpu::active().is_some() {
+            512
+        } else {
+            256
+        },
         logits: Vec::new(),
         out: Vec::new(),
         turns: 0,
@@ -242,9 +255,20 @@ pub extern "C" fn web_reset() {
 /// Adds a user turn (and, on the first turn, the optional system prompt), runs the prefill and
 /// returns the number of prompt tokens processed. Then call `web_next` until it returns -1.
 #[unsafe(no_mangle)]
-pub extern "C" fn web_chat_turn(user: *const u8, user_len: usize, system: *const u8, system_len: usize, think: u32, max_tokens: u32) -> i32 {
+pub unsafe extern "C" fn web_chat_turn(
+    user: *const u8,
+    user_len: usize,
+    system: *const u8,
+    system_len: usize,
+    think: u32,
+    max_tokens: u32,
+) -> i32 {
     let user = unsafe { str_arg(user, user_len) }.to_string();
-    let system = if system.is_null() || system_len == 0 { None } else { Some(unsafe { str_arg(system, system_len) }.to_string()) };
+    let system = if system.is_null() || system_len == 0 {
+        None
+    } else {
+        Some(unsafe { str_arg(system, system_len) }.to_string())
+    };
     ENGINE.with(|g| {
         let mut g = g.borrow_mut();
         let Some(e) = g.as_mut() else {
@@ -268,7 +292,12 @@ impl Engine {
             text.push_str(&fmt.end_of_model_turn());
         }
         text.push_str(&fmt.user_turn(user, think));
-        let ids = self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec();
+        let ids = self
+            .tok
+            .encode(text.as_str(), false)
+            .map_err(|e| anyhow!("encode: {e}"))?
+            .get_ids()
+            .to_vec();
         self.out.clear();
         self.logits.clear();
         for c in ids.chunks(self.prefill_chunk) {
@@ -313,7 +342,7 @@ pub extern "C" fn web_next() -> i32 {
 /// The reply so far, decoded (valid until the next call into the module); returns the pointer,
 /// the length goes to `*len`.
 #[unsafe(no_mangle)]
-pub extern "C" fn web_text(len: *mut usize) -> *const u8 {
+pub unsafe extern "C" fn web_text(len: *mut usize) -> *const u8 {
     ENGINE.with(|g| {
         let mut g = g.borrow_mut();
         match g.as_mut() {
@@ -332,7 +361,7 @@ pub extern "C" fn web_text(len: *mut usize) -> *const u8 {
 
 /// Last error message (pointer; length to `*len`).
 #[unsafe(no_mangle)]
-pub extern "C" fn web_last_error(len: *mut usize) -> *const u8 {
+pub unsafe extern "C" fn web_last_error(len: *mut usize) -> *const u8 {
     LAST_ERROR.with(|l| {
         let l = l.borrow();
         unsafe { *len = l.len() };
@@ -343,12 +372,17 @@ pub extern "C" fn web_last_error(len: *mut usize) -> *const u8 {
 /// Number of tokens generated in the current turn.
 #[unsafe(no_mangle)]
 pub extern "C" fn web_generated() -> u32 {
-    ENGINE.with(|g| g.borrow().as_ref().map(|e| e.out.iter().filter(|t| !e.eos.contains(t)).count() as u32).unwrap_or(0))
+    ENGINE.with(|g| {
+        g.borrow()
+            .as_ref()
+            .map(|e| e.out.iter().filter(|t| !e.eos.contains(t)).count() as u32)
+            .unwrap_or(0)
+    })
 }
 
 /// GPU statistics line (pointer; length to `*len`), empty without a GPU backend.
 #[unsafe(no_mangle)]
-pub extern "C" fn web_gpu_stats(len: *mut usize) -> *const u8 {
+pub unsafe extern "C" fn web_gpu_stats(len: *mut usize) -> *const u8 {
     ENGINE.with(|g| {
         let mut g = g.borrow_mut();
         match g.as_mut() {

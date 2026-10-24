@@ -9,7 +9,12 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(temperature: f32, top_k: usize, top_p: f32, seed: u64) -> Self {
-        Self { temperature, top_k, top_p, rng: seed.max(1) }
+        Self {
+            temperature,
+            top_k,
+            top_p,
+            rng: seed.max(1),
+        }
     }
 
     fn next_f32(&mut self) -> f32 {
@@ -27,15 +32,23 @@ impl Sampler {
         if self.temperature <= 0.0 {
             return argmax(logits);
         }
-        let k = if self.top_k == 0 { logits.len() } else { self.top_k.min(logits.len()) };
+        let k = if self.top_k == 0 {
+            logits.len()
+        } else {
+            self.top_k.min(logits.len())
+        };
         // Partial selection of the top-k indices.
         let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
         idx.select_nth_unstable_by(k - 1, |&a, &b| {
-            logits[b as usize].partial_cmp(&logits[a as usize]).unwrap_or(std::cmp::Ordering::Equal)
+            logits[b as usize]
+                .partial_cmp(&logits[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         idx.truncate(k);
         idx.sort_unstable_by(|&a, &b| {
-            logits[b as usize].partial_cmp(&logits[a as usize]).unwrap_or(std::cmp::Ordering::Equal)
+            logits[b as usize]
+                .partial_cmp(&logits[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         let inv_t = 1.0 / self.temperature;
         let max = logits[idx[0] as usize];

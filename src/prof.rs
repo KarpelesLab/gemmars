@@ -1,7 +1,7 @@
 //! Lightweight always-on profiler: accumulated wall time per category.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use crate::clock::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -49,7 +49,10 @@ pub fn reset() {
 }
 
 pub fn report(total_secs: f64, tokens: usize) {
-    eprintln!("[profile over {tokens} forward tokens, {:.1} ms/token]", total_secs * 1e3 / tokens.max(1) as f64);
+    eprintln!(
+        "[profile over {tokens} forward tokens, {:.1} ms/token]",
+        total_secs * 1e3 / tokens.max(1) as f64
+    );
     if let Some(s) = crate::gpu::active().and_then(|b| b.stats()) {
         eprintln!("  gpu: {s}");
     }

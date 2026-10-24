@@ -41,7 +41,11 @@ const MIN_FLOPS: f64 = 1e8;
 
 pub fn install() {
     if unsafe { gpu_available() } != 0 {
-        crate::gpu::install(Some(Box::new(WebGpuBackend { calls: AtomicU64::new(0), flops: AtomicU64::new(0), micros: AtomicU64::new(0) })));
+        crate::gpu::install(Some(Box::new(WebGpuBackend {
+            calls: AtomicU64::new(0),
+            flops: AtomicU64::new(0),
+            micros: AtomicU64::new(0),
+        })));
     } else {
         super::log("[webgpu: not available on this host (no adapter or no JSPI); using CPU]");
     }
@@ -52,14 +56,38 @@ impl Backend for WebGpuBackend {
         "webgpu"
     }
     fn wants(&self, n_out: usize, n_in: usize, t: usize) -> bool {
-        t >= MIN_T && n_out % 64 == 0 && n_in % 32 == 0 && 2.0 * t as f64 * n_out as f64 * n_in as f64 >= MIN_FLOPS
+        t >= MIN_T && n_out.is_multiple_of(64) && n_in.is_multiple_of(32) && 2.0 * t as f64 * n_out as f64 * n_in as f64 >= MIN_FLOPS
     }
     fn upload(&self, w: &WeightRef, n_out: usize, n_in: usize) -> Option<DeviceWeight> {
         let h = unsafe {
             match w {
-                WeightRef::Bf16(w) => gpu_upload(0, w.as_ptr() as *const u8, w.len() * 2, std::ptr::null(), 0, n_out as u32, n_in as u32),
-                WeightRef::Q8(m) => gpu_upload(1, m.q.as_ptr() as *const u8, m.q.len(), m.scales.as_ptr() as *const u8, m.scales.len() * 4, n_out as u32, n_in as u32),
-                WeightRef::Q4(m) => gpu_upload(2, m.q.as_ptr(), m.q.len(), m.scales.as_ptr() as *const u8, m.scales.len() * 2, n_out as u32, n_in as u32),
+                WeightRef::Bf16(w) => gpu_upload(
+                    0,
+                    w.as_ptr() as *const u8,
+                    w.len() * 2,
+                    std::ptr::null(),
+                    0,
+                    n_out as u32,
+                    n_in as u32,
+                ),
+                WeightRef::Q8(m) => gpu_upload(
+                    1,
+                    m.q.as_ptr() as *const u8,
+                    m.q.len(),
+                    m.scales.as_ptr() as *const u8,
+                    m.scales.len() * 4,
+                    n_out as u32,
+                    n_in as u32,
+                ),
+                WeightRef::Q4(m) => gpu_upload(
+                    2,
+                    m.q.as_ptr(),
+                    m.q.len(),
+                    m.scales.as_ptr() as *const u8,
+                    m.scales.len() * 2,
+                    n_out as u32,
+                    n_in as u32,
+                ),
             }
         };
         if h < 0 {
@@ -71,7 +99,12 @@ impl Backend for WebGpuBackend {
         let t0 = crate::clock::Instant::now();
         let descs: Vec<JobDesc> = jobs
             .iter_mut()
-            .map(|j| JobDesc { handle: j.dev.downcast_ref::<Handle>().map(|h| h.0 as u32).unwrap_or(u32::MAX), n_out: j.n_out as u32, y: j.y.as_mut_ptr() as u32, _pad: 0 })
+            .map(|j| JobDesc {
+                handle: j.dev.downcast_ref::<Handle>().map(|h| h.0 as u32).unwrap_or(u32::MAX),
+                n_out: j.n_out as u32,
+                y: j.y.as_mut_ptr() as u32,
+                _pad: 0,
+            })
             .collect();
         if descs.iter().any(|d| d.handle == u32::MAX) {
             return false;
@@ -93,6 +126,11 @@ impl Backend for WebGpuBackend {
             return None;
         }
         let secs = self.micros.load(Ordering::Relaxed) as f64 / 1e6;
-        Some(format!("{calls} batches, {:.2} GFLOP in {:.3}s = {:.0} GFLOP/s incl. host round trips", self.flops.load(Ordering::Relaxed) as f64 / 1e9, secs, self.flops.load(Ordering::Relaxed) as f64 / 1e9 / secs))
+        Some(format!(
+            "{calls} batches, {:.2} GFLOP in {:.3}s = {:.0} GFLOP/s incl. host round trips",
+            self.flops.load(Ordering::Relaxed) as f64 / 1e9,
+            secs,
+            self.flops.load(Ordering::Relaxed) as f64 / 1e9 / secs
+        ))
     }
 }

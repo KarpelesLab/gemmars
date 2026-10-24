@@ -31,8 +31,11 @@ impl<T: Copy> PageVec<T> {
     pub fn alloc_bytes(&self) -> usize {
         self.bytes
     }
-    /// Rebuilds a `PageVec` from a pointer obtained by forgetting one created with `zeroed(len)`
-    /// (same `len`).
+    /// Rebuilds a `PageVec` from a pointer obtained by forgetting one created with `zeroed(len)`.
+    ///
+    /// # Safety
+    /// `ptr` must come from `PageVec::<T>::zeroed(len)` with the same `len`, forgotten with
+    /// `std::mem::forget`, and must not be rebuilt twice.
     pub unsafe fn from_raw(ptr: *mut T, len: usize) -> Self {
         let bytes = (len * std::mem::size_of::<T>()).div_ceil(PAGE).max(1) * PAGE;
         Self { ptr, len, bytes }
@@ -72,7 +75,11 @@ impl<T: Copy> QBuf<T> {
     /// # Safety
     /// `s` must stay valid and unmodified for as long as the returned buffer is used.
     pub unsafe fn borrowed(s: &[T]) -> Self {
-        Self { ptr: s.as_ptr(), len: s.len(), _own: None }
+        Self {
+            ptr: s.as_ptr(),
+            len: s.len(),
+            _own: None,
+        }
     }
     pub fn is_borrowed(&self) -> bool {
         self._own.is_none()
@@ -80,7 +87,11 @@ impl<T: Copy> QBuf<T> {
 }
 impl<T: Copy> From<PageVec<T>> for QBuf<T> {
     fn from(v: PageVec<T>) -> Self {
-        Self { ptr: v.as_ptr(), len: v.len(), _own: Some(v) }
+        Self {
+            ptr: v.as_ptr(),
+            len: v.len(),
+            _own: Some(v),
+        }
     }
 }
 impl<T: Copy> Deref for QBuf<T> {
@@ -137,7 +148,7 @@ impl<T> SendPtr<T> {
 /// Quantizes a bf16 row-major matrix. Symmetric round-to-nearest, scale = absmax / 127 per block.
 pub fn quantize_bf16(w: &[u16], n_out: usize, n_in: usize) -> QMatrix {
     assert_eq!(w.len(), n_out * n_in);
-    assert!(n_in % QBLOCK == 0, "n_in must be a multiple of {QBLOCK}");
+    assert!(n_in.is_multiple_of(QBLOCK), "n_in must be a multiple of {QBLOCK}");
     let bpr = n_in / QBLOCK;
     let mut q = PageVec::<i8>::zeroed(n_out * n_in);
     let mut scales = PageVec::<f32>::zeroed(n_out * bpr);
@@ -169,7 +180,12 @@ pub fn quantize_bf16(w: &[u16], n_out: usize, n_in: usize) -> QMatrix {
             }
         }
     });
-    QMatrix { q: q.into(), scales: scales.into(), n_out, n_in }
+    QMatrix {
+        q: q.into(),
+        scales: scales.into(),
+        n_out,
+        n_in,
+    }
 }
 
 /// Quantized activations `[t, n_in]`: int8 values and one scale per block.
@@ -185,7 +201,7 @@ pub struct QAct {
 
 pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
     assert_eq!(x.len(), t * n_in);
-    assert!(n_in % QBLOCK == 0);
+    assert!(n_in.is_multiple_of(QBLOCK));
     let bpr = n_in / QBLOCK;
     let mut q = vec![0i8; t * n_in];
     let mut scales = vec![0f32; t * bpr];
@@ -256,7 +272,7 @@ fn f32_to_f16(x: f32) -> u16 {
 
 pub fn quantize_q4(w: &[u16], n_out: usize, n_in: usize) -> Q4Matrix {
     assert_eq!(w.len(), n_out * n_in);
-    assert!(n_in % QBLOCK == 0);
+    assert!(n_in.is_multiple_of(QBLOCK));
     let bpr = n_in / QBLOCK;
     let mut q = PageVec::<u8>::zeroed(n_out * n_in / 2);
     let mut scales = PageVec::<u16>::zeroed(n_out * bpr);
@@ -294,7 +310,12 @@ pub fn quantize_q4(w: &[u16], n_out: usize, n_in: usize) -> Q4Matrix {
             }
         }
     });
-    Q4Matrix { q: q.into(), scales: scales.into(), n_out, n_in }
+    Q4Matrix {
+        q: q.into(),
+        scales: scales.into(),
+        n_out,
+        n_in,
+    }
 }
 
 /// Dequantizes rows `r0..r1` of `m` into `out` (f32 row-major).

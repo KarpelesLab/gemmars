@@ -5,8 +5,8 @@ use crate::kernels::*;
 use crate::mm_config::AudioConfig;
 use crate::pool;
 use crate::safetensors::ModelFiles;
-use crate::vision::{load_clip_lin, ClipLin};
-use anyhow::{bail, Context, Result};
+use crate::vision::{ClipLin, load_clip_lin};
+use anyhow::{Context, Result, bail};
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const N_MELS: usize = 128;
@@ -45,7 +45,9 @@ fn mel_to_hertz(m: f64) -> f64 {
 fn mel_filters() -> Vec<f32> {
     let bins = FFT / 2 + 1;
     let (mmin, mmax) = (hertz_to_mel(0.0), hertz_to_mel(8000.0));
-    let mel_freqs: Vec<f64> = (0..N_MELS + 2).map(|i| mmin + (mmax - mmin) * i as f64 / (N_MELS + 1) as f64).collect();
+    let mel_freqs: Vec<f64> = (0..N_MELS + 2)
+        .map(|i| mmin + (mmax - mmin) * i as f64 / (N_MELS + 1) as f64)
+        .collect();
     let filt: Vec<f64> = mel_freqs.iter().map(|&m| mel_to_hertz(m)).collect();
     let fft_freqs: Vec<f64> = (0..bins).map(|i| (SAMPLE_RATE / 2) as f64 * i as f64 / (bins - 1) as f64).collect();
     let mut out = vec![0f32; bins * N_MELS];
@@ -102,7 +104,10 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
 pub fn mel_features(pcm: &[f32]) -> Vec<f32> {
     let t = num_mel_frames(pcm.len());
     let filters = mel_filters();
-    let window: Vec<f32> = (0..FRAME).map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / FRAME as f64).cos()).map(|v| v as f32).collect();
+    let window: Vec<f32> = (0..FRAME)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / FRAME as f64).cos())
+        .map(|v| v as f32)
+        .collect();
     let pad_left = FRAME / 2;
     let mut out = vec![0f32; t * N_MELS];
     let mut re = vec![0f32; FFT];
@@ -112,7 +117,11 @@ pub fn mel_features(pcm: &[f32]) -> Vec<f32> {
         im.fill(0.0);
         for i in 0..FRAME {
             let idx = f * HOP + i;
-            let s = if idx < pad_left { 0.0 } else { pcm.get(idx - pad_left).copied().unwrap_or(0.0) };
+            let s = if idx < pad_left {
+                0.0
+            } else {
+                pcm.get(idx - pad_left).copied().unwrap_or(0.0)
+            };
             re[i] = s * window[i];
         }
         fft(&mut re, &mut im);
@@ -160,14 +169,14 @@ struct ALayer<'a> {
 
 pub struct AudioTower<'a> {
     pub cfg: AudioConfig,
-    conv0: &'a [u16], // [C0, 1, 3, 3]
-    norm0: &'a [u16], // [C0]
-    conv1: &'a [u16], // [C1, C0, 3, 3]
-    norm1: &'a [u16], // [C1]
+    conv0: &'a [u16],      // [C0, 1, 3, 3]
+    norm0: &'a [u16],      // [C0]
+    conv1: &'a [u16],      // [C1, C0, 3, 3]
+    norm1: &'a [u16],      // [C1]
     input_proj: &'a [u16], // [H, (128/4)*C1]
     layers: Vec<ALayer<'a>>,
-    out_w: &'a [u16], // [out_dims, H]
-    out_b: &'a [u16], // [out_dims]
+    out_w: &'a [u16],      // [out_dims, H]
+    out_b: &'a [u16],      // [out_dims]
     embed_proj: &'a [u16], // [text_hidden, out_dims]
     pub text_hidden: usize,
 }
@@ -463,7 +472,18 @@ fn ln_relu(x: Vec<f32>, c: usize, m: usize, w: &[u16], eps: f32) -> Vec<f32> {
 /// Chunked local attention collapsed to its equivalent: each query attends to keys with
 /// `0 <= q - kv < window`, with a relative-position bias `q . relk[q - kv]`, tanh soft-capped.
 #[allow(clippy::too_many_arguments)]
-fn local_attention(q: &[f32], k: &[f32], v: &[f32], relk: &[f32], n: usize, nh: usize, hd: usize, window: usize, cap: f32, out: &mut [f32]) {
+fn local_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    relk: &[f32],
+    n: usize,
+    nh: usize,
+    hd: usize,
+    window: usize,
+    cap: f32,
+    out: &mut [f32],
+) {
     let h = nh * hd;
     let op = SendPtrF(out.as_mut_ptr());
     pool::run(n * nh, &|idx| {

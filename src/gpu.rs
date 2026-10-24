@@ -69,9 +69,13 @@ pub fn init(plat: &crate::platform::Platform, pref: crate::platform::DevicePref)
         Some(g) => {
             let r: Result<Box<dyn Backend>, String> = match g.kind {
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
-                crate::platform::GpuKind::Metal => crate::metal::MetalBackend::new().map(|b| Box::new(b) as Box<dyn Backend>).map_err(|e| e.to_string()),
+                crate::platform::GpuKind::Metal => crate::metal::MetalBackend::new()
+                    .map(|b| Box::new(b) as Box<dyn Backend>)
+                    .map_err(|e| e.to_string()),
                 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
-                crate::platform::GpuKind::Cuda => crate::cuda::CudaBackend::new(g.index).map(|b| Box::new(b) as Box<dyn Backend>).map_err(|e| e.to_string()),
+                crate::platform::GpuKind::Cuda => crate::cuda::CudaBackend::new(g.index)
+                    .map(|b| Box::new(b) as Box<dyn Backend>)
+                    .map_err(|e| e.to_string()),
                 _ => Err(format!("{} compute is not implemented in this build", g.kind.as_str())),
             };
             match r {

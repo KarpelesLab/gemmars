@@ -4,18 +4,18 @@
 
 use crate::config::QwenConfig;
 use crate::kernels::*;
-use crate::model::{attention, linear, linear_multi, load_lin, table_quant, LayerCache, Lin, Quant, Table};
+use crate::model::{LayerCache, Lin, Quant, Table, attention, linear, linear_multi, load_lin, table_quant};
 use crate::pool;
 use crate::prof::{self, Cat};
 use crate::safetensors::ModelFiles;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 struct Gdn<'a> {
-    qkv: Lin<'a>, // [2*key_dim + value_dim, H]
-    z: Lin<'a>,   // [value_dim, H]
-    b: Lin<'a>,   // [n_v, H]
-    a: Lin<'a>,   // [n_v, H]
-    conv_w: Vec<f32>,   // [conv_dim, K]
+    qkv: Lin<'a>,         // [2*key_dim + value_dim, H]
+    z: Lin<'a>,           // [value_dim, H]
+    b: Lin<'a>,           // [n_v, H]
+    a: Lin<'a>,           // [n_v, H]
+    conv_w: Vec<f32>,     // [conv_dim, K]
     decay_coef: Vec<f32>, // -exp(A_log) per v head
     dt_bias: Vec<f32>,
     norm_w: Vec<f32>, // [hd_v], plain weight (gated norm)
@@ -98,8 +98,8 @@ impl<'a> QwenModel<'a> {
             }
             let b = files.bytes(full)?;
             Ok(match info.dtype.as_str() {
-                "BF16" => b.chunks_exact(2).map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-                "F32" => b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                "BF16" => b.as_chunks::<2>().0.iter().map(|c| bf16_to_f32(u16::from_le_bytes(*c))).collect(),
+                "F32" => b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect(),
                 other => bail!("tensor {full} has dtype {other}, expected BF16 or F32"),
             })
         };
@@ -107,7 +107,13 @@ impl<'a> QwenModel<'a> {
 
         let tied = cfg.tie_word_embeddings || !has("lm_head.weight");
         // Lookups use the head's precision when tied (one copy in a pre-quantized file), else bf16.
-        let embed = Table::load(files, &format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h, if tied { quant } else { table_quant(quant) })?;
+        let embed = Table::load(
+            files,
+            &format!("{prefix}embed_tokens.weight"),
+            cfg.vocab_size,
+            h,
+            if tied { quant } else { table_quant(quant) },
+        )?;
         let lm_head = if tied {
             lin(&format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h)?
         } else {
@@ -116,7 +122,12 @@ impl<'a> QwenModel<'a> {
         let final_norm = one_plus(get(&format!("{prefix}norm.weight"), &[h])?);
 
         let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
-        let (nk, nv, hdk, hdv) = (cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim);
+        let (nk, nv, hdk, hdv) = (
+            cfg.linear_num_key_heads,
+            cfg.linear_num_value_heads,
+            cfg.linear_key_head_dim,
+            cfg.linear_value_head_dim,
+        );
         let (key_dim, value_dim) = (nk * hdk, nv * hdv);
         let conv_dim = 2 * key_dim + value_dim;
         let kc = cfg.linear_conv_kernel_dim;
@@ -162,8 +173,18 @@ impl<'a> QwenModel<'a> {
         }
         let rot = cfg.rotary_dim();
         let theta = cfg.rope_theta();
-        let inv_freq: Vec<f32> = (0..rot / 2).map(|i| (1.0 / theta.powf((2 * i) as f64 / rot as f64)) as f32).collect();
-        Ok(Self { cfg, quant, embed, layers, final_norm, lm_head, inv_freq })
+        let inv_freq: Vec<f32> = (0..rot / 2)
+            .map(|i| (1.0 / theta.powf((2 * i) as f64 / rot as f64)) as f32)
+            .collect();
+        Ok(Self {
+            cfg,
+            quant,
+            embed,
+            layers,
+            final_norm,
+            lm_head,
+            inv_freq,
+        })
     }
 
     pub fn streamed_bytes(&self) -> usize {
@@ -269,7 +290,16 @@ impl<'a> QwenModel<'a> {
         let mut qg = vec![0f32; t * qw];
         let mut k = vec![0f32; t * nkv * hd];
         let mut v = vec![0f32; t * nkv * hd];
-        linear_multi(&mut [(&at.q, qw, &mut qg[..]), (&at.k, nkv * hd, &mut k[..]), (&at.v, nkv * hd, &mut v[..])], h, hn, t);
+        linear_multi(
+            &mut [
+                (&at.q, qw, &mut qg[..]),
+                (&at.k, nkv * hd, &mut k[..]),
+                (&at.v, nkv * hd, &mut v[..]),
+            ],
+            h,
+            hn,
+            t,
+        );
 
         // Split query / gate, norm, partial RoPE, fold in the 1/sqrt(hd) scaling.
         let scale = (hd as f32).powf(-0.5);
@@ -283,9 +313,17 @@ impl<'a> QwenModel<'a> {
                 let (ti, hh) = (i / nh, i % nh);
                 // SAFETY: disjoint (token, head) slices.
                 let qo = unsafe { std::slice::from_raw_parts_mut(qp.get().add(i * hd), hd) };
-                let src = if gated { &qg[ti * qw + hh * 2 * hd..ti * qw + hh * 2 * hd + hd] } else { &qg[ti * qw + hh * hd..ti * qw + (hh + 1) * hd] };
+                let src = if gated {
+                    &qg[ti * qw + hh * 2 * hd..ti * qw + hh * 2 * hd + hd]
+                } else {
+                    &qg[ti * qw + hh * hd..ti * qw + (hh + 1) * hd]
+                };
                 rmsnorm_f32w(src, &at.q_norm, eps, qo);
-                apply_rope(&mut qo[..2 * half], &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half]);
+                apply_rope(
+                    &mut qo[..2 * half],
+                    &cos[ti * half..(ti + 1) * half],
+                    &sin[ti * half..(ti + 1) * half],
+                );
                 for v in qo.iter_mut() {
                     *v *= scale;
                 }
@@ -306,7 +344,11 @@ impl<'a> QwenModel<'a> {
         for_chunks(&mut kn, hd, par, |i, ko| {
             let ti = i / nkv;
             rmsnorm_f32w(&k[i * hd..(i + 1) * hd], &at.k_norm, eps, ko);
-            apply_rope(&mut ko[..2 * half], &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half]);
+            apply_rope(
+                &mut ko[..2 * half],
+                &cos[ti * half..(ti + 1) * half],
+                &sin[ti * half..(ti + 1) * half],
+            );
         });
         cache.push(&kn, &v, t);
         let mut att = vec![0f32; t * nh * hd];
@@ -323,7 +365,12 @@ impl<'a> QwenModel<'a> {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps as f32;
-        let (nk, nv, hdk, hdv) = (cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim);
+        let (nk, nv, hdk, hdv) = (
+            cfg.linear_num_key_heads,
+            cfg.linear_num_value_heads,
+            cfg.linear_key_head_dim,
+            cfg.linear_value_head_dim,
+        );
         let (key_dim, value_dim) = (nk * hdk, nv * hdv);
         let conv_dim = 2 * key_dim + value_dim;
         let kc = cfg.linear_conv_kernel_dim;
@@ -333,7 +380,17 @@ impl<'a> QwenModel<'a> {
         let mut z = vec![0f32; t * value_dim];
         let mut b = vec![0f32; t * nv];
         let mut a = vec![0f32; t * nv];
-        linear_multi(&mut [(&gd.qkv, conv_dim, &mut qkv[..]), (&gd.z, value_dim, &mut z[..]), (&gd.b, nv, &mut b[..]), (&gd.a, nv, &mut a[..])], h, hn, t);
+        linear_multi(
+            &mut [
+                (&gd.qkv, conv_dim, &mut qkv[..]),
+                (&gd.z, value_dim, &mut z[..]),
+                (&gd.b, nv, &mut b[..]),
+                (&gd.a, nv, &mut a[..]),
+            ],
+            h,
+            hn,
+            t,
+        );
 
         // Causal depthwise conv over time (kernel kc, left context from the state), then SiLU.
         let _timer = prof::start(Cat::Attention);
@@ -341,7 +398,11 @@ impl<'a> QwenModel<'a> {
         {
             let st_conv = &st.conv;
             let src = |i: isize, ch: usize| -> f32 {
-                if i >= 0 { qkv[i as usize * conv_dim + ch] } else { st_conv[((kc as isize - 1 + i) as usize) * conv_dim + ch] }
+                if i >= 0 {
+                    qkv[i as usize * conv_dim + ch]
+                } else {
+                    st_conv[((kc as isize - 1 + i) as usize) * conv_dim + ch]
+                }
             };
             for_chunks(&mut c, conv_dim, t > 1, |i, row| {
                 for ch in 0..conv_dim {
@@ -361,7 +422,8 @@ impl<'a> QwenModel<'a> {
                 // slot 0 is the oldest kept input: time index t - keep + slot
                 let ti = t as isize - keep as isize + slot as isize;
                 if ti >= 0 {
-                    new_state[slot * conv_dim..(slot + 1) * conv_dim].copy_from_slice(&qkv[ti as usize * conv_dim..(ti as usize + 1) * conv_dim]);
+                    new_state[slot * conv_dim..(slot + 1) * conv_dim]
+                        .copy_from_slice(&qkv[ti as usize * conv_dim..(ti as usize + 1) * conv_dim]);
                 } else {
                     let old = (keep as isize + ti) as usize;
                     new_state[slot * conv_dim..(slot + 1) * conv_dim].copy_from_slice(&st.conv[old * conv_dim..(old + 1) * conv_dim]);

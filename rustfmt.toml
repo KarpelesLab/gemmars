@@ -1,0 +1,2 @@
+# The kernels and loaders favour long, flat lines; wrapping them at 100 hurt readability.
+max_width = 140

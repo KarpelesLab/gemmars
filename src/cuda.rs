@@ -10,10 +10,10 @@
 //! This backend is compile-checked but has not been run on NVIDIA hardware yet.
 
 use crate::gpu::{Backend, DeviceWeight, Job, WeightRef};
-use anyhow::{anyhow, bail, Result};
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::atomic::{AtomicU64, Ordering};
+use anyhow::{Result, anyhow, bail};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const TILE: usize = 64;
@@ -201,14 +201,19 @@ impl CudaBackend {
             cu.cuDeviceGetAttribute(&mut minor, 76, dev);
         }
         let mut ctx: *mut c_void = std::ptr::null_mut();
-        check(&cu, unsafe { cu.cuDevicePrimaryCtxRetain(&mut ctx, dev) }, "cuDevicePrimaryCtxRetain")?;
+        check(
+            &cu,
+            unsafe { cu.cuDevicePrimaryCtxRetain(&mut ctx, dev) },
+            "cuDevicePrimaryCtxRetain",
+        )?;
         check(&cu, unsafe { cu.cuCtxSetCurrent(ctx) }, "cuCtxSetCurrent")?;
 
         // Compile the kernels for this device with NVRTC.
         let nvrtc = {
             use dlsym::Bindings;
             // SAFETY: as above.
-            unsafe { Nvrtc::open_first(NVRTC_CANDIDATES.iter().copied()) }.map_err(|e| anyhow!("libnvrtc (ships with the CUDA toolkit): {e}"))?
+            unsafe { Nvrtc::open_first(NVRTC_CANDIDATES.iter().copied()) }
+                .map_err(|e| anyhow!("libnvrtc (ships with the CUDA toolkit): {e}"))?
         };
         let src = CString::new(KERNEL_SRC)?;
         let name = CString::new("oxinfer.cu")?;
@@ -237,16 +242,29 @@ impl CudaBackend {
             ptx.push(0);
         }
         let mut module: *mut c_void = std::ptr::null_mut();
-        check(&cu, unsafe { cu.cuModuleLoadData(&mut module, ptx.as_ptr() as *const c_void) }, "cuModuleLoadData")?;
+        check(
+            &cu,
+            unsafe { cu.cuModuleLoadData(&mut module, ptx.as_ptr() as *const c_void) },
+            "cuModuleLoadData",
+        )?;
         let mut funcs = [std::ptr::null_mut(); 3];
         for (i, fname) in [c"gemm_bf", c"gemm_q8", c"gemm_q4"].iter().enumerate() {
-            check(&cu, unsafe { cu.cuModuleGetFunction(&mut funcs[i], module, fname.as_ptr()) }, "cuModuleGetFunction")?;
+            check(
+                &cu,
+                unsafe { cu.cuModuleGetFunction(&mut funcs[i], module, fname.as_ptr()) },
+                "cuModuleGetFunction",
+            )?;
         }
         Ok(Self {
             cu,
             _module: module,
             funcs,
-            staging: Mutex::new(Staging { x: 0, x_cap: 0, y: 0, y_cap: 0 }),
+            staging: Mutex::new(Staging {
+                x: 0,
+                x_cap: 0,
+                y: 0,
+                y_cap: 0,
+            }),
             stats: Stats::default(),
             name: format!("cuda (sm_{major}{minor})"),
         })
@@ -329,12 +347,15 @@ impl Backend for CudaBackend {
     }
 
     fn wants(&self, n_out: usize, n_in: usize, t: usize) -> bool {
-        t >= MIN_T && n_out % TILE == 0 && n_in % 32 == 0 && 2.0 * (t * n_out * n_in) as f64 >= MIN_FLOPS
+        t >= MIN_T && n_out.is_multiple_of(TILE) && n_in.is_multiple_of(32) && 2.0 * (t * n_out * n_in) as f64 >= MIN_FLOPS
     }
 
     fn upload(&self, w: &WeightRef, _n_out: usize, _n_in: usize) -> Option<DeviceWeight> {
         let cw = match w {
-            WeightRef::Bf16(w) => CudaWeight { data: self.upload_bytes(w.as_ptr() as *const u8, w.len() * 2)?, scales: 0 },
+            WeightRef::Bf16(w) => CudaWeight {
+                data: self.upload_bytes(w.as_ptr() as *const u8, w.len() * 2)?,
+                scales: 0,
+            },
             WeightRef::Q8(m) => {
                 let data = self.upload_bytes(m.q.as_ptr() as *const u8, m.q.len())?;
                 let scales = match self.upload_bytes(m.scales.as_ptr() as *const u8, m.scales.len() * 4) {
@@ -347,7 +368,7 @@ impl Backend for CudaBackend {
                 CudaWeight { data, scales }
             }
             WeightRef::Q4(m) => {
-                let data = self.upload_bytes(m.q.as_ptr() as *const u8, m.q.len())?;
+                let data = self.upload_bytes(m.q.as_ptr(), m.q.len())?;
                 let scales = match self.upload_bytes(m.scales.as_ptr() as *const u8, m.scales.len() * 2) {
                     Some(s) => s,
                     None => {
@@ -362,7 +383,7 @@ impl Backend for CudaBackend {
     }
 
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool {
-        if jobs.is_empty() || n_in % 32 != 0 || x.len() < t * n_in {
+        if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in {
             return false;
         }
         let t_pad = t.div_ceil(TILE) * TILE;
@@ -384,7 +405,11 @@ impl Backend for CudaBackend {
             }
             if t_pad > t {
                 let zeros = vec![0f32; (t_pad - t) * n_in];
-                if self.cu.cuMemcpyHtoD_v2(st.x + (t * n_in * 4) as u64, zeros.as_ptr() as *const c_void, zeros.len() * 4) != 0 {
+                if self
+                    .cu
+                    .cuMemcpyHtoD_v2(st.x + (t * n_in * 4) as u64, zeros.as_ptr() as *const c_void, zeros.len() * 4)
+                    != 0
+                {
                     return false;
                 }
             }
@@ -439,7 +464,11 @@ impl Backend for CudaBackend {
         let t2 = Instant::now();
         let mut y_off = 0usize;
         for j in jobs.iter_mut() {
-            if unsafe { self.cu.cuMemcpyDtoH_v2(j.y.as_mut_ptr() as *mut c_void, st.y + (y_off * 4) as u64, t * j.n_out * 4) } != 0 {
+            if unsafe {
+                self.cu
+                    .cuMemcpyDtoH_v2(j.y.as_mut_ptr() as *mut c_void, st.y + (y_off * 4) as u64, t * j.n_out * 4)
+            } != 0
+            {
                 return false;
             }
             y_off += t_pad * j.n_out;

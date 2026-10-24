@@ -1,6 +1,6 @@
 //! Gemma 4 text-model configuration, parsed from HuggingFace `config.json`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -122,14 +122,19 @@ impl TextConfig {
     }
 
     pub fn layer_head_dim(&self, layer: usize) -> usize {
-        if self.is_sliding(layer) { self.head_dim } else { self.global_head_dim }
+        if self.is_sliding(layer) {
+            self.head_dim
+        } else {
+            self.global_head_dim
+        }
     }
 
     pub fn layer_n_kv(&self, layer: usize) -> usize {
-        if !self.is_sliding(layer) && self.attention_k_eq_v {
-            if let Some(n) = self.num_global_key_value_heads {
-                return n;
-            }
+        if !self.is_sliding(layer)
+            && self.attention_k_eq_v
+            && let Some(n) = self.num_global_key_value_heads
+        {
+            return n;
         }
         self.num_key_value_heads
     }
@@ -190,9 +195,15 @@ impl TextConfig {
             },
             None => {
                 if sliding {
-                    RopeSpec { theta: 10_000.0, proportion: 1.0 }
+                    RopeSpec {
+                        theta: 10_000.0,
+                        proportion: 1.0,
+                    }
                 } else {
-                    RopeSpec { theta: 1_000_000.0, proportion: 0.25 }
+                    RopeSpec {
+                        theta: 1_000_000.0,
+                        proportion: 0.25,
+                    }
                 }
             }
         }
@@ -203,19 +214,29 @@ impl TextConfig {
     }
 }
 
-/// Stop tokens from `generation_config.json` (falls back to `<eos>` and `<turn|>`).
+/// Stop tokens: `eos_token_id` from `generation_config.json`, else from `config.json` (root or
+/// `text_config`), else Gemma's `<eos>` and `<turn|>`. Callers add the chat format's end-of-turn
+/// token on top (`chat::with_turn_end`), since some checkpoints only list the base model's EOS.
 pub fn load_eos_ids(dir: &Path) -> Vec<u32> {
-    let path = dir.join("generation_config.json");
-    if let Ok(b) = crate::fsx::read(&path) {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
-            match &v["eos_token_id"] {
-                serde_json::Value::Number(n) => return vec![n.as_u64().unwrap() as u32],
-                serde_json::Value::Array(a) => {
-                    return a.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect();
-                }
-                _ => {}
-            }
+    fn ids(v: &serde_json::Value) -> Option<Vec<u32>> {
+        match v {
+            serde_json::Value::Number(n) => n.as_u64().map(|x| vec![x as u32]),
+            serde_json::Value::Array(a) => Some(a.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect()),
+            _ => None,
         }
+    }
+    let read = |name: &str| {
+        crate::fsx::read(&dir.join(name))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    };
+    if let Some(found) = read("generation_config.json").and_then(|v| ids(&v["eos_token_id"])) {
+        return found;
+    }
+    if let Some(v) = read("config.json")
+        && let Some(found) = ids(&v["eos_token_id"]).or_else(|| ids(&v["text_config"]["eos_token_id"]))
+    {
+        return found;
     }
     vec![1, 106]
 }
@@ -226,7 +247,12 @@ pub fn model_type(dir: &Path) -> Result<String> {
     raw.get("model_type")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| raw.get("text_config").and_then(|t| t.get("model_type")).and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .or_else(|| {
+            raw.get("text_config")
+                .and_then(|t| t.get("model_type"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
         .context("config.json has no model_type")
 }
 
@@ -317,7 +343,12 @@ impl QwenConfig {
     }
     /// Number of rotated dimensions per head (partial RoPE).
     pub fn rotary_dim(&self) -> usize {
-        let f = self.rope_parameters.as_ref().and_then(|r| r.partial_rotary_factor).or(self.partial_rotary_factor).unwrap_or(1.0);
+        let f = self
+            .rope_parameters
+            .as_ref()
+            .and_then(|r| r.partial_rotary_factor)
+            .or(self.partial_rotary_factor)
+            .unwrap_or(1.0);
         (self.head_dim as f64 * f) as usize
     }
 }

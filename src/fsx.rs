@@ -94,7 +94,9 @@ mod imp {
     pub fn read(path: &Path) -> Result<Vec<u8>> {
         FILES.with(|f| {
             let f = f.borrow();
-            let (v, n) = f.get(&key(path)).with_context(|| format!("read {}: not provided by the host", path.display()))?;
+            let (v, n) = f
+                .get(&key(path))
+                .with_context(|| format!("read {}: not provided by the host", path.display()))?;
             Ok(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, *n) }.to_vec())
         })
     }
@@ -103,7 +105,11 @@ mod imp {
     }
     /// Takes a file out of the table (large checkpoints are consumed, not copied).
     pub fn read_pages(path: &Path) -> Result<(PageVec<u64>, usize)> {
-        FILES.with(|f| f.borrow_mut().remove(&key(path)).with_context(|| format!("open {}: not provided by the host", path.display())))
+        FILES.with(|f| {
+            f.borrow_mut()
+                .remove(&key(path))
+                .with_context(|| format!("open {}: not provided by the host", path.display()))
+        })
     }
 }
 

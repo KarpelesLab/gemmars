@@ -1,6 +1,6 @@
 //! Media decoding through oxideav (pure-Rust codecs): images to RGB8, audio to 16 kHz mono f32.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use oxideav_core::{Frame, MediaType, RuntimeContext, SampleFormat};
 use std::path::Path;
 
@@ -14,6 +14,12 @@ pub struct RgbImage {
     pub data: Vec<u8>, // interleaved RGB, row-major
 }
 
+impl Default for Media {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Media {
     pub fn new() -> Self {
         let mut ctx = RuntimeContext::new();
@@ -25,7 +31,11 @@ impl Media {
         let file = oxideav_image::open(&self.ctx, path).map_err(|e| anyhow!("decode image {}: {e}", path.display()))?;
         let img = file.primary();
         let data = img.to_rgb8().map_err(|e| anyhow!("convert image to RGB: {e}"))?;
-        Ok(RgbImage { width: img.width() as usize, height: img.height() as usize, data })
+        Ok(RgbImage {
+            width: img.width() as usize,
+            height: img.height() as usize,
+            data,
+        })
     }
 
     /// Decodes any supported audio container/codec and returns mono samples at `target_rate`.
@@ -58,7 +68,9 @@ impl Media {
         let declared = stream.params.sample_format;
         let take = |frame: &Frame, mono: &mut Vec<f32>| -> Result<()> {
             if let Frame::Audio(af) = frame {
-                let fmt = declared.or_else(|| infer_format(af, channels)).ok_or_else(|| anyhow!("unknown sample format"))?;
+                let fmt = declared
+                    .or_else(|| infer_format(af, channels))
+                    .ok_or_else(|| anyhow!("unknown sample format"))?;
                 append_mono(af, fmt, channels, mono)?;
             }
             Ok(())
@@ -88,7 +100,11 @@ impl Media {
         if rate == 0 {
             bail!("unknown sample rate");
         }
-        Ok(if rate == target_rate { mono } else { resample(&mono, rate, target_rate) })
+        Ok(if rate == target_rate {
+            mono
+        } else {
+            resample(&mono, rate, target_rate)
+        })
     }
 }
 
@@ -99,7 +115,11 @@ fn infer_format(af: &oxideav_core::AudioFrame, channels: usize) -> Option<Sample
         return None;
     }
     let planar = af.data.len() > 1;
-    let per_sample = if planar { af.data[0].len() / n } else { af.data[0].len() / (n * channels) };
+    let per_sample = if planar {
+        af.data[0].len() / n
+    } else {
+        af.data[0].len() / (n * channels)
+    };
     Some(match (per_sample, planar) {
         (1, _) => SampleFormat::U8,
         (2, false) => SampleFormat::S16,
@@ -126,7 +146,9 @@ fn append_mono(af: &oxideav_core::AudioFrame, fmt: SampleFormat, channels: usize
                 let v = (plane[3 * i] as i32) | ((plane[3 * i + 1] as i32) << 8) | ((plane[3 * i + 2] as i8 as i32) << 16);
                 v as f32 / 8_388_608.0
             }
-            SampleFormat::S32 | SampleFormat::S32P => i32::from_le_bytes(plane[4 * i..4 * i + 4].try_into().unwrap()) as f32 / 2_147_483_648.0,
+            SampleFormat::S32 | SampleFormat::S32P => {
+                i32::from_le_bytes(plane[4 * i..4 * i + 4].try_into().unwrap()) as f32 / 2_147_483_648.0
+            }
             SampleFormat::F32 | SampleFormat::F32P => f32::from_le_bytes(plane[4 * i..4 * i + 4].try_into().unwrap()),
             SampleFormat::F64 | SampleFormat::F64P => f64::from_le_bytes(plane[8 * i..8 * i + 8].try_into().unwrap()) as f32,
             _ => f32::NAN,
@@ -136,7 +158,11 @@ fn append_mono(af: &oxideav_core::AudioFrame, fmt: SampleFormat, channels: usize
     for s in 0..n {
         let mut acc = 0f32;
         for c in 0..channels {
-            let v = if planar { sample(&af.data[c], s) } else { sample(&af.data[0], s * channels + c) };
+            let v = if planar {
+                sample(&af.data[c], s)
+            } else {
+                sample(&af.data[0], s * channels + c)
+            };
             if v.is_nan() {
                 bail!("unsupported sample format {fmt:?}");
             }
@@ -167,7 +193,11 @@ pub fn resample(x: &[f32], from: usize, to: usize) -> Vec<f32> {
                     continue;
                 }
                 let d = j as f64 - center;
-                let sinc = if d.abs() < 1e-12 { 1.0 } else { (pi * d * cutoff).sin() / (pi * d * cutoff) };
+                let sinc = if d.abs() < 1e-12 {
+                    1.0
+                } else {
+                    (pi * d * cutoff).sin() / (pi * d * cutoff)
+                };
                 let w = 0.5 + 0.5 * (pi * d / (taps as f64 + 1.0)).cos();
                 let k = cutoff * sinc * w;
                 acc += k * x[j as usize] as f64;

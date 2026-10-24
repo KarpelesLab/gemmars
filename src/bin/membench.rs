@@ -1,9 +1,11 @@
 //! Memory bandwidth and matmul-kernel microbenchmark.
 //! usage: membench [GB]   (default 4 GB buffer)
+// The tile macros expand `r + $R <= rows` with `$R` = 1 in one instance.
+#![allow(clippy::int_plus_one)]
 
-use oxinfer::{kernels, pool};
 #[cfg(any(feature = "gpu", target_arch = "aarch64"))]
 use oxinfer::quant;
+use oxinfer::{kernels, pool};
 use std::time::Instant;
 
 fn bench_read(buf: &[u64], threads: usize) -> f64 {
@@ -52,10 +54,16 @@ fn bench_gpu(n_out: usize, n_in: usize) {
         return;
     };
     pool::init(pool::threads().max(1));
-    let w: Vec<u16> = (0..n_out * n_in).map(|i| ((((i as u32).wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32 - 0.5).to_bits() >> 16) as u16).collect();
+    let w: Vec<u16> = (0..n_out * n_in)
+        .map(|i| ((((i as u32).wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32 - 0.5).to_bits() >> 16) as u16)
+        .collect();
     let q8 = quant::quantize_bf16(&w, n_out, n_in);
     let q4 = quant::quantize_q4(&w, n_out, n_in);
-    let refs: [(&str, WeightRef); 3] = [("bf16", WeightRef::Bf16(&w)), ("q8", WeightRef::Q8(&q8)), ("q4", WeightRef::Q4(&q4))];
+    let refs: [(&str, WeightRef); 3] = [
+        ("bf16", WeightRef::Bf16(&w)),
+        ("q8", WeightRef::Q8(&q8)),
+        ("q4", WeightRef::Q4(&q4)),
+    ];
     for (name, wr) in refs.iter() {
         let dev = be.upload(wr, n_out, n_in).expect("upload");
         println!("\n{name} [{n_out} x {n_in}] on {}:", be.name());
@@ -69,7 +77,10 @@ fn bench_gpu(n_out: usize, n_in: usize) {
             }
             let mut y = vec![0f32; t * n_out];
             let mut best_gpu = f64::MAX;
-            let reps: usize = std::env::var("REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(if t >= 256 { 3 } else { 5 });
+            let reps: usize = std::env::var("REPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(if t >= 256 { 3 } else { 5 });
             let wanted = be.wants(n_out, n_in, t);
             for _ in 0..reps {
                 let ti = Instant::now();
@@ -78,7 +89,12 @@ fn bench_gpu(n_out: usize, n_in: usize) {
                     WeightRef::Q8(m) => WeightRef::Q8(m),
                     WeightRef::Q4(m) => WeightRef::Q4(m),
                 };
-                let mut jobs = [gpu::Job { w: wr2, dev: &dev, n_out, y: &mut y }];
+                let mut jobs = [gpu::Job {
+                    w: wr2,
+                    dev: &dev,
+                    n_out,
+                    y: &mut y,
+                }];
                 if !be.matmul(&x, t, n_in, &mut jobs) {
                     best_gpu = f64::NAN;
                     break;
@@ -154,101 +170,41 @@ fn main() {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        if std::env::var("VARIANTS").is_err() { println!("(set VARIANTS=1 for single-thread kernel variants)"); } else {
-        println!("\nsingle-thread kernel variants, t=1 (GB/s):");
-        let rows = n_out;
-        {
-            pool::init(1);
-            let x = vec![0.5f32; n_in];
-            let mut y = vec![0f32; n_out];
-            let mut best = 0f64;
-            for _ in 0..3 {
-                let ti = Instant::now();
-                kernels::matmul(w, n_out, n_in, &x, 1, &mut y);
-                best = best.max((w.len() * 2) as f64 / ti.elapsed().as_secs_f64() / 1e9);
-            }
-            println!("  {:<22} {:>6.1}", "matmul() 1 thread", best);
-        }
-        let x = vec![0.5f32; n_in];
-        macro_rules! var {
-            ($name:expr, $R:expr, $TC:expr, $G:expr, $A:expr) => {{
+        if std::env::var("VARIANTS").is_err() {
+            println!("(set VARIANTS=1 for single-thread kernel variants)");
+        } else {
+            println!("\nsingle-thread kernel variants, t=1 (GB/s):");
+            let rows = n_out;
+            {
+                pool::init(1);
+                let x = vec![0.5f32; n_in];
+                let mut y = vec![0f32; n_out];
                 let mut best = 0f64;
-                let mut sink = 0f32;
                 for _ in 0..3 {
                     let ti = Instant::now();
-                    let mut r = 0;
-                    while r + $R <= rows {
-                        let o = unsafe {
-                            kernels::simd::kernel::<u16, $R, $TC, $G, $A>(w.as_ptr().add(r * n_in), n_in, x.as_ptr(), n_in, n_in)
-                        };
-                        for rr in 0..$R {
-                            for c in 0..$TC {
-                                sink += o[rr][c];
-                            }
-                        }
-                        r += $R;
-                    }
-                    best = best.max((rows * n_in * 2) as f64 / ti.elapsed().as_secs_f64() / 1e9);
+                    kernels::matmul(w, n_out, n_in, &x, 1, &mut y);
+                    best = best.max((w.len() * 2) as f64 / ti.elapsed().as_secs_f64() / 1e9);
                 }
-                std::hint::black_box(sink);
-                println!("  {:<22} {:>6.1}", $name, best);
-            }};
-        }
-        var!("R4 G1 A2 (current)", 4, 1, 1, 2);
-        var!("R4 G1 A1", 4, 1, 1, 1);
-        var!("R4 G2 A4", 4, 1, 2, 4);
-        var!("R2 G2 A4", 2, 1, 2, 4);
-        var!("R2 G4 A8", 2, 1, 4, 8);
-        var!("R1 G4 A8", 1, 1, 4, 8);
-        var!("R8 G1 A1", 8, 1, 1, 1);
-        var!("R8 G1 A2", 8, 1, 1, 2);
-        var!("R8 G2 A2", 8, 1, 2, 2);
-        var!("R12 G1 A1", 12, 1, 1, 1);
-        var!("R16 G1 A1", 16, 1, 1, 1);
-        var!("R6 G1 A2", 6, 1, 1, 2);
-        var!("R8 TC2 G1 A1", 8, 2, 1, 1);
-        var!("R4 TC2 G1 A2 (cur)", 4, 2, 1, 2);
-        var!("R4 TC4 G1 A1 (cur)", 4, 4, 1, 1);
-        var!("R8 TC4 G1 A1", 8, 4, 1, 1);
-        var!("R1 G2 A4", 1, 1, 2, 4);
-        var!("R1 G4 A8", 1, 1, 4, 8);
-        var!("R1 G8 A16", 1, 1, 8, 16);
-        var!("R2 G2 A4", 2, 1, 2, 4);
-        var!("R2 G4 A8", 2, 1, 4, 8);
-        // AND/SHL conversion variant, single row, A accumulators.
-        {
-            use std::arch::aarch64::*;
-            let half = n_in / 2;
-            let xe: Vec<f32> = (0..half).map(|j| x[2 * j]).collect();
-            let xo: Vec<f32> = (0..half).map(|j| x[2 * j + 1]).collect();
-            macro_rules! andshl {
-                ($name:expr, $A:expr) => {{
+                println!("  {:<22} {:>6.1}", "matmul() 1 thread", best);
+            }
+            let x = vec![0.5f32; n_in];
+            macro_rules! var {
+                ($name:expr, $R:expr, $TC:expr, $G:expr, $A:expr) => {{
                     let mut best = 0f64;
                     let mut sink = 0f32;
                     for _ in 0..3 {
                         let ti = Instant::now();
-                        for r in 0..rows {
-                            unsafe {
-                                let wp = w.as_ptr().add(r * n_in) as *const u32;
-                                let mask = vdupq_n_u32(0xFFFF_0000);
-                                let mut acc = [vdupq_n_f32(0.0); $A];
-                                let mut i = 0;
-                                while i < n_in {
-                                    for g in 0..$A / 2 {
-                                        let w32 = vld1q_u32(wp.add((i + 8 * g) / 2));
-                                        let hi = vreinterpretq_f32_u32(vandq_u32(w32, mask));
-                                        let lo = vreinterpretq_f32_u32(vshlq_n_u32::<16>(w32));
-                                        acc[2 * g] = vfmaq_f32(acc[2 * g], lo, vld1q_f32(xe.as_ptr().add((i + 8 * g) / 2)));
-                                        acc[2 * g + 1] = vfmaq_f32(acc[2 * g + 1], hi, vld1q_f32(xo.as_ptr().add((i + 8 * g) / 2)));
-                                    }
-                                    i += 4 * $A;
+                        let mut r = 0;
+                        while r + $R <= rows {
+                            let o = unsafe {
+                                kernels::simd::kernel::<u16, $R, $TC, $G, $A>(w.as_ptr().add(r * n_in), n_in, x.as_ptr(), n_in, n_in)
+                            };
+                            for rr in 0..$R {
+                                for c in 0..$TC {
+                                    sink += o[rr][c];
                                 }
-                                let mut sum = acc[0];
-                                for a in 1..$A {
-                                    sum = vaddq_f32(sum, acc[a]);
-                                }
-                                sink += vaddvq_f32(sum);
                             }
+                            r += $R;
                         }
                         best = best.max((rows * n_in * 2) as f64 / ti.elapsed().as_secs_f64() / 1e9);
                     }
@@ -256,16 +212,82 @@ fn main() {
                     println!("  {:<22} {:>6.1}", $name, best);
                 }};
             }
-            andshl!("ANDSHL R1 A4", 4);
-            andshl!("ANDSHL R1 A8", 8);
-            andshl!("ANDSHL R1 A16", 16);
-        }
+            var!("R4 G1 A2 (current)", 4, 1, 1, 2);
+            var!("R4 G1 A1", 4, 1, 1, 1);
+            var!("R4 G2 A4", 4, 1, 2, 4);
+            var!("R2 G2 A4", 2, 1, 2, 4);
+            var!("R2 G4 A8", 2, 1, 4, 8);
+            var!("R1 G4 A8", 1, 1, 4, 8);
+            var!("R8 G1 A1", 8, 1, 1, 1);
+            var!("R8 G1 A2", 8, 1, 1, 2);
+            var!("R8 G2 A2", 8, 1, 2, 2);
+            var!("R12 G1 A1", 12, 1, 1, 1);
+            var!("R16 G1 A1", 16, 1, 1, 1);
+            var!("R6 G1 A2", 6, 1, 1, 2);
+            var!("R8 TC2 G1 A1", 8, 2, 1, 1);
+            var!("R4 TC2 G1 A2 (cur)", 4, 2, 1, 2);
+            var!("R4 TC4 G1 A1 (cur)", 4, 4, 1, 1);
+            var!("R8 TC4 G1 A1", 8, 4, 1, 1);
+            var!("R1 G2 A4", 1, 1, 2, 4);
+            var!("R1 G4 A8", 1, 1, 4, 8);
+            var!("R1 G8 A16", 1, 1, 8, 16);
+            var!("R2 G2 A4", 2, 1, 2, 4);
+            var!("R2 G4 A8", 2, 1, 4, 8);
+            // AND/SHL conversion variant, single row, A accumulators.
+            {
+                use std::arch::aarch64::*;
+                let half = n_in / 2;
+                let xe: Vec<f32> = (0..half).map(|j| x[2 * j]).collect();
+                let xo: Vec<f32> = (0..half).map(|j| x[2 * j + 1]).collect();
+                macro_rules! andshl {
+                    ($name:expr, $A:expr) => {{
+                        let mut best = 0f64;
+                        let mut sink = 0f32;
+                        for _ in 0..3 {
+                            let ti = Instant::now();
+                            for r in 0..rows {
+                                unsafe {
+                                    let wp = w.as_ptr().add(r * n_in) as *const u32;
+                                    let mask = vdupq_n_u32(0xFFFF_0000);
+                                    let mut acc = [vdupq_n_f32(0.0); $A];
+                                    let mut i = 0;
+                                    while i < n_in {
+                                        for g in 0..$A / 2 {
+                                            let w32 = vld1q_u32(wp.add((i + 8 * g) / 2));
+                                            let hi = vreinterpretq_f32_u32(vandq_u32(w32, mask));
+                                            let lo = vreinterpretq_f32_u32(vshlq_n_u32::<16>(w32));
+                                            acc[2 * g] = vfmaq_f32(acc[2 * g], lo, vld1q_f32(xe.as_ptr().add((i + 8 * g) / 2)));
+                                            acc[2 * g + 1] = vfmaq_f32(acc[2 * g + 1], hi, vld1q_f32(xo.as_ptr().add((i + 8 * g) / 2)));
+                                        }
+                                        i += 4 * $A;
+                                    }
+                                    let mut sum = acc[0];
+                                    for a in 1..$A {
+                                        sum = vaddq_f32(sum, acc[a]);
+                                    }
+                                    sink += vaddvq_f32(sum);
+                                }
+                            }
+                            best = best.max((rows * n_in * 2) as f64 / ti.elapsed().as_secs_f64() / 1e9);
+                        }
+                        std::hint::black_box(sink);
+                        println!("  {:<22} {:>6.1}", $name, best);
+                    }};
+                }
+                andshl!("ANDSHL R1 A4", 4);
+                andshl!("ANDSHL R1 A8", 8);
+                andshl!("ANDSHL R1 A16", 16);
+            }
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
         // Prefill GEMM kernel compute ceiling: single thread, operands resident in L1 / L2.
-        for (name, rows, k, toks) in [("L1: 8 rows x 512 k x 8 tok", 8usize, 512usize, 8usize), ("L2: 8 rows x 4096 k x 64 tok", 8, 4096, 64), ("L2: 64 rows x 2560 k x 64 tok", 64, 2560, 64)] {
+        for (name, rows, k, toks) in [
+            ("L1: 8 rows x 512 k x 8 tok", 8usize, 512usize, 8usize),
+            ("L2: 8 rows x 4096 k x 64 tok", 8, 4096, 64),
+            ("L2: 64 rows x 2560 k x 64 tok", 64, 2560, 64),
+        ] {
             let wq: Vec<u16> = (0..rows * k).map(|i| 0x3f80 ^ (i as u16 & 0x3f)).collect();
             let xt: Vec<f32> = vec![0.5f32; toks * k]; // packed [tile][k][8]
             let mut y = vec![0f32; toks * rows];
@@ -277,14 +299,26 @@ fn main() {
                 while r + 8 <= rows {
                     for tile in 0..toks / 8 {
                         unsafe {
-                            kernels::simd::gemm_8x8::<u16>(wq.as_ptr().add(r * k), k, xt.as_ptr().add(tile * k * 8), y.as_mut_ptr(), rows, r, tile * 8, 8);
+                            kernels::simd::gemm_8x8::<u16>(
+                                wq.as_ptr().add(r * k),
+                                k,
+                                xt.as_ptr().add(tile * k * 8),
+                                y.as_mut_ptr(),
+                                rows,
+                                r,
+                                tile * 8,
+                                8,
+                            );
                         }
                     }
                     r += 8;
                 }
             }
             std::hint::black_box(&y);
-            println!("gemm_8x8 1 thread {name}: {:.0} GFLOP/s", flops_per_pass * passes as f64 / t0.elapsed().as_secs_f64() / 1e9);
+            println!(
+                "gemm_8x8 1 thread {name}: {:.0} GFLOP/s",
+                flops_per_pass * passes as f64 / t0.elapsed().as_secs_f64() / 1e9
+            );
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -310,7 +344,12 @@ fn main() {
                     best = best.max($bytes as f64 / t0.elapsed().as_secs_f64() / 1e9);
                 }
                 std::hint::black_box(sink);
-                println!("  {:<24} {:>6.1} | {:>6.1}", $name, best, best * (rows * n_in * 2) as f64 / $bytes as f64);
+                println!(
+                    "  {:<24} {:>6.1} | {:>6.1}",
+                    $name,
+                    best,
+                    best * (rows * n_in * 2) as f64 / $bytes as f64
+                );
             }};
         }
         unsafe {
@@ -318,7 +357,13 @@ fn main() {
                 let mut s = 0f32;
                 let mut r = 0;
                 while r + 2 <= rows {
-                    let o = kernels::simd::q8_dot_rows_tc::<2, 4>(q8.q.as_ptr().add(r * n_in), q8.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr());
+                    let o = kernels::simd::q8_dot_rows_tc::<2, 4>(
+                        q8.q.as_ptr().add(r * n_in),
+                        q8.scales.as_ptr().add(r * bpr),
+                        n_in,
+                        xa.q.as_ptr(),
+                        xa.scales.as_ptr(),
+                    );
                     s += o[0][0] + o[0][1] + o[0][2] + o[0][3] + o[1][0] + o[1][1] + o[1][2] + o[1][3];
                     r += 2;
                 }
@@ -328,7 +373,14 @@ fn main() {
                 let mut s = 0f32;
                 let mut r = 0;
                 while r + 2 <= rows {
-                    let o = kernels::simd::q4_dot_rows_tc::<2, 4>(q4.q.as_ptr().add(r * n_in / 2), q4.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr(), xa.sums.as_ptr());
+                    let o = kernels::simd::q4_dot_rows_tc::<2, 4>(
+                        q4.q.as_ptr().add(r * n_in / 2),
+                        q4.scales.as_ptr().add(r * bpr),
+                        n_in,
+                        xa.q.as_ptr(),
+                        xa.scales.as_ptr(),
+                        xa.sums.as_ptr(),
+                    );
                     s += o[0][0] + o[0][1] + o[0][2] + o[0][3] + o[1][0] + o[1][1] + o[1][2] + o[1][3];
                     r += 2;
                 }
@@ -338,7 +390,13 @@ fn main() {
                 let mut s = 0f32;
                 let mut r = 0;
                 while r + 2 <= rows {
-                    let o = kernels::simd::q8_dot_rows::<2>(q8.q.as_ptr().add(r * n_in), q8.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr());
+                    let o = kernels::simd::q8_dot_rows::<2>(
+                        q8.q.as_ptr().add(r * n_in),
+                        q8.scales.as_ptr().add(r * bpr),
+                        n_in,
+                        xa.q.as_ptr(),
+                        xa.scales.as_ptr(),
+                    );
                     s += o[0] + o[1];
                     r += 2;
                 }
@@ -346,13 +404,25 @@ fn main() {
             });
             for tc in [2usize, 4] {
                 let name = format!("q8 tc={tc} (R1)");
-                bench!(name, q8.bytes() , {
+                bench!(name, q8.bytes(), {
                     let mut s = 0f32;
                     for r in 0..rows {
                         let o: [f32; 4] = if tc == 4 {
-                            kernels::simd::q8_dot_rows_tc::<1, 4>(q8.q.as_ptr().add(r * n_in), q8.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr())[0]
+                            kernels::simd::q8_dot_rows_tc::<1, 4>(
+                                q8.q.as_ptr().add(r * n_in),
+                                q8.scales.as_ptr().add(r * bpr),
+                                n_in,
+                                xa.q.as_ptr(),
+                                xa.scales.as_ptr(),
+                            )[0]
                         } else {
-                            let o2 = kernels::simd::q8_dot_rows_tc::<1, 2>(q8.q.as_ptr().add(r * n_in), q8.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr())[0];
+                            let o2 = kernels::simd::q8_dot_rows_tc::<1, 2>(
+                                q8.q.as_ptr().add(r * n_in),
+                                q8.scales.as_ptr().add(r * bpr),
+                                n_in,
+                                xa.q.as_ptr(),
+                                xa.scales.as_ptr(),
+                            )[0];
                             [o2[0], o2[1], 0.0, 0.0]
                         };
                         s += o[0] + o[1] + o[2] + o[3];
@@ -364,7 +434,14 @@ fn main() {
                 let mut s = 0f32;
                 let mut r = 0;
                 while r + 2 <= rows {
-                    let o = kernels::simd::q4_dot_rows::<2>(q4.q.as_ptr().add(r * n_in / 2), q4.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr(), xa.sums.as_ptr());
+                    let o = kernels::simd::q4_dot_rows::<2>(
+                        q4.q.as_ptr().add(r * n_in / 2),
+                        q4.scales.as_ptr().add(r * bpr),
+                        n_in,
+                        xa.q.as_ptr(),
+                        xa.scales.as_ptr(),
+                        xa.sums.as_ptr(),
+                    );
                     s += o[0] + o[1];
                     r += 2;
                 }
@@ -376,9 +453,23 @@ fn main() {
                     let mut s = 0f32;
                     for r in 0..rows {
                         let o: [f32; 4] = if tc == 4 {
-                            kernels::simd::q4_dot_rows_tc::<1, 4>(q4.q.as_ptr().add(r * n_in / 2), q4.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr(), xa.sums.as_ptr())[0]
+                            kernels::simd::q4_dot_rows_tc::<1, 4>(
+                                q4.q.as_ptr().add(r * n_in / 2),
+                                q4.scales.as_ptr().add(r * bpr),
+                                n_in,
+                                xa.q.as_ptr(),
+                                xa.scales.as_ptr(),
+                                xa.sums.as_ptr(),
+                            )[0]
                         } else {
-                            let o2 = kernels::simd::q4_dot_rows_tc::<1, 2>(q4.q.as_ptr().add(r * n_in / 2), q4.scales.as_ptr().add(r * bpr), n_in, xa.q.as_ptr(), xa.scales.as_ptr(), xa.sums.as_ptr())[0];
+                            let o2 = kernels::simd::q4_dot_rows_tc::<1, 2>(
+                                q4.q.as_ptr().add(r * n_in / 2),
+                                q4.scales.as_ptr().add(r * bpr),
+                                n_in,
+                                xa.q.as_ptr(),
+                                xa.scales.as_ptr(),
+                                xa.sums.as_ptr(),
+                            )[0];
                             [o2[0], o2[1], 0.0, 0.0]
                         };
                         s += o[0] + o[1] + o[2] + o[3];

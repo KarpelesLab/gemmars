@@ -1,14 +1,14 @@
+use anyhow::{Context, Result, bail};
 use oxinfer::chat::{self, ChatFormat};
-use oxinfer::model::{Model, Quant, Session};
-use oxinfer::sampler::{argmax, Sampler};
-use oxinfer::{config, drafter, platform, pool, prof, qwen, safetensors};
-#[cfg(feature = "media")]
-use oxinfer::{audio, mm_config, vision};
 #[cfg(feature = "hf")]
 use oxinfer::hf;
 #[cfg(feature = "media")]
 use oxinfer::media;
-use anyhow::{bail, Context, Result};
+use oxinfer::model::{Model, Quant, Session};
+use oxinfer::sampler::{Sampler, argmax};
+#[cfg(feature = "media")]
+use oxinfer::{audio, mm_config, vision};
+use oxinfer::{config, drafter, platform, pool, prof, qwen, safetensors};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -210,7 +210,11 @@ fn prepare_multimodal(args: &Args, files: &safetensors::ModelFiles, text_hidden:
         let vcfg = mmc.vision.clone().context("checkpoint has no vision tower")?;
         let t = Instant::now();
         let tower = vision::VisionTower::load(vcfg, files, text_hidden)?;
-        let budget = if args.max_soft_tokens > 0 { args.max_soft_tokens } else { mmc.vision_soft_tokens_per_image };
+        let budget = if args.max_soft_tokens > 0 {
+            args.max_soft_tokens
+        } else {
+            mmc.vision_soft_tokens_per_image
+        };
         if !vision::SUPPORTED_SOFT_TOKENS.contains(&budget) {
             bail!("--max-soft-tokens must be one of {:?}", vision::SUPPORTED_SOFT_TOKENS);
         }
@@ -221,7 +225,13 @@ fn prepare_multimodal(args: &Args, files: &safetensors::ModelFiles, text_hidden:
             let n = emb.len() / text_hidden;
             eprintln!(
                 "[image {}: {}x{} -> {}x{} patches -> {} soft tokens, {:.2}s]",
-                path.display(), img.width, img.height, patches.pw, patches.ph, n, t.elapsed().as_secs_f64()
+                path.display(),
+                img.width,
+                img.height,
+                patches.pw,
+                patches.ph,
+                n,
+                t.elapsed().as_secs_f64()
             );
             if let (Some(prefix), 0) = (&args.dump_mm, i) {
                 let b: Vec<u8> = patches.patches.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -234,7 +244,11 @@ fn prepare_multimodal(args: &Args, files: &safetensors::ModelFiles, text_hidden:
                 text.push_str("<|image|>");
             }
             text.push_str("<image|>");
-            feats.push(MmFeature { token_id: mmc.image_token_id, emb, n });
+            feats.push(MmFeature {
+                token_id: mmc.image_token_id,
+                emb,
+                n,
+            });
         }
     }
     if !args.audios.is_empty() {
@@ -255,7 +269,11 @@ fn prepare_multimodal(args: &Args, files: &safetensors::ModelFiles, text_hidden:
             let n = emb.len() / text_hidden;
             eprintln!(
                 "[audio {}: {:.2}s -> {} mel frames -> {} soft tokens, {:.2}s]",
-                path.display(), pcm.len() as f64 / audio::SAMPLE_RATE as f64, frames, n, t.elapsed().as_secs_f64()
+                path.display(),
+                pcm.len() as f64 / audio::SAMPLE_RATE as f64,
+                frames,
+                n,
+                t.elapsed().as_secs_f64()
             );
             if let (Some(prefix), 0) = (&args.dump_mm, i) {
                 let b: Vec<u8> = mel.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -268,7 +286,11 @@ fn prepare_multimodal(args: &Args, files: &safetensors::ModelFiles, text_hidden:
                 text.push_str("<|audio|>");
             }
             text.push_str("<audio|>");
-            feats.push(MmFeature { token_id: mmc.audio_token_id, emb, n });
+            feats.push(MmFeature {
+                token_id: mmc.audio_token_id,
+                emb,
+                n,
+            });
         }
     }
     Ok((text, feats))
@@ -281,7 +303,11 @@ fn mm_overrides(ids: &[u32], feats: &[MmFeature], hidden: usize) -> Result<Vec<(
     for f in feats {
         let mut k = 0;
         while k < f.n {
-            let pos = ids[cursor..].iter().position(|&t| t == f.token_id).context("fewer placeholder tokens than soft tokens")? + cursor;
+            let pos = ids[cursor..]
+                .iter()
+                .position(|&t| t == f.token_id)
+                .context("fewer placeholder tokens than soft tokens")?
+                + cursor;
             out.push((pos, f.emb[k * hidden..(k + 1) * hidden].to_vec()));
             cursor = pos + 1;
             k += 1;
@@ -296,8 +322,11 @@ fn prefill_mm<M: TextLm>(model: &M, sess: &mut M::Sess, ids: &[u32], chunk: usiz
     let mut start = 0;
     for c in ids.chunks(chunk.max(1)) {
         let end = start + c.len();
-        let local: Vec<(usize, &[f32])> =
-            overrides.iter().filter(|(p, _)| *p >= start && *p < end).map(|(p, e)| (p - start, e.as_slice())).collect();
+        let local: Vec<(usize, &[f32])> = overrides
+            .iter()
+            .filter(|(p, _)| *p >= start && *p < end)
+            .map(|(p, e)| (p - start, e.as_slice()))
+            .collect();
         hs = model.forward_hidden_mm(sess, c, &local);
         start = end;
     }
@@ -389,10 +418,14 @@ impl Printer {
         // Thinking delimiters are rendered as dimming, never as text (some tokenizers keep them).
         let shown: Vec<u32> = out.iter().copied().filter(|&t| t != self.soc && t != self.eoc).collect();
         if let Ok(text) = tok.decode(&shown, true) {
-            let stable = if !final_ && text.ends_with('\u{FFFD}') { text.len().saturating_sub(3) } else { text.len() };
+            let stable = if !final_ && text.ends_with('\u{FFFD}') {
+                text.len().saturating_sub(3)
+            } else {
+                text.len()
+            };
             if stable > self.printed && text.is_char_boundary(stable) {
                 let mut lock = std::io::stdout().lock();
-                let _ = lock.write_all(text[self.printed..stable].as_bytes());
+                let _ = lock.write_all(&text.as_bytes()[self.printed..stable]);
                 let _ = lock.flush();
                 self.printed = stable;
             }
@@ -429,7 +462,12 @@ fn generate_speculative(
     let t0 = Instant::now();
     let h = model.cfg.hidden_size;
     let (ls, lg) = model.cfg.shared_kv_layers();
-    let mut stats = SpecStats { forwards: 0, drafted: 0, accepted: 0, per_pos: [0; 16] };
+    let mut stats = SpecStats {
+        forwards: 0,
+        drafted: 0,
+        accepted: 0,
+        per_pos: [0; 16],
+    };
     let mut out: Vec<u32> = Vec::new();
     let mut printer = Printer::new(&chat::GemmaChat, false);
 
@@ -483,7 +521,17 @@ fn generate_speculative(
                 if a1 != ak {
                     eprintln!(
                         "[check: pos {} token {}: t=1 argmax {} ({:.4}) vs t={} argmax {} ({:.4}); cross: t1[{}]={:.4} tk[{}]={:.4}]",
-                        pos + i, tk, a1, l1[a1 as usize], seq.len(), ak, lk[ak as usize], ak, l1[ak as usize], a1, lk[a1 as usize]
+                        pos + i,
+                        tk,
+                        a1,
+                        l1[a1 as usize],
+                        seq.len(),
+                        ak,
+                        lk[ak as usize],
+                        ak,
+                        l1[ak as usize],
+                        a1,
+                        lk[a1 as usize]
                     );
                 }
             }
@@ -570,7 +618,11 @@ fn generate<M: TextLm>(
         logits = model.forward(sess, &[id]);
         n_forward += 1;
     }
-    let shown = if out.last().is_some_and(|e| eos.contains(e)) { &out[..out.len() - 1] } else { &out[..] };
+    let shown = if out.last().is_some_and(|e| eos.contains(e)) {
+        &out[..out.len() - 1]
+    } else {
+        &out[..]
+    };
     printer.flush_text(tok, shown, true);
     println!();
     (out, n_forward, t0.elapsed().as_secs_f64())
@@ -598,7 +650,11 @@ fn resolve_model(spec: &str, cache_dir: Option<&std::path::Path>) -> Result<Path
     {
         let _ = cache_dir;
         let p = PathBuf::from(spec);
-        if p.is_dir() { Ok(p) } else { bail!("{spec}: not a directory (built without the `hf` feature, so repo ids cannot be fetched)") }
+        if p.is_dir() {
+            Ok(p)
+        } else {
+            bail!("{spec}: not a directory (built without the `hf` feature, so repo ids cannot be fetched)")
+        }
     }
 }
 
@@ -613,7 +669,12 @@ fn save_quantized(src: &Path, out: &Path, files: &safetensors::ModelFiles, quant
     let source = src.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let written = files.write_quantized(
         out,
-        &[("format", "pt"), ("oxinfer_quant", quant.as_str()), ("oxinfer_table_quant", table.as_str()), ("oxinfer_source", &source)],
+        &[
+            ("format", "pt"),
+            ("oxinfer_quant", quant.as_str()),
+            ("oxinfer_table_quant", table.as_str()),
+            ("oxinfer_source", &source),
+        ],
     )?;
     let mut copied = Vec::new();
     for e in std::fs::read_dir(src)? {
@@ -629,7 +690,13 @@ fn save_quantized(src: &Path, out: &Path, files: &safetensors::ModelFiles, quant
     for (p, size) in &written {
         eprintln!("[wrote {} ({:.2} GB)]", p.display(), *size as f64 / 1e9);
     }
-    eprintln!("[{} weights, tables {}; copied {}; {:.1}s]", quant.as_str(), table.as_str(), copied.join(", "), t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[{} weights, tables {}; copied {}; {:.1}s]",
+        quant.as_str(),
+        table.as_str(),
+        copied.join(", "),
+        t0.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -759,7 +826,11 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
         std::fs::write(path, bytes)?;
         let mut idx: Vec<usize> = (0..logits.len()).collect();
         idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-        let top = idx[..10].iter().map(|&i| format!("{i}:{:.3}", logits[i])).collect::<Vec<_>>().join(" ");
+        let top = idx[..10]
+            .iter()
+            .map(|&i| format!("{i}:{:.3}", logits[i]))
+            .collect::<Vec<_>>()
+            .join(" ");
         eprintln!("[wrote {} logits to {} | top10 {top}]", logits.len(), path.display());
         eprintln!("[prefill {} tok in {:.2}s]", ids.len(), prefill_secs);
         return Ok(());
@@ -787,6 +858,7 @@ fn run_qwen(args: Args) -> Result<()> {
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let model = qwen::QwenModel::load(cfg, &files, args.quant)?;
     let tok = Tokenizer::from_file(args.model.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let eos = chat::with_turn_end(&chat::QwenChat, &tok, eos);
     eprintln!(
         "[loaded Qwen: {} layers, hidden {}, {:.1} GB checkpoint ({}), {:?} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
         model.cfg.num_hidden_layers,
@@ -810,8 +882,8 @@ fn run_gemma(args: Args) -> Result<()> {
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let model = Model::load(cfg, &files, args.quant)?;
-    let tok = Tokenizer::from_file(args.model.join("tokenizer.json"))
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let tok = Tokenizer::from_file(args.model.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let eos = chat::with_turn_end(&chat::GemmaChat, &tok, eos);
     eprintln!(
         "[loaded {} layers, hidden {}, {:.1} GB checkpoint ({}), {:?} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
         model.cfg.num_hidden_layers,
@@ -845,12 +917,19 @@ fn run_gemma(args: Args) -> Result<()> {
         (Some(d), Some(f)) => {
             let dr = drafter::Drafter::load(d, f)?;
             if dr.backbone_hidden != model.cfg.hidden_size {
-                bail!("drafter backbone size {} does not match model hidden size {}", dr.backbone_hidden, model.cfg.hidden_size);
+                bail!(
+                    "drafter backbone size {} does not match model hidden size {}",
+                    dr.backbone_hidden,
+                    model.cfg.hidden_size
+                );
             }
             if args.temperature > 0.0 {
                 eprintln!("[note: speculative decoding is greedy; --temp ignored]");
             }
-            eprintln!("[drafter loaded: {} layers, hidden {}, {} draft tokens/round]", dr.cfg.num_hidden_layers, dr.cfg.hidden_size, args.draft_tokens);
+            eprintln!(
+                "[drafter loaded: {} layers, hidden {}, {} draft tokens/round]",
+                dr.cfg.num_hidden_layers, dr.cfg.hidden_size, args.draft_tokens
+            );
             Some(dr)
         }
         _ => None,
@@ -907,14 +986,28 @@ fn run_gemma(args: Args) -> Result<()> {
                     eprintln!("[output ids: {out:?}]");
                 }
                 report(ids.len(), prefill_secs, out.len(), secs);
-                eprintln!("[speculative: {:.2} tok/forward, drafts accepted {}%]", out.len() as f64 / st.forwards.max(1) as f64, 100 * st.accepted / st.drafted.max(1));
+                eprintln!(
+                    "[speculative: {:.2} tok/forward, drafts accepted {}%]",
+                    out.len() as f64 / st.forwards.max(1) as f64,
+                    100 * st.accepted / st.drafted.max(1)
+                );
                 continue;
             }
             let hs = prefill_mm(&model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
             let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
-            let (out, n, decode_secs) = generate(&model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens, &chat::GemmaChat, args.think);
+            let (out, n, decode_secs) = generate(
+                &model,
+                &mut sess,
+                &tok,
+                logits,
+                &mut sampler,
+                &eos,
+                args.max_tokens,
+                &chat::GemmaChat,
+                args.think,
+            );
             if args.show_tokens {
                 eprintln!("[output ids: {out:?}]");
             }
@@ -1010,7 +1103,17 @@ fn run_gemma(args: Args) -> Result<()> {
     }
 
     prof::reset();
-    let (out, n, decode_secs) = generate(&model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens, &chat::GemmaChat, args.think);
+    let (out, n, decode_secs) = generate(
+        &model,
+        &mut sess,
+        &tok,
+        logits,
+        &mut sampler,
+        &eos,
+        args.max_tokens,
+        &chat::GemmaChat,
+        args.think,
+    );
     if args.show_tokens {
         eprintln!("[output ids: {out:?}]");
     }

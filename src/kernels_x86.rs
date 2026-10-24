@@ -82,7 +82,13 @@ unsafe fn hsum(v: __m256) -> f32 {
 /// Dot products of R weight rows against TC activation rows; each step consumes 8*G elements per
 /// row with A independent accumulators per output. `n` must be a multiple of 8*G.
 #[inline(always)]
-pub unsafe fn kernel<W: Load8, const R: usize, const TC: usize, const G: usize, const A: usize>(w: *const W, ws: usize, x: *const f32, xs: usize, n: usize) -> [[f32; TC]; R] {
+pub unsafe fn kernel<W: Load8, const R: usize, const TC: usize, const G: usize, const A: usize>(
+    w: *const W,
+    ws: usize,
+    x: *const f32,
+    xs: usize,
+    n: usize,
+) -> [[f32; TC]; R] {
     if avx2() {
         kernel_avx2::<W, R, TC, G, A>(w, ws, x, xs, n)
     } else {
@@ -91,7 +97,13 @@ pub unsafe fn kernel<W: Load8, const R: usize, const TC: usize, const G: usize, 
 }
 
 #[target_feature(enable = "avx2,fma")]
-unsafe fn kernel_avx2<W: Load8, const R: usize, const TC: usize, const G: usize, const A: usize>(w: *const W, ws: usize, x: *const f32, xs: usize, n: usize) -> [[f32; TC]; R] {
+unsafe fn kernel_avx2<W: Load8, const R: usize, const TC: usize, const G: usize, const A: usize>(
+    w: *const W,
+    ws: usize,
+    x: *const f32,
+    xs: usize,
+    n: usize,
+) -> [[f32; TC]; R] {
     let zero = _mm256_setzero_ps();
     let mut acc = [[[zero; A]; TC]; R];
     let mut i = 0;
@@ -125,7 +137,13 @@ unsafe fn kernel_avx2<W: Load8, const R: usize, const TC: usize, const G: usize,
     out
 }
 
-unsafe fn kernel_scalar<W: Load8, const R: usize, const TC: usize>(w: *const W, ws: usize, x: *const f32, xs: usize, n: usize) -> [[f32; TC]; R] {
+unsafe fn kernel_scalar<W: Load8, const R: usize, const TC: usize>(
+    w: *const W,
+    ws: usize,
+    x: *const f32,
+    xs: usize,
+    n: usize,
+) -> [[f32; TC]; R] {
     let mut out = [[0f32; TC]; R];
     for r in 0..R {
         for c in 0..TC {
@@ -143,7 +161,16 @@ unsafe fn kernel_scalar<W: Load8, const R: usize, const TC: usize>(w: *const W, 
 /// `y[(c0+c)*n_out + r]`.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn run_tiles<W: Load8, const R: usize, const TC: usize, const G: usize, const A: usize>(w: *const W, n_in: usize, x: *const f32, y: *mut f32, n_out: usize, r0: usize, r1: usize, c0: usize) {
+unsafe fn run_tiles<W: Load8, const R: usize, const TC: usize, const G: usize, const A: usize>(
+    w: *const W,
+    n_in: usize,
+    x: *const f32,
+    y: *mut f32,
+    n_out: usize,
+    r0: usize,
+    r1: usize,
+    c0: usize,
+) {
     let mut r = r0;
     while r + R <= r1 {
         let o = kernel::<W, R, TC, G, A>(w.add(r * n_in), n_in, x.add(c0 * n_in), n_in, n_in);
@@ -159,7 +186,17 @@ unsafe fn run_tiles<W: Load8, const R: usize, const TC: usize, const G: usize, c
 /// Rows `r0..r1` (any count) for `tc` tokens (1..=4) starting at `c0`. Requires `n_in % 32 == 0`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn block_tc<W: Load8>(w: *const W, n_in: usize, x: *const f32, y: *mut f32, n_out: usize, r0: usize, r1: usize, c0: usize, tc: usize) {
+pub unsafe fn block_tc<W: Load8>(
+    w: *const W,
+    n_in: usize,
+    x: *const f32,
+    y: *mut f32,
+    n_out: usize,
+    r0: usize,
+    r1: usize,
+    c0: usize,
+    tc: usize,
+) {
     // 16 ymm registers: keep accumulators + weight vectors under that.
     macro_rules! go {
         ($TC:expr, $G:expr, $A:expr) => {{
@@ -181,7 +218,16 @@ pub unsafe fn block_tc<W: Load8>(w: *const W, n_in: usize, x: *const f32, y: *mu
 /// weights are broadcast, accumulators are vectors over tokens.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn gemm_8x8<W: LoadW4>(w: *const W, n_in: usize, xt: *const f32, y: *mut f32, n_out: usize, rb: usize, c0: usize, c_valid: usize) {
+pub unsafe fn gemm_8x8<W: LoadW4>(
+    w: *const W,
+    n_in: usize,
+    xt: *const f32,
+    y: *mut f32,
+    n_out: usize,
+    rb: usize,
+    c0: usize,
+    c_valid: usize,
+) {
     if avx2() {
         gemm_8x8_avx2(w, n_in, xt, y, n_out, rb, c0, c_valid)
     } else {
@@ -199,7 +245,16 @@ pub unsafe fn gemm_8x8<W: LoadW4>(w: *const W, n_in: usize, xt: *const f32, y: *
 
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn gemm_8x8_avx2<W: LoadW4>(w: *const W, n_in: usize, xt: *const f32, y: *mut f32, n_out: usize, rb: usize, c0: usize, c_valid: usize) {
+unsafe fn gemm_8x8_avx2<W: LoadW4>(
+    w: *const W,
+    n_in: usize,
+    xt: *const f32,
+    y: *mut f32,
+    n_out: usize,
+    rb: usize,
+    c0: usize,
+    c_valid: usize,
+) {
     let mut acc = [_mm256_setzero_ps(); 8];
     let mut k = 0;
     while k < n_in {
@@ -222,7 +277,13 @@ unsafe fn gemm_8x8_avx2<W: LoadW4>(w: *const W, n_in: usize, xt: *const f32, y: 
 
 /// Q8: R weight rows against TC quantized activation rows (token stride `n_in`).
 #[inline(never)]
-pub unsafe fn q8_dot_rows_tc<const R: usize, const TC: usize>(q: *const i8, s: *const f32, n_in: usize, xq: *const i8, xs: *const f32) -> [[f32; TC]; R] {
+pub unsafe fn q8_dot_rows_tc<const R: usize, const TC: usize>(
+    q: *const i8,
+    s: *const f32,
+    n_in: usize,
+    xq: *const i8,
+    xs: *const f32,
+) -> [[f32; TC]; R] {
     if avx2() {
         q8_dot_rows_tc_avx2::<R, TC>(q, s, n_in, xq, xs)
     } else {
@@ -246,7 +307,13 @@ pub unsafe fn q8_dot_rows_tc<const R: usize, const TC: usize>(q: *const i8, s: *
 }
 
 #[target_feature(enable = "avx2,fma")]
-unsafe fn q8_dot_rows_tc_avx2<const R: usize, const TC: usize>(q: *const i8, s: *const f32, n_in: usize, xq: *const i8, xs: *const f32) -> [[f32; TC]; R] {
+unsafe fn q8_dot_rows_tc_avx2<const R: usize, const TC: usize>(
+    q: *const i8,
+    s: *const f32,
+    n_in: usize,
+    xq: *const i8,
+    xs: *const f32,
+) -> [[f32; TC]; R] {
     let bpr = n_in / 32;
     let ones = _mm256_set1_epi16(1);
     let mut accf = [[_mm256_setzero_ps(); TC]; R];
@@ -300,7 +367,14 @@ pub unsafe fn q8_rows_t1(m: &crate::quant::QMatrix, xq: *const i8, xs: *const f3
 /// Q4_0: R weight rows against TC quantized activation rows. Nibbles are used unsigned (0..15) and
 /// the +8 offset is folded in via the block sums of x.
 #[inline(never)]
-pub unsafe fn q4_dot_rows_tc<const R: usize, const TC: usize>(q: *const u8, s: *const u16, n_in: usize, xq: *const i8, xs: *const f32, xsums: *const i32) -> [[f32; TC]; R] {
+pub unsafe fn q4_dot_rows_tc<const R: usize, const TC: usize>(
+    q: *const u8,
+    s: *const u16,
+    n_in: usize,
+    xq: *const i8,
+    xs: *const f32,
+    xsums: *const i32,
+) -> [[f32; TC]; R] {
     if avx2() {
         q4_dot_rows_tc_avx2::<R, TC>(q, s, n_in, xq, xs, xsums)
     } else {
@@ -329,7 +403,14 @@ pub unsafe fn q4_dot_rows_tc<const R: usize, const TC: usize>(q: *const u8, s: *
 }
 
 #[target_feature(enable = "avx2,fma")]
-unsafe fn q4_dot_rows_tc_avx2<const R: usize, const TC: usize>(q: *const u8, s: *const u16, n_in: usize, xq: *const i8, xs: *const f32, xsums: *const i32) -> [[f32; TC]; R] {
+unsafe fn q4_dot_rows_tc_avx2<const R: usize, const TC: usize>(
+    q: *const u8,
+    s: *const u16,
+    n_in: usize,
+    xq: *const i8,
+    xs: *const f32,
+    xsums: *const i32,
+) -> [[f32; TC]; R] {
     let bpr = n_in / 32;
     let half_row = n_in / 2;
     let ones = _mm256_set1_epi16(1);

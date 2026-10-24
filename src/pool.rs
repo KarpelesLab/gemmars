@@ -5,10 +5,10 @@
 //! A region ends as soon as every *claimed* block is done; a worker that never
 //! joined the region (e.g. because it was preempted) does not hold up the barrier.
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::Arc;
-use std::thread::{self, Thread};
 use crate::clock::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
+use std::thread::{self, Thread};
 use std::time::Duration;
 
 type JobFn<'a> = &'a (dyn Fn(usize) + Sync);
@@ -153,7 +153,11 @@ impl Pool {
         let s = &self.shared;
         // SAFETY: the region outlives every access: the pointer is cleared and `active`
         // observed zero before this function returns.
-        let region = Region { f: unsafe { std::mem::transmute::<JobFn<'_>, JobFn<'static>>(f) }, n, next: AtomicUsize::new(0) };
+        let region = Region {
+            f: unsafe { std::mem::transmute::<JobFn<'_>, JobFn<'static>>(f) },
+            n,
+            next: AtomicUsize::new(0),
+        };
         s.region.store(&region as *const Region as *mut Region, SeqCst);
         s.generation.fetch_add(1, SeqCst);
         if s.sleepers.load(SeqCst) > 0 {

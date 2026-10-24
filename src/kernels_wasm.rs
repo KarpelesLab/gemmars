@@ -75,7 +75,13 @@ fn fma(a: v128, b: v128, c: v128) -> v128 {
 /// Dot products of R weight rows against TC activation rows; each step consumes 8*G elements per
 /// row with A independent accumulator pairs per output. `n` must be a multiple of 8*G.
 #[inline(always)]
-pub unsafe fn kernel<W: Load8, const R: usize, const TC: usize, const G: usize, const A: usize>(w: *const W, ws: usize, x: *const f32, xs: usize, n: usize) -> [[f32; TC]; R] {
+pub unsafe fn kernel<W: Load8, const R: usize, const TC: usize, const G: usize, const A: usize>(
+    w: *const W,
+    ws: usize,
+    x: *const f32,
+    xs: usize,
+    n: usize,
+) -> [[f32; TC]; R] {
     let zero = f32x4_splat(0.0);
     let mut acc = [[[(zero, zero); A]; TC]; R];
     let mut i = 0;
@@ -115,7 +121,16 @@ pub unsafe fn kernel<W: Load8, const R: usize, const TC: usize, const G: usize, 
 /// `y[(c0+c)*n_out + r]`.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn run_tiles<W: Load8, const R: usize, const TC: usize, const G: usize, const A: usize>(w: *const W, n_in: usize, x: *const f32, y: *mut f32, n_out: usize, r0: usize, r1: usize, c0: usize) {
+unsafe fn run_tiles<W: Load8, const R: usize, const TC: usize, const G: usize, const A: usize>(
+    w: *const W,
+    n_in: usize,
+    x: *const f32,
+    y: *mut f32,
+    n_out: usize,
+    r0: usize,
+    r1: usize,
+    c0: usize,
+) {
     let mut r = r0;
     while r + R <= r1 {
         let o = kernel::<W, R, TC, G, A>(w.add(r * n_in), n_in, x.add(c0 * n_in), n_in, n_in);
@@ -131,7 +146,17 @@ unsafe fn run_tiles<W: Load8, const R: usize, const TC: usize, const G: usize, c
 /// Rows `r0..r1` (any count) for `tc` tokens (1..=4) starting at `c0`. Requires `n_in % 32 == 0`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn block_tc<W: Load8>(w: *const W, n_in: usize, x: *const f32, y: *mut f32, n_out: usize, r0: usize, r1: usize, c0: usize, tc: usize) {
+pub unsafe fn block_tc<W: Load8>(
+    w: *const W,
+    n_in: usize,
+    x: *const f32,
+    y: *mut f32,
+    n_out: usize,
+    r0: usize,
+    r1: usize,
+    c0: usize,
+    tc: usize,
+) {
     // wasm engines map v128 locals onto 16-32 host registers; keep the live set small.
     macro_rules! go {
         ($TC:expr, $G:expr, $A:expr) => {{
@@ -153,7 +178,16 @@ pub unsafe fn block_tc<W: Load8>(w: *const W, n_in: usize, x: *const f32, y: *mu
 /// weights are broadcast, accumulators are two vectors (8 tokens) per row.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn gemm_8x8<W: LoadW4>(w: *const W, n_in: usize, xt: *const f32, y: *mut f32, n_out: usize, rb: usize, c0: usize, c_valid: usize) {
+pub unsafe fn gemm_8x8<W: LoadW4>(
+    w: *const W,
+    n_in: usize,
+    xt: *const f32,
+    y: *mut f32,
+    n_out: usize,
+    rb: usize,
+    c0: usize,
+    c_valid: usize,
+) {
     let zero = f32x4_splat(0.0);
     let mut acc = [(zero, zero); 8];
     let mut k = 0;
@@ -189,7 +223,13 @@ fn dot_i8x16(a: v128, b: v128) -> v128 {
 
 /// Q8: R weight rows against TC quantized activation rows (token stride `n_in`).
 #[inline(never)]
-pub unsafe fn q8_dot_rows_tc<const R: usize, const TC: usize>(q: *const i8, s: *const f32, n_in: usize, xq: *const i8, xs: *const f32) -> [[f32; TC]; R] {
+pub unsafe fn q8_dot_rows_tc<const R: usize, const TC: usize>(
+    q: *const i8,
+    s: *const f32,
+    n_in: usize,
+    xq: *const i8,
+    xs: *const f32,
+) -> [[f32; TC]; R] {
     let bpr = n_in / 32;
     let mut accf = [[f32x4_splat(0.0); TC]; R];
     for b in 0..bpr {
@@ -242,7 +282,14 @@ pub unsafe fn q8_rows_t1(m: &crate::quant::QMatrix, xq: *const i8, xs: *const f3
 /// Q4_0: R weight rows against TC quantized activation rows. Nibbles are used unsigned (0..15) and
 /// the +8 offset is folded in via the block sums of x.
 #[inline(never)]
-pub unsafe fn q4_dot_rows_tc<const R: usize, const TC: usize>(q: *const u8, s: *const u16, n_in: usize, xq: *const i8, xs: *const f32, xsums: *const i32) -> [[f32; TC]; R] {
+pub unsafe fn q4_dot_rows_tc<const R: usize, const TC: usize>(
+    q: *const u8,
+    s: *const u16,
+    n_in: usize,
+    xq: *const i8,
+    xs: *const f32,
+    xsums: *const i32,
+) -> [[f32; TC]; R] {
     let bpr = n_in / 32;
     let half_row = n_in / 2;
     let m0f = u8x16_splat(0x0F);

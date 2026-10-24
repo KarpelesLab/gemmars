@@ -6,9 +6,9 @@
 
 use crate::config::TextConfig;
 use crate::kernels::*;
-use crate::model::{attention, LayerCache};
+use crate::model::{LayerCache, attention};
 use crate::safetensors::ModelFiles;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 struct DLayer<'a> {
@@ -70,7 +70,7 @@ impl<'a> Drafter<'a> {
                 bail!("unexpected token_ordering dtype/shape");
             }
             let bytes = files.bytes("masked_embedding.token_ordering")?;
-            bytes.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap()) as u32).collect()
+            bytes.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c) as u32).collect()
         };
         let mut layers = Vec::new();
         for l in 0..cfg.num_hidden_layers {
