@@ -193,6 +193,7 @@ impl<'a> AudioTower<'a> {
             }
             files.bf16(&full)
         };
+        let conv = |name: &str, shape: &[usize]| files.bf16_conv(&format!("{pre}{name}"), shape);
         let (c0, c1) = (cfg.subsampling_conv_channels[0], cfg.subsampling_conv_channels[1]);
         let clipped = cfg.use_clipped_linears;
         let mut layers = Vec::new();
@@ -222,7 +223,10 @@ impl<'a> AudioTower<'a> {
                 per_dim_scale: g("self_attn.per_dim_scale", &[h / cfg.num_attention_heads])?,
                 lc_pre: g("lconv1d.pre_layer_norm.weight", &[h])?,
                 lc_start: cl("lconv1d.linear_start", 2 * h, h)?,
-                lc_conv: g("lconv1d.depthwise_conv1d.weight", &[h, 1, cfg.conv_kernel_size])?,
+                lc_conv: conv(
+                    &format!("layers.{l}.lconv1d.depthwise_conv1d.weight"),
+                    &[h, 1, cfg.conv_kernel_size],
+                )?,
                 lc_norm: g("lconv1d.conv_norm.weight", &[h])?,
                 lc_end: cl("lconv1d.linear_end", h, h)?,
             });
@@ -236,9 +240,9 @@ impl<'a> AudioTower<'a> {
             files.bf16(embed_name)?
         };
         Ok(Self {
-            conv0: get("subsample_conv_projection.layer0.conv.weight", &[c0, 1, 3, 3])?,
+            conv0: conv("subsample_conv_projection.layer0.conv.weight", &[c0, 1, 3, 3])?,
             norm0: get("subsample_conv_projection.layer0.norm.weight", &[c0])?,
-            conv1: get("subsample_conv_projection.layer1.conv.weight", &[c1, c0, 3, 3])?,
+            conv1: conv("subsample_conv_projection.layer1.conv.weight", &[c1, c0, 3, 3])?,
             norm1: get("subsample_conv_projection.layer1.norm.weight", &[c1])?,
             input_proj: get("subsample_conv_projection.input_proj_linear.weight", &[h, (N_MELS / 4) * c1])?,
             layers,

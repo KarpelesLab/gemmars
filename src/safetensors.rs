@@ -596,6 +596,39 @@ impl ModelFiles {
         sh.bf16(name)
     }
 
+    /// A bf16 convolution weight in torch layout `shape` (`[out, in, spatial...]`). MLX stores
+    /// convolutions channels-last (`[out, spatial..., in]`); those are permuted into a copy.
+    pub fn bf16_conv(&self, name: &str, shape: &[usize]) -> Result<&[u16]> {
+        let info = self.info(name).with_context(|| format!("missing tensor {name}"))?;
+        if info.shape == shape {
+            return self.bf16(name);
+        }
+        let mut cl = vec![shape[0]];
+        cl.extend_from_slice(&shape[2..]);
+        cl.push(shape[1]);
+        if !self.is_mlx() || info.shape != cl {
+            bail!("tensor {name} has shape {:?}, expected {shape:?}", info.shape);
+        }
+        let src = self.bf16(name)?;
+        let key = format!("{name} (torch layout)");
+        let mut cache = self.dequantized.lock().unwrap();
+        if !cache.contains_key(&key) {
+            let (o, i, sp) = (shape[0], shape[1], shape[2..].iter().product::<usize>());
+            let mut v = PageVec::<u16>::zeroed(src.len());
+            for a in 0..o {
+                for b in 0..i {
+                    for c in 0..sp {
+                        v[(a * i + b) * sp + c] = src[(a * sp + c) * i + b];
+                    }
+                }
+            }
+            cache.insert(key.clone(), v);
+        }
+        let v = &cache[&key];
+        // SAFETY: as in `mlx_bf16`.
+        Ok(unsafe { std::slice::from_raw_parts(v.as_ptr(), v.len()) })
+    }
+
     pub fn bytes(&self, name: &str) -> Result<&[u8]> {
         self.touch(name);
         let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
