@@ -387,6 +387,8 @@ pub struct QwenRope {
 #[allow(dead_code)]
 pub struct QwenConfig {
     pub hidden_size: usize,
+    /// Dense MLP width (absent in MoE configs).
+    #[serde(default)]
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -418,6 +420,15 @@ pub struct QwenConfig {
     pub tie_word_embeddings: bool,
     #[serde(default = "d_true")]
     pub attn_output_gate: bool,
+    /// Sparse MoE MLPs (Qwen3.5 MoE: routed experts plus a gated shared expert) when set.
+    #[serde(default)]
+    pub num_experts: Option<usize>,
+    #[serde(default)]
+    pub num_experts_per_tok: usize,
+    #[serde(default)]
+    pub moe_intermediate_size: usize,
+    #[serde(default)]
+    pub shared_expert_intermediate_size: usize,
     /// Qwen3 keeps the RoPE base at the top level.
     #[serde(default)]
     pub rope_theta: Option<f64>,

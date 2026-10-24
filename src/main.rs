@@ -853,7 +853,7 @@ fn run(mut args: Args) -> Result<()> {
     let model_type = config::model_type(&args.model)?;
     match model_type.as_str() {
         "gemma4" | "gemma4_text" | "gemma3" | "gemma3_text" => run_gemma(args),
-        "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_6" | "qwen3_8" => run_qwen(args),
+        "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" => run_qwen(args),
         other => bail!("unsupported model_type {other}"),
     }
 }

@@ -127,6 +127,90 @@ pub fn matmul_multi(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[
     });
 }
 
+/// Work items of a grouped matmul: `(job, row0, row1, token0, token1)`, row blocks of about
+/// `total_bytes / (8 * threads)` bytes and token chunks of at most 64 (whole TN tiles).
+fn grouped_blocks(segs: &[(usize, usize)], n_out: usize, row_bytes: usize) -> Vec<(u32, u32, u32, u32, u32)> {
+    let total = segs.iter().filter(|s| s.1 > 0).count() * n_out * row_bytes;
+    let target = (total / (pool::threads() * 8)).max(64 * 1024);
+    let rows_per_block = (target / row_bytes).max(16) / 16 * 16;
+    let mut blocks = Vec::new();
+    for (j, &(s, len)) in segs.iter().enumerate() {
+        debug_assert!(s.is_multiple_of(TN) && len.is_multiple_of(TN));
+        let mut c = s;
+        while c < s + len {
+            let c1 = (c + 64).min(s + len);
+            let mut r = 0;
+            while r < n_out {
+                let r1 = (r + rows_per_block).min(n_out);
+                blocks.push((j as u32, r as u32, r1 as u32, c as u32, c1 as u32));
+                r = r1;
+            }
+            c = c1;
+        }
+    }
+    blocks
+}
+
+/// Grouped matmuls over row segments of one input (MoE experts, each with the tokens routed to
+/// it): job `j` multiplies rows `segs[j].0 .. + segs[j].1` of `x` (`[_, n_in]`) by `ws[j]`
+/// (`[n_out, n_in]`) into the same rows of `y` (`[_, n_out]`), all in one parallel region.
+/// Segments start and end on multiples of TN tokens (pad them with zero rows).
+pub fn matmul_grouped(ws: &[&[u16]], segs: &[(usize, usize)], n_out: usize, n_in: usize, x: &[f32], y: &mut [f32]) {
+    assert_eq!(ws.len(), segs.len());
+    let rows = x.len() / n_in;
+    assert!(y.len() == rows * n_out && rows.is_multiple_of(TN));
+    let _timer = prof::start(Cat::Matmul);
+    prof::add_bytes(ws.iter().zip(segs).filter(|(_, s)| s.1 > 0).map(|(w, _)| w.len() * 2).sum());
+    let blocks = grouped_blocks(segs, n_out, n_in * 2);
+    let xt = pack_xt(x, rows, n_in);
+    let yp = SendPtr(y.as_mut_ptr());
+    pool::run(blocks.len(), &|b| {
+        let (j, r0, r1, c0, c1) = blocks[b];
+        let (c0, c1) = (c0 as usize, c1 as usize);
+        unsafe {
+            matmul_block(
+                ws[j as usize],
+                n_out,
+                n_in,
+                &x[c0 * n_in..c1 * n_in],
+                Some(&xt[c0 / TN * n_in * TN..]),
+                c1 - c0,
+                r0 as usize,
+                r1 as usize,
+                yp.get().add(c0 * n_out),
+            )
+        }
+    });
+}
+
+/// [`matmul_grouped`] with quantized weights.
+pub fn matmul_quant_grouped<M: QMat>(ms: &[&M], segs: &[(usize, usize)], x: &[f32], y: &mut [f32]) {
+    assert_eq!(ms.len(), segs.len());
+    let (n_out, n_in) = (ms[0].n_out(), ms[0].n_in());
+    let rows = x.len() / n_in;
+    assert!(y.len() == rows * n_out && rows.is_multiple_of(TN));
+    let _timer = prof::start(Cat::Matmul);
+    prof::add_bytes(ms.iter().zip(segs).filter(|(_, s)| s.1 > 0).map(|(m, _)| m.bytes()).sum());
+    let blocks = grouped_blocks(segs, n_out, (ms[0].bytes() / n_out).max(1));
+    let xt = pack_xt(x, rows, n_in);
+    let yp = SendPtr(y.as_mut_ptr());
+    pool::run(blocks.len(), &|b| {
+        let (j, r0, r1, c0, c1) = blocks[b];
+        let (c0, c1) = (c0 as usize, c1 as usize);
+        unsafe {
+            matmul_quant_block_prefill(
+                ms[j as usize],
+                &x[c0 * n_in..c1 * n_in],
+                &xt[c0 / TN * n_in * TN..],
+                c1 - c0,
+                r0 as usize,
+                r1 as usize,
+                yp.get().add(c0 * n_out),
+            )
+        }
+    });
+}
+
 /// When the weights split into too few row blocks to occupy the pool (small matrices over many
 /// tokens: convolutions, attention products), also split the tokens, in whole TN-token tiles.
 /// Returns the number of token chunks and their length.
@@ -1483,6 +1567,44 @@ mod tests {
             scale = scale.max(b.abs());
         }
         assert!(max <= 1e-4 * scale.max(1.0), "{name}: max abs diff {max} (scale {scale})");
+    }
+
+    #[test]
+    fn grouped_matmuls_match_per_segment() {
+        crate::pool::init(4);
+        let (n_out, n_in) = (48usize, 128usize);
+        let mut seed = 3u64;
+        // Segments of 8, 0, 16 and 72 rows (the last split into token chunks of 64).
+        let segs = [(0usize, 8usize), (8, 0), (8, 16), (24, 72)];
+        let rows = 96;
+        let x: Vec<f32> = (0..rows * n_in).map(|_| lcg(&mut seed)).collect();
+        let wb: Vec<Vec<u16>> = (0..segs.len())
+            .map(|_| (0..n_out * n_in).map(|_| half::bf16::from_f32(lcg(&mut seed)).to_bits()).collect())
+            .collect();
+        let wf: Vec<Vec<f32>> = wb.iter().map(|w| w.iter().map(|&v| bf16_to_f32(v)).collect()).collect();
+        let want = |wf: &[Vec<f32>]| {
+            let mut y = vec![0f32; rows * n_out];
+            for (j, &(s, len)) in segs.iter().enumerate() {
+                let r = reference(&wf[j], n_out, n_in, &x[s * n_in..(s + len) * n_in], len);
+                y[s * n_out..(s + len) * n_out].copy_from_slice(&r);
+            }
+            y
+        };
+        let mut y = vec![0f32; rows * n_out];
+        matmul_grouped(&wb.iter().map(|w| &w[..]).collect::<Vec<_>>(), &segs, n_out, n_in, &x, &mut y);
+        check("grouped bf16", &y, &want(&wf));
+        let q: Vec<_> = wb.iter().map(|w| quantize_q4(w, n_out, n_in)).collect();
+        let qf: Vec<Vec<f32>> = q
+            .iter()
+            .map(|m| {
+                let mut f = vec![0f32; n_out * n_in];
+                dequantize_rows_q4(m, 0, n_out, &mut f);
+                f
+            })
+            .collect();
+        let mut y = vec![0f32; rows * n_out];
+        matmul_quant_grouped(&q.iter().collect::<Vec<_>>(), &segs, &x, &mut y);
+        check("grouped q4", &y, &want(&qf));
     }
 
     #[test]

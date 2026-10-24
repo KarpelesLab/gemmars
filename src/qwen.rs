@@ -1,11 +1,14 @@
 //! Qwen3.5 / Qwen3.8 dense hybrid text model: Gated DeltaNet (linear attention with a causal
 //! short conv and a delta-rule recurrent state) interleaved with gated full attention, SiLU MLPs
-//! and zero-centered RMSNorm; plain Qwen3 (full attention only) runs on the same code. Text only
-//! (the vision encoder and MTP head are not loaded).
+//! and zero-centered RMSNorm; plain Qwen3 (full attention only) runs on the same code, and so does
+//! Qwen3.5 MoE (top-k routed SiLU experts plus a sigmoid-gated shared expert in place of the MLP).
+//! Text only (the vision encoder and MTP head are not loaded).
 
 use crate::config::QwenConfig;
 use crate::kernels::*;
-use crate::model::{LayerCache, Lin, Quant, Table, attention, linear, linear_multi, load_lin, table_quant};
+use crate::model::{
+    LayerCache, Lin, Quant, Table, attention, linear, linear_grouped, linear_multi, load_lin, load_lin_experts, table_quant,
+};
 use crate::pool;
 use crate::prof::{self, Cat};
 use crate::safetensors::ModelFiles;
@@ -39,13 +42,72 @@ enum Mixer<'a> {
     Attn(Attn<'a>),
 }
 
+struct Mlp<'a> {
+    gate: Lin<'a>,
+    up: Lin<'a>,
+    down: Lin<'a>,
+    inter: usize,
+}
+
+impl Mlp<'_> {
+    fn bytes(&self) -> usize {
+        self.gate.bytes() + self.up.bytes() + self.down.bytes()
+    }
+    /// `down(silu(gate(x)) * up(x))` for `t` rows of `x`.
+    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
+        let mut g = vec![0f32; t * self.inter];
+        let mut u = vec![0f32; t * self.inter];
+        linear_multi(
+            &mut [(&self.gate, self.inter, &mut g[..]), (&self.up, self.inter, &mut u[..])],
+            h,
+            x,
+            t,
+        );
+        silu_mul(&mut g, &u);
+        linear(&self.down, h, self.inter, &g, t, y);
+    }
+}
+
+/// Sparse MoE block: softmax router, top-k experts with renormalized weights, plus a shared
+/// expert scaled by `sigmoid(shared_gate . x)`.
+struct Moe<'a> {
+    router: Vec<f32>,         // [n_exp, H]
+    gate_up: Vec<GateUp<'a>>, // per expert
+    down: Vec<Lin<'a>>,       // per expert [H, inter]
+    shared: Mlp<'a>,
+    shared_gate: Vec<f32>, // [H]
+    top_k: usize,
+    inter: usize,
+}
+
+/// An expert's input projections: fused (`experts.gate_up_proj`, `[2 * inter, H]`, gate rows then
+/// up rows) or separate (`experts.{e}.gate_proj` / `up_proj`, as transformers saves them).
+enum GateUp<'a> {
+    Fused(Lin<'a>),
+    Split(Lin<'a>, Lin<'a>),
+}
+
+impl GateUp<'_> {
+    fn bytes(&self) -> usize {
+        match self {
+            GateUp::Fused(l) => l.bytes(),
+            GateUp::Split(g, u) => g.bytes() + u.bytes(),
+        }
+    }
+}
+
+// One per layer, built once.
+#[allow(clippy::large_enum_variant)]
+enum Ffn<'a> {
+    Dense(Mlp<'a>),
+    Moe(Moe<'a>),
+}
+
 struct QLayer<'a> {
     mixer: Mixer<'a>,
     ln_in: Vec<f32>,   // 1 + w
     ln_post: Vec<f32>, // 1 + w
-    gate: Lin<'a>,
-    up: Lin<'a>,
-    down: Lin<'a>,
+    ffn: Ffn<'a>,
 }
 
 pub struct QwenModel<'a> {
@@ -139,6 +201,14 @@ impl<'a> QwenModel<'a> {
         let conv_dim = 2 * key_dim + value_dim;
         let kc = cfg.linear_conv_kernel_dim;
         let inter = cfg.intermediate_size;
+        let mlp = |p: &str, inter: usize| -> Result<Mlp<'a>> {
+            Ok(Mlp {
+                gate: lin(&format!("{p}gate_proj.weight"), inter, h)?,
+                up: lin(&format!("{p}up_proj.weight"), inter, h)?,
+                down: lin(&format!("{p}down_proj.weight"), h, inter)?,
+                inter,
+            })
+        };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             let lp = format!("{prefix}layers.{l}.");
@@ -169,13 +239,50 @@ impl<'a> QwenModel<'a> {
                     out: lin(&format!("{gp}out_proj.weight"), h, value_dim)?,
                 })
             };
+            let ffn = match cfg.num_experts {
+                Some(n_exp) => {
+                    let (mi, mp) = (cfg.moe_intermediate_size, format!("{lp}mlp."));
+                    if cfg.num_experts_per_tok == 0 || cfg.num_experts_per_tok > n_exp {
+                        bail!("num_experts_per_tok {} with {n_exp} experts", cfg.num_experts_per_tok);
+                    }
+                    let fused = format!("{mp}experts.gate_up_proj");
+                    let (gate_up, down) = if has(&fused) {
+                        (
+                            load_lin_experts(files, &fused, n_exp, 2 * mi, h, quant)?
+                                .into_iter()
+                                .map(GateUp::Fused)
+                                .collect(),
+                            load_lin_experts(files, &format!("{mp}experts.down_proj"), n_exp, h, mi, quant)?,
+                        )
+                    } else {
+                        let (mut gu, mut d) = (Vec::with_capacity(n_exp), Vec::with_capacity(n_exp));
+                        for e in 0..n_exp {
+                            let ep = format!("{mp}experts.{e}.");
+                            gu.push(GateUp::Split(
+                                lin(&format!("{ep}gate_proj.weight"), mi, h)?,
+                                lin(&format!("{ep}up_proj.weight"), mi, h)?,
+                            ));
+                            d.push(lin(&format!("{ep}down_proj.weight"), h, mi)?);
+                        }
+                        (gu, d)
+                    };
+                    Ffn::Moe(Moe {
+                        router: getf(&format!("{mp}gate.weight"), &[n_exp, h])?,
+                        gate_up,
+                        down,
+                        shared: mlp(&format!("{mp}shared_expert."), cfg.shared_expert_intermediate_size)?,
+                        shared_gate: getf(&format!("{mp}shared_expert_gate.weight"), &[1, h])?,
+                        top_k: cfg.num_experts_per_tok,
+                        inter: mi,
+                    })
+                }
+                None => Ffn::Dense(mlp(&format!("{lp}mlp."), inter)?),
+            };
             layers.push(QLayer {
                 mixer,
                 ln_in: one_plus(get(&format!("{lp}input_layernorm.weight"), &[h])?),
                 ln_post: one_plus(get(&format!("{lp}post_attention_layernorm.weight"), &[h])?),
-                gate: lin(&format!("{lp}mlp.gate_proj.weight"), inter, h)?,
-                up: lin(&format!("{lp}mlp.up_proj.weight"), inter, h)?,
-                down: lin(&format!("{lp}mlp.down_proj.weight"), h, inter)?,
+                ffn,
             });
         }
         let rot = cfg.rotary_dim();
@@ -197,7 +304,11 @@ impl<'a> QwenModel<'a> {
     pub fn streamed_bytes(&self) -> usize {
         let mut n = self.lm_head.bytes();
         for l in &self.layers {
-            n += l.gate.bytes() + l.up.bytes() + l.down.bytes();
+            n += match &l.ffn {
+                Ffn::Dense(m) => m.bytes(),
+                // Per token: the shared expert and top_k of the routed ones.
+                Ffn::Moe(m) => m.shared.bytes() + m.top_k * (m.gate_up[0].bytes() + m.down[0].bytes()),
+            };
             n += match &l.mixer {
                 Mixer::Gdn(g) => g.qkv.bytes() + g.z.bytes() + g.b.bytes() + g.a.bytes() + g.out.bytes(),
                 Mixer::Attn(a) => a.q.bytes() + a.k.bytes() + a.v.bytes() + a.o.bytes(),
@@ -263,9 +374,6 @@ impl<'a> QwenModel<'a> {
         drop(timer);
 
         let mut hn = vec![0f32; t * h];
-        let inter = cfg.intermediate_size;
-        let mut g = vec![0f32; t * inter];
-        let mut u = vec![0f32; t * inter];
         let mut y = vec![0f32; t * h];
         for (l, layer) in self.layers.iter().enumerate() {
             rmsnorm_f32w_rows(&x, h, &layer.ln_in, eps, &mut hn);
@@ -275,9 +383,10 @@ impl<'a> QwenModel<'a> {
             }
             add_inplace(&mut x, &y);
             rmsnorm_f32w_rows(&x, h, &layer.ln_post, eps, &mut hn);
-            linear_multi(&mut [(&layer.gate, inter, &mut g[..]), (&layer.up, inter, &mut u[..])], h, &hn, t);
-            silu_mul(&mut g, &u);
-            linear(&layer.down, h, inter, &g, t, &mut y);
+            match &layer.ffn {
+                Ffn::Dense(m) => m.forward(&hn, t, h, &mut y),
+                Ffn::Moe(m) => m.forward(&hn, t, h, &mut y),
+            }
             add_inplace(&mut x, &y);
         }
         rmsnorm_f32w_rows(&x.clone(), h, &self.final_norm, eps, &mut x);
@@ -506,6 +615,144 @@ impl<'a> QwenModel<'a> {
             }
         });
         linear(&gd.out, h, value_dim, &out, t, y);
+    }
+}
+
+impl Moe<'_> {
+    /// Indices and renormalized weights of the top-k experts of one token (softmax over all
+    /// experts, top k, divided by their sum: the same as a softmax over the k largest logits).
+    fn route(&self, logits: &[f32]) -> Vec<(usize, f32)> {
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+        idx.truncate(self.top_k);
+        let m = logits[idx[0]];
+        let e: Vec<f32> = idx.iter().map(|&i| (logits[i] - m).exp()).collect();
+        let s: f32 = e.iter().sum();
+        idx.into_iter().zip(e).map(|(i, v)| (i, v / s)).collect()
+    }
+
+    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
+        self.shared.forward(x, t, h, y);
+        for_chunks(y, h, t > 1, |ti, row| {
+            let g = 1.0 / (1.0 + (-dot(&self.shared_gate, &x[ti * h..(ti + 1) * h])).exp());
+            scale_inplace(row, g);
+        });
+        let ne = self.down.len();
+        let mut logits = vec![0f32; t * ne];
+        for_chunks(&mut logits, ne, t > 1, |ti, l| {
+            for (v, w) in l.iter_mut().zip(self.router.chunks(h)) {
+                *v = dot(w, &x[ti * h..(ti + 1) * h]);
+            }
+        });
+        let routes: Vec<_> = logits.chunks(ne).map(|l| self.route(l)).collect();
+        let mi = self.inter;
+        if t == 1 {
+            // Decode: every chosen expert sees the same row, so the gate/up matmuls run as one batch.
+            let r = &routes[0];
+            let mut gu = vec![vec![0f32; 2 * mi]; r.len()];
+            let mut jobs: Vec<(&Lin, usize, &mut [f32])> = Vec::with_capacity(2 * r.len());
+            for (&(e, _), o) in r.iter().zip(gu.iter_mut()) {
+                match &self.gate_up[e] {
+                    GateUp::Fused(l) => jobs.push((l, 2 * mi, &mut o[..])),
+                    GateUp::Split(g, u) => {
+                        let (og, ou) = o.split_at_mut(mi);
+                        jobs.push((g, mi, og));
+                        jobs.push((u, mi, ou));
+                    }
+                }
+            }
+            linear_multi(&mut jobs, h, x, 1);
+            let mut o = vec![0f32; h];
+            for (&(e, w), gu) in r.iter().zip(gu.iter_mut()) {
+                let (g, u) = gu.split_at_mut(mi);
+                silu_mul(g, u);
+                linear(&self.down[e], h, mi, g, 1, &mut o);
+                axpy(y, w, &o);
+            }
+            return;
+        }
+        // Prefill: gather each expert's tokens into one segment (padded to whole GEMM tiles) and
+        // run all experts as one grouped matmul.
+        let mut count = vec![0usize; ne];
+        for r in &routes {
+            for &(e, _) in r {
+                count[e] += 1;
+            }
+        }
+        let mut segs = Vec::with_capacity(ne);
+        let mut rows = 0;
+        for &c in &count {
+            let len = c.next_multiple_of(TN);
+            segs.push((rows, len));
+            rows += len;
+        }
+        // Row of each (token, k) in the gathered input, and the token of each gathered row.
+        let mut fill: Vec<usize> = segs.iter().map(|s| s.0).collect();
+        let mut src = vec![usize::MAX; rows];
+        let slot: Vec<Vec<(usize, f32)>> = routes
+            .iter()
+            .enumerate()
+            .map(|(ti, r)| {
+                r.iter()
+                    .map(|&(e, w)| {
+                        let i = fill[e];
+                        fill[e] += 1;
+                        src[i] = ti;
+                        (i, w)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut xs = vec![0f32; rows * h];
+        for_chunks(&mut xs, h, true, |i, row| {
+            if src[i] != usize::MAX {
+                row.copy_from_slice(&x[src[i] * h..(src[i] + 1) * h]);
+            }
+        });
+        let mut a = vec![0f32; rows * mi];
+        match &self.gate_up[0] {
+            GateUp::Fused(_) => {
+                let ls: Vec<&Lin> = self
+                    .gate_up
+                    .iter()
+                    .map(|g| if let GateUp::Fused(l) = g { l } else { unreachable!() })
+                    .collect();
+                let mut gu = vec![0f32; rows * 2 * mi];
+                linear_grouped(&ls, &segs, 2 * mi, h, &xs, &mut gu);
+                for_chunks(&mut a, mi, true, |i, ar| {
+                    let r = &gu[i * 2 * mi..(i + 1) * 2 * mi];
+                    for ((o, &g), &u) in ar.iter_mut().zip(&r[..mi]).zip(&r[mi..]) {
+                        *o = g / (1.0 + (-g).exp()) * u;
+                    }
+                });
+            }
+            GateUp::Split(..) => {
+                let (gs, us): (Vec<&Lin>, Vec<&Lin>) = self
+                    .gate_up
+                    .iter()
+                    .map(|g| if let GateUp::Split(g, u) = g { (g, u) } else { unreachable!() })
+                    .unzip();
+                let mut u = vec![0f32; rows * mi];
+                linear_grouped(&gs, &segs, mi, h, &xs, &mut a);
+                linear_grouped(&us, &segs, mi, h, &xs, &mut u);
+                silu_mul(&mut a, &u);
+            }
+        }
+        let ds: Vec<&Lin> = self.down.iter().collect();
+        let mut o = vec![0f32; rows * h];
+        linear_grouped(&ds, &segs, h, mi, &a, &mut o);
+        for_chunks(y, h, true, |ti, yr| {
+            for &(i, w) in &slot[ti] {
+                axpy(yr, w, &o[i * h..(i + 1) * h]);
+            }
+        });
+    }
+}
+
+/// `y += a * x`.
+fn axpy(y: &mut [f32], a: f32, x: &[f32]) {
+    for (y, x) in y.iter_mut().zip(x) {
+        *y += a * x;
     }
 }
 

@@ -268,6 +268,56 @@ pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize
     })
 }
 
+/// The experts of a fused `[n_exp, n_out, n_in]` tensor (MoE `gate_up_proj` / `down_proj`), one
+/// linear layer each. Every expert is a contiguous block of rows, so quantizing the experts one by
+/// one gives the same bytes as quantizing the tensor whole (as `--save-quantized` writes it, with
+/// shape `[n_exp, n_out * n_in]`); pre-quantized experts are borrowed views of the stored matrix.
+pub fn load_lin_experts<'a>(files: &'a ModelFiles, full: &str, n_exp: usize, n_out: usize, n_in: usize, q: Quant) -> Result<Vec<Lin<'a>>> {
+    files.note_use(full, true, false);
+    let (rows, bpr) = (n_out, n_in / crate::quant::QBLOCK);
+    // SAFETY: the stored matrix borrows `files` for 'a (zero-copy), and so do its per-expert views.
+    if let Some(st) = unsafe { files.quantized(full, n_exp, n_out * n_in)? } {
+        fn view<T: Copy>(s: &[T], e: usize, n: usize) -> crate::quant::QBuf<T> {
+            unsafe { crate::quant::QBuf::borrowed(&s[e * n..(e + 1) * n]) }
+        }
+        return Ok((0..n_exp)
+            .map(|e| match &st {
+                Stored::Q8(m) => Lin::q8(QMatrix {
+                    q: view(&m.q, e, rows * n_in),
+                    scales: view(&m.scales, e, rows * bpr),
+                    n_out,
+                    n_in,
+                }),
+                Stored::Q4(m) => Lin::q4(Q4Matrix {
+                    q: view(&m.q, e, rows * n_in / 2),
+                    scales: view(&m.scales, e, rows * bpr),
+                    n_out,
+                    n_in,
+                    offsets: None,
+                }),
+            })
+            .collect());
+    }
+    if files.is_mlx() && files.has(&format!("{full}.scales")) {
+        bail!("{full}: MLX-quantized experts are not supported yet");
+    }
+    let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
+    if info.shape != [n_exp, n_out, n_in] {
+        bail!("tensor {full} has shape {:?}, expected [{n_exp}, {n_out}, {n_in}]", info.shape);
+    }
+    let w = files.bf16(full)?;
+    if let Some(k) = q.kind() {
+        files.mark_quant(full, k);
+    }
+    Ok(w.chunks(n_out * n_in)
+        .map(|w| match q {
+            Quant::Bf16 => Lin::bf16(w),
+            Quant::Q8 => Lin::q8(quantize_bf16(w, n_out, n_in)),
+            Quant::Q4 => Lin::q4(quantize_q4(w, n_out, n_in)),
+        })
+        .collect())
+}
+
 /// A linear layer's weight `[n_out, n_in]`: bf16 (borrowed from the checkpoint or owned) or
 /// quantized, plus lazily created device-side state when an accelerator backend is active.
 pub struct Lin<'a> {
@@ -407,6 +457,43 @@ pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, 
         matmul_quant_multi(&mut v, x, t);
     } else {
         panic!("mixed precision in fused matmul");
+    }
+}
+
+/// Grouped matmuls on the CPU (see [`matmul_grouped`]): `ls[j]` over rows `segs[j]` of `x`.
+/// All weights must have the same shape and precision.
+pub(crate) fn linear_grouped(ls: &[&Lin], segs: &[(usize, usize)], n_out: usize, n_in: usize, x: &[f32], y: &mut [f32]) {
+    match &ls[0].w {
+        Weight::Bf16(..) => {
+            let ws: Vec<&[u16]> = ls
+                .iter()
+                .map(|l| match &l.w {
+                    Weight::Bf16(w, _) => &w[..],
+                    _ => panic!("mixed precision in grouped matmul"),
+                })
+                .collect();
+            matmul_grouped(&ws, segs, n_out, n_in, x, y);
+        }
+        Weight::Q8(_) => {
+            let ms: Vec<&QMatrix> = ls
+                .iter()
+                .map(|l| match &l.w {
+                    Weight::Q8(m) => m,
+                    _ => panic!("mixed precision in grouped matmul"),
+                })
+                .collect();
+            matmul_quant_grouped(&ms, segs, x, y);
+        }
+        Weight::Q4(_) => {
+            let ms: Vec<&Q4Matrix> = ls
+                .iter()
+                .map(|l| match &l.w {
+                    Weight::Q4(m) => m,
+                    _ => panic!("mixed precision in grouped matmul"),
+                })
+                .collect();
+            matmul_quant_grouped(&ms, segs, x, y);
+        }
     }
 }
 

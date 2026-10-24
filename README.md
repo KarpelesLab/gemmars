@@ -32,6 +32,7 @@ identical tokens.
 | google/gemma-4-31B-it | 31B | 62 GB | supported, sharded loading, untested |
 | google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
 | Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text only; matches the bf16 reference; see below |
+| Qwen/Qwen3.6-35B-A3B and fine-tunes (PixilabAI/Zawen-v0.1-35B-A3B) | 35B MoE, 3B active | 69 GB | text only; matches the reference at full width (see below); full checkpoint not yet run |
 | Qwen/Qwen3.5-0.8B | 0.8B | 1.7 GB | text only; the small one used for the wasm measurements |
 | mlx-community/gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit | 5.1B / 8.0B | 3.6 / 5.2 GB (MLX 4-bit) | text, images and audio; see [MLX checkpoints](#mlx-checkpoints) |
 | mlx-community/Qwen3-4B-4bit (Qwen3 dense) | 4.0B | 2.3 GB (MLX 4-bit) | text; matches the reference on the same weights (same top 10) |
@@ -53,6 +54,17 @@ RoPE on 64 dims, a sigmoid output gate), SiLU MLPs and zero-centred RMSNorm. The
 keep a fixed-size state instead of a KV cache, so memory does not grow with context for 48 of the
 64 layers. The vision encoder and the MTP head in the checkpoint are not loaded yet, and
 speculative decoding is not available for this family yet.
+
+The MoE variants (`qwen3_5_moe`, Qwen3.5/3.6-35B-A3B) replace each MLP with 256 routed SiLU
+experts of width 512 (softmax router, top 8, weights renormalised) plus a shared expert scaled by
+a sigmoid gate. Experts load from the fused `experts.gate_up_proj` / `down_proj` tensors or from
+per-expert `experts.N.*_proj` weights (as transformers saves them), and quantize like any other
+matrix (`--save-quantized` included). Decode batches the 8 chosen experts' input projections into
+one matmul. Prefill gathers each expert's tokens and runs every expert as one grouped matmul on
+the CPU. With `--quant q4` (about 19 GB) on an M5 Max, that is about 220 tok/s of prefill and 65
+tok/s of decode. On randomly initialised weights at the real width (2048 hidden, 256 experts, 2
+layers, the real vocabulary), oxinfer matches transformers in float32 to a max logit difference of
+7e-5, with the same 20 greedy tokens. MLX-quantized experts are not read yet.
 
 Thinking is on by default in the Qwen template; `--think` enables it here (the trace is dimmed),
 otherwise the generation prompt closes the think block.
