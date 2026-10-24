@@ -384,6 +384,33 @@ By default the whole safetensors file is read into RAM at startup (a few seconds
 gives steady decode speed from the first token. `--mmap` starts faster but pays page
 faults on the first pass.
 
+### As a library
+
+`oxinfer::engine` is the CLI's text generation as an API: load a directory, GGUF file or repo
+id with `EngineOptions` (every flag above that applies to text, also settable as `key=value`
+pairs), then hold a conversation with streamed output, cancellation from another thread
+(`CancelHandle`), tool calls, attachments and per-turn statistics:
+
+```rust
+use oxinfer::engine::{Engine, EngineOptions, Flow};
+let mut opts = EngineOptions::default();
+opts.set("quant", "q8")?;
+opts.set("mtp", "1")?;
+let mut engine = Engine::load("Qwen/Qwen3.5-0.8B", &opts)?;
+let reply = engine.send("Why is the sky blue?", &mut |d| {
+    print!("{}", d.text); // d.thinking marks thinking text
+    Flow::Continue        // Flow::Stop ends the reply
+})?;
+println!("\n{:.1} tok/s, {:.0}% drafts accepted", reply.stats.decode_tok_s(), 100.0 * reply.stats.acceptance());
+```
+
+`examples/chat.rs` is a complete chat. Wrap `Engine::load` in `oxinfer::hf::with_progress` for
+download progress and cancellation. The lower-level pieces the CLI is built from are public too:
+`oxinfer::generate` (decoding loops with per-token callbacks, MTP and drafter speculative
+decoding, streaming detokenization) and the model, session and sampler types. A C API over the
+engine (`capi` feature, `include/oxinfer.h`) and a SwiftUI test app for iOS are in `ios/`
+(see `ios/README.md`).
+
 ## Performance
 
 Decode is memory-bandwidth bound: every generated token streams all dense weights once.
@@ -531,7 +558,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 
 | Platform | Compute | Status |
 |---|---|---|
-| Apple Silicon (macOS, iOS) | NEON kernels + Metal GEMM for prefill | measured, bit-identical logits to the CPU path |
+| Apple Silicon (macOS, iOS) | NEON kernels + Metal GEMM for prefill | measured, bit-identical logits to the CPU path; iOS: runs in the Simulator (CPU and Metal; `ios/`) |
 | x86-64 (Linux, Windows, macOS) | AVX2 + FMA kernels (bf16, Q8 via `maddubs`, Q4), scalar fallback below AVX2 | compiles for all three; the kernel tests pass on the scalar fallback under Rosetta (which exposes no AVX), so the AVX2 kernels themselves are not yet executed anywhere |
 | Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled GEMM (`cuda.rs`) | compile-checked only, not yet run on NVIDIA hardware |
 | Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |

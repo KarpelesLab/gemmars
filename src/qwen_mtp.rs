@@ -347,6 +347,10 @@ impl<'m> MtpDecoder<'m> {
         self.model
     }
 
+    pub fn mtp(&self) -> &'m QwenMtp<'m> {
+        self.mtp
+    }
+
     /// Current draft length.
     pub fn draft_len(&self) -> usize {
         self.k_cur

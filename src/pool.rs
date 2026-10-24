@@ -34,7 +34,7 @@ pub struct Pool {
     workers: usize,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn raise_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
@@ -44,7 +44,7 @@ fn raise_qos() {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn raise_qos() {}
 
 /// Claims and runs blocks of the current region, if any. Returns false if no region was published.
@@ -195,6 +195,14 @@ pub fn init(threads: usize) {
     if !old.is_null() {
         // Leaked on purpose: in-flight references may still exist.
         unsafe { (*old).shutdown() };
+    }
+}
+
+/// Uses `threads` threads: installs a new global pool unless the current one has that many.
+pub fn configure(threads: usize) {
+    let p = GLOBAL.load(Acquire);
+    if p.is_null() || unsafe { (*p).threads() } != threads.max(1) {
+        init(threads);
     }
 }
 

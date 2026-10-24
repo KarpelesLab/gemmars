@@ -116,6 +116,11 @@ pub fn install(b: Option<Box<dyn Backend>>) {
     let _ = ACTIVE.set(b);
 }
 
+/// Whether a backend choice (possibly "none") was installed already.
+pub fn initialized() -> bool {
+    ACTIVE.get().is_some()
+}
+
 pub fn active() -> Option<&'static dyn Backend> {
     ACTIVE.get().and_then(|b| b.as_deref())
 }

@@ -14,12 +14,73 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// `$OXINFER_CACHE`, else `~/.cache/oxinfer/hub` (on iOS, where `HOME` is the app's sandbox:
+/// `Library/Application Support/oxinfer/hub` in it, which the system does not purge).
 pub fn cache_root() -> PathBuf {
     if let Ok(p) = std::env::var("OXINFER_CACHE") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".cache").join("oxinfer").join("hub")
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
+    if cfg!(target_os = "ios") {
+        return home.join("Library").join("Application Support").join("oxinfer").join("hub");
+    }
+    home.join(".cache").join("oxinfer").join("hub")
+}
+
+/// Download progress reported to a [`with_progress`] hook.
+#[derive(Clone, Copy, Debug)]
+pub struct Progress<'a> {
+    pub repo: &'a str,
+    /// The file being fetched (path in the repository).
+    pub file: &'a str,
+    /// 1-based index of the file among the `count` large files of this fetch (0 for metadata).
+    pub index: usize,
+    pub count: usize,
+    /// Bytes on disk so far (including a resumed part) and the file size when known.
+    pub done: u64,
+    pub total: Option<u64>,
+}
+
+type ProgressHook<'f> = dyn FnMut(&Progress) -> bool + 'f;
+
+thread_local! {
+    static HOOK: std::cell::Cell<Option<*mut ProgressHook<'static>>> = const { std::cell::Cell::new(None) };
+}
+
+/// Unwinding payload of a cancelled download.
+struct Cancelled;
+
+/// Runs `f` (a [`resolve`], [`resolve_file`] or [`resolve_gguf`] call on this thread) with
+/// `hook` receiving download progress; returning false from the hook cancels the download (the
+/// partial file stays and a later fetch resumes it) and makes this return an error.
+pub fn with_progress<T>(hook: &mut ProgressHook<'_>, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let p: *mut ProgressHook<'_> = hook;
+    // SAFETY: the pointer is only dereferenced on this thread while `hook` is borrowed (it is
+    // removed before returning, also when unwinding through `catch_unwind`).
+    let p: *mut ProgressHook<'static> = unsafe { std::mem::transmute(p) };
+    let prev = HOOK.with(|h| h.replace(Some(p)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    HOOK.with(|h| h.set(prev));
+    match r {
+        Ok(r) => r,
+        Err(e) if e.is::<Cancelled>() => bail!("download cancelled"),
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
+/// Reports progress to the hook of [`with_progress`], if any; unwinds out of the download when it
+/// asks to cancel.
+fn report(p: &Progress) {
+    // Taken while called, so the hook is never re-entered.
+    let Some(h) = HOOK.with(|c| c.take()) else {
+        return;
+    };
+    // SAFETY: see `with_progress`.
+    let keep = unsafe { (*h)(p) };
+    HOOK.with(|c| c.set(Some(h)));
+    if !keep {
+        std::panic::resume_unwind(Box::new(Cancelled));
+    }
 }
 
 /// A local directory is used as is; otherwise `spec` must be a repo id (`org/name`), which is
@@ -475,19 +536,33 @@ fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, src: &S
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
+    let progress = |done: u64, total: Option<u64>| {
+        report(&Progress {
+            repo,
+            file: name,
+            index,
+            count,
+            done,
+            total,
+        })
+    };
     if let Ok(md) = std::fs::metadata(&path)
         && md.len() > 0
         && expected.is_none_or(|s| s == md.len())
     {
+        progress(md.len(), Some(md.len()));
         return Ok(());
     }
     let url = match src {
         Source::Inline(b) => {
             std::fs::write(&path, b).with_context(|| format!("write {}", path.display()))?;
+            progress(b.len() as u64, Some(b.len() as u64));
             return Ok(());
         }
         Source::Url(u) => u.as_str(),
     };
+    progress(0, expected);
+    let (prepo, pname) = (repo.to_string(), name.to_string());
     let t0 = Instant::now();
     let label = format!("[{index}/{count}] {name}");
     let tty = std::io::stderr().is_terminal();
@@ -496,6 +571,14 @@ fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, src: &S
     let plabel = label.clone();
     let opts = DownloadOptions {
         progress: Some(Box::new(move |done: u64, total: Option<u64>| {
+            report(&Progress {
+                repo: &prepo,
+                file: &pname,
+                index,
+                count,
+                done,
+                total,
+            });
             let secs = t0.elapsed().as_secs_f64();
             if tty {
                 if last.elapsed().as_millis() >= 200 {

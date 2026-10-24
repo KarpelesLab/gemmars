@@ -878,20 +878,26 @@ impl MetalBackend {
     }
 
     /// Wraps host memory as a shared buffer without copying (the enclosing pages are mapped; the
-    /// caller guarantees they belong to one allocation); falls back to copying.
+    /// caller guarantees they belong to one allocation); falls back to copying. The iOS
+    /// Simulator's Metal driver aborts on wrapped host memory (it hands buffers to the host's GPU
+    /// process as shared memory), so it always copies there.
     fn wrap(&self, ptr: *const u8, len: usize) -> Option<Buf> {
         let start = (ptr as usize) & !(PAGE - 1);
         let end = (ptr as usize + len).div_ceil(PAGE) * PAGE;
         let nocopy: MsgNewBufNoCopy = self.o.msg_send();
-        let id = unsafe {
-            nocopy(
-                self.device,
-                self.sels.new_buffer_nocopy,
-                start as *mut c_void,
-                end - start,
-                0,
-                std::ptr::null_mut(),
-            )
+        let id = if cfg!(target_abi = "sim") {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                nocopy(
+                    self.device,
+                    self.sels.new_buffer_nocopy,
+                    start as *mut c_void,
+                    end - start,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            }
         };
         if !id.is_null() {
             return Some(Buf {

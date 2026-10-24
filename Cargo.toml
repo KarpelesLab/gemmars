@@ -49,6 +49,9 @@ gpu = ["dep:dlsym"]
 # The browser module (wasm32-unknown-unknown only): C-ABI exports for web/oxinfer.js and the
 # WebGPU backend. Build with `cargo build-web` (see .cargo/config.toml).
 web = ["dep:getrandom"]
+# A C API over the `engine` module (include/oxinfer.h), for Swift and other non-Rust hosts.
+# Build the static library with `cargo build-capi --target T` (see .cargo/config.toml).
+capi = []
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }

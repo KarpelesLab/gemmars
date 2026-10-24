@@ -19,4 +19,7 @@ rustflags = ["-C", "target-feature=+simd128", "--cfg", 'getrandom_backend="custo
 # `cargo build-web`: the browser module, target/wasm32-unknown-unknown/release/oxinfer.wasm.
 # The library is emitted as a cdylib only here, so native builds never link one.
 [alias]
+# `cargo build-capi --target T`: the C API as a static library, target/T/release/liboxinfer.a
+# (e.g. aarch64-apple-ios, aarch64-apple-ios-sim, aarch64-apple-darwin; see ios/README.md).
+build-capi = ["rustc", "--release", "--lib", "--features", "capi", "--crate-type", "staticlib"]
 build-web = ["rustc", "--release", "--lib", "--target", "wasm32-unknown-unknown", "--no-default-features", "--features", "web", "--crate-type", "cdylib", "--", "-C", "debuginfo=0", "-C", "strip=debuginfo"]

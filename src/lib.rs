@@ -7,6 +7,8 @@
 
 pub mod audio;
 pub mod bert;
+#[cfg(feature = "capi")]
+pub mod capi;
 pub mod chat;
 pub mod clock;
 pub mod config;
@@ -14,7 +16,9 @@ pub mod config;
 pub mod cuda;
 pub mod drafter;
 pub mod embed;
+pub mod engine;
 pub mod fsx;
+pub mod generate;
 pub mod ggml;
 pub mod gguf;
 pub mod gpu;
@@ -25,6 +29,7 @@ pub mod kernels;
 pub mod media;
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 pub mod metal;
+pub mod mm;
 pub mod mm_config;
 pub mod model;
 pub mod modernbert;
