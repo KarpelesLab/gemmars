@@ -153,12 +153,12 @@ unsafe fn q4k<const TC: usize, const FIVE: bool>(row: *const u8, n_in: usize, x:
         let (s0, s1) = u8x8_to_f32(vcreate_u8(sc));
         let (n0, n1) = u8x8_to_f32(vcreate_u8(mn));
         let (ds0, ds1) = (vmulq_n_f32(s0, d), vmulq_n_f32(s1, d));
-        // Weights are centered (q - 8, or q - 16 for Q5_K) so the int8 rounding of the activations
-        // multiplies small values; the offset moves into the min term with the exact sums.
+        // Weights are centered (q - 8, or q - 16 for Q5_K: the int8 rounding of the activations then
+        // multiplies small values), as integer sums minus `off * sum(xq)`; the offset moves into
+        // the min term with the exact activation sums.
         let off = if FIVE { 16.0 } else { 8.0 };
         let dm0 = vsubq_f32(vmulq_n_f32(n0, dmin), vmulq_n_f32(ds0, off));
         let dm1 = vsubq_f32(vmulq_n_f32(n1, dmin), vmulq_n_f32(ds1, off));
-        let qoff = vdupq_n_s8(off as i8);
         let qs = b.add(if FIVE { 48 } else { 16 });
         let mut w = [vdupq_n_s8(0); 16];
         let (h0, h1) = if FIVE {
@@ -179,11 +179,23 @@ unsafe fn q4k<const TC: usize, const FIVE: bool>(row: *const u8, n_in: usize, x:
                 q[3] = vorrq_u8(q[3], vandq_u8(vtstq_u8(h1, u2), b16));
             }
             for i in 0..4 {
-                w[4 * j + i] = vsubq_s8(vreinterpretq_s8_u8(q[i]), qoff);
+                w[4 * j + i] = vreinterpretq_s8_u8(q[i]);
             }
         }
         for c in 0..TC {
             let (a0, a1) = sums32(&w, x.q.add(c * n_in + sb * QK_K));
+            let xi = x.i.add(c * bpr + sb * 8);
+            let (a0, a1) = if FIVE {
+                (
+                    vsubq_s32(a0, vshlq_n_s32::<4>(vld1q_s32(xi))),
+                    vsubq_s32(a1, vshlq_n_s32::<4>(vld1q_s32(xi.add(4)))),
+                )
+            } else {
+                (
+                    vsubq_s32(a0, vshlq_n_s32::<3>(vld1q_s32(xi))),
+                    vsubq_s32(a1, vshlq_n_s32::<3>(vld1q_s32(xi.add(4)))),
+                )
+            };
             let xs = x.s.add(c * bpr + sb * 8);
             let xf = x.f.add(c * bpr + sb * 8);
             let mut v = vfmaq_f32(acc[c], vcvtq_f32_s32(a0), vmulq_f32(ds0, vld1q_f32(xs)));
@@ -573,14 +585,14 @@ unsafe fn iq4xs<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; 
     for sb in 0..n_in / QK_K {
         let b = row.add(sb * 136);
         let d = f16p(b);
-        let sh = std::ptr::read_unaligned(b.add(2) as *const u16) as u32;
-        let mut ls = [0f32; 8];
-        unroll8!(ib, {
-            let l = ((*b.add(4 + ib / 2) >> (4 * (ib % 2))) & 0xF) as u32 | (((sh >> (2 * ib)) & 3) << 4);
-            ls[ib] = l as f32 - 32.0;
-        });
-        let ds0 = vmulq_n_f32(vld1q_f32(ls.as_ptr()), d);
-        let ds1 = vmulq_n_f32(vld1q_f32(ls.as_ptr().add(4)), d);
+        // The eight 6-bit scales in one vector: low nibbles from scales_l, 2-bit tops from scales_h.
+        const HSH: [i16; 8] = [4, 2, 0, -2, -4, -6, -8, -10];
+        let sl = vcreate_u8(rd32(b.add(4)) as u64);
+        let lo = vmovl_u8(vzip1_u8(vand_u8(sl, vdup_n_u8(0x0F)), vshr_n_u8::<4>(sl)));
+        let hi = vandq_u16(vshlq_u16(vdupq_n_u16(rd16(b.add(2))), vld1q_s16(HSH.as_ptr())), vdupq_n_u16(0x30));
+        let ls = vsubq_s16(vreinterpretq_s16_u16(vorrq_u16(lo, hi)), vdupq_n_s16(32));
+        let ds0 = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(ls))), d);
+        let ds1 = vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(ls)), d);
         let mut w = [vdupq_n_s8(0); 16];
         unroll8!(ib, {
             let v = vld1q_u8(b.add(8 + 16 * ib));
@@ -660,8 +672,8 @@ unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act
         _ => (24, 8),
     };
     let has_min = K == Q4_1 || K == Q5_1;
-    // Q4_1 / Q5_1 weights are centered like Q4_0 / Q5_0; the min absorbs `d * qoff`.
-    let qoff = if K == Q5_1 { 16.0 } else { 8.0 };
+    // Nibbles are centered by `qoff` (Q4_1 / Q5_1 like Q4_0 / Q5_0; the min absorbs `d * qoff`).
+    let qoff = if K == Q5_0 || K == Q5_1 { 16.0 } else { 8.0 };
     let bpr = n_in / 32;
     let zero = vdupq_n_s32(0);
     let m4 = vdupq_n_u8(0x0F);
@@ -679,8 +691,8 @@ unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act
         let (lo, hi) = (vreinterpretq_s8_u8(lo), vreinterpretq_s8_u8(hi));
         match K {
             IQ4_NL => (vqtbl1q_s8(kv, vreinterpretq_u8_s8(lo)), vqtbl1q_s8(kv, vreinterpretq_u8_s8(hi))),
-            Q4_0 | Q4_1 => (vsubq_s8(lo, vdupq_n_s8(8)), vsubq_s8(hi, vdupq_n_s8(8))),
-            _ => (vsubq_s8(lo, vdupq_n_s8(16)), vsubq_s8(hi, vdupq_n_s8(16))),
+            // The offset (8 or 16) is subtracted from the integer sums.
+            _ => (lo, hi),
         }
     };
     let mut acc = [vdupq_n_f32(0.0); TC];
@@ -710,7 +722,11 @@ unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act
                     vld1q_s8(xq.add(32 * k + 16)),
                 );
             }
-            let s = vpaddq_s32(vpaddq_s32(a[0], a[1]), vpaddq_s32(a[2], a[3]));
+            let mut s = vpaddq_s32(vpaddq_s32(a[0], a[1]), vpaddq_s32(a[2], a[3]));
+            if K != IQ4_NL {
+                let xi = vld1q_s32(x.i.add(c * bpr + blk));
+                s = vsubq_s32(s, if qoff == 16.0 { vshlq_n_s32::<4>(xi) } else { vshlq_n_s32::<3>(xi) });
+            }
             let mut v = vfmaq_f32(acc[c], vcvtq_f32_s32(s), vmulq_f32(dv, vld1q_f32(x.s.add(c * bpr + blk))));
             if has_min {
                 v = vfmaq_f32(v, mv, vld1q_f32(x.f.add(c * bpr + blk)));
@@ -726,7 +742,10 @@ unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act
         let d = f16p(b);
         for c in 0..TC {
             let xq = x.q.add(c * n_in + blk * 32);
-            let s = vaddvq_s32(sdot(sdot(zero, w0, vld1q_s8(xq)), w1, vld1q_s8(xq.add(16))));
+            let mut s = vaddvq_s32(sdot(sdot(zero, w0, vld1q_s8(xq)), w1, vld1q_s8(xq.add(16))));
+            if K != IQ4_NL {
+                s -= qoff as i32 * *x.i.add(c * bpr + blk);
+            }
             out[c] += s as f32 * d * *x.s.add(c * bpr + blk);
             if has_min {
                 out[c] += (f16p(b.add(2)) + d * qoff) * *x.f.add(c * bpr + blk);

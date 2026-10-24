@@ -865,6 +865,9 @@ pub(crate) struct Act {
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub f: *const f32,
     pub h: *const f32,
+    /// Integer block sums of the int8 values (folds the offset of centered nibble formats).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub i: *const i32,
     pub n_in: usize,
 }
 
@@ -876,6 +879,7 @@ impl Act {
             s: unsafe { xa.scales.as_ptr().add(c0 * n / QBLOCK) },
             f: unsafe { xa.fsums.as_ptr().add(c0 * n / QBLOCK) },
             h: unsafe { xa.hsums.as_ptr().add(c0 * n / 16) },
+            i: unsafe { xa.sums.as_ptr().add(c0 * n / QBLOCK) },
             n_in: n,
         }
     }
