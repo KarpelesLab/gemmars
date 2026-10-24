@@ -960,9 +960,7 @@ impl Q4Matrix {
         let fs = &xa.fsums[c * bpr..(c + 1) * bpr];
         let gs: Vec<f32> = fs.chunks(k).map(|ch| ch.iter().sum()).collect();
         for r in r0..r1 {
-            let orow = &o.v[r * gpr..(r + 1) * gpr];
-            let acc: f32 = orow.iter().zip(&gs).map(|(&m, &g)| bf16_to_f32(m) * g).sum();
-            *y.add(r) += acc;
+            *y.add(r) += dot_bf16(&o.v[r * gpr..(r + 1) * gpr], &gs);
         }
     }
 }
@@ -1170,7 +1168,20 @@ pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
             return o[0][0];
         }
     }
-    w.iter().zip(x).map(|(&a, &b)| bf16_to_f32(a) * b).sum()
+    // 8 independent lanes so it vectorizes.
+    let mut acc = [0f32; 8];
+    let (wc, wr) = w.as_chunks::<8>();
+    let (xc, xr) = x.as_chunks::<8>();
+    for (a, b) in wc.iter().zip(xc) {
+        for i in 0..8 {
+            acc[i] += bf16_to_f32(a[i]) * b[i];
+        }
+    }
+    let mut s: f32 = acc.iter().sum();
+    for (&a, &b) in wr.iter().zip(xr) {
+        s += bf16_to_f32(a) * b;
+    }
+    s
 }
 
 /// f32 dot product with 8 independent accumulators (auto-vectorizes).

@@ -48,6 +48,13 @@ inline void load(Q4W w, uint row, uint b, thread float4* out) {
     out[0] = nib_lo(v.x) * d; out[1] = nib_lo(v.y) * d; out[2] = nib_lo(v.z) * d; out[3] = nib_lo(v.w) * d;
     out[4] = nib_hi(v.x) * d; out[5] = nib_hi(v.y) * d; out[6] = nib_hi(v.z) * d; out[7] = nib_hi(v.w) * d;
 }
+// Affine Q4 (MLX): a bf16 offset per group of `gk` blocks is added to every element.
+struct Q4A { Q4W b; device const ushort* o; uint gpr; uint gk; };
+inline void load(Q4A w, uint row, uint b, thread float4* out) {
+    load(w.b, row, b, out);
+    float m = as_type<float>(uint(w.o[(ulong)row * w.gpr + b / w.gk]) << 16);
+    for (uint i = 0; i < 8; i++) out[i] += m;
+}
 inline void load(Q8W w, uint row, uint b, thread float4* out) {
     float d = w.s[(ulong)row * w.bpr + b];
     device const char4* p = (device const char4*)(w.q + (ulong)row * w.n_in + b * 32);
@@ -196,6 +203,14 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
 #define MK_BF BfW{ (device const ushort*)qb + p.w_off, p.n_in }
 #define MK_F32 F32W{ (device const float*)qb + p.w_off, p.n_in }
 GEMM(gemm_bf, BfW, MK_BF) GEMM(gemm_q8, Q8W, MK_Q8) GEMM(gemm_q4, Q4W, MK_Q4) GEMM(gemm_f32, F32W, MK_F32)
+struct OP { uint o_off; uint gpr; uint gk; uint _p; };
+kernel void gemm_q4a(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]],
+                     device const float* x [[buffer(2)]], device float* y [[buffer(3)]], constant P& p [[buffer(4)]],
+                     device const ushort* ob [[buffer(5)]], constant OP& op [[buffer(6)]],
+                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float Ws[64 * LD];
+    Q4A w = { MK_Q4, ob + op.o_off, op.gpr, op.gk }; gemm_body<Q4A>(w, x, y, p, tg, tid, sg, Ws); }
 CONV(conv_bf, BfW, MK_BF) CONV(conv_q8, Q8W, MK_Q8) CONV(conv_q4, Q4W, MK_Q4)
 
 // ---- Normalization statistics and softmax --------------------------------------------------------
@@ -298,6 +313,16 @@ struct Buf {
 struct MetalWeight {
     data: Buf,
     scales: Option<Buf>,
+    /// Affine Q4: the offsets buffer, offsets per row, and blocks of 32 per offset group.
+    offsets: Option<(Buf, u32, u32)>,
+}
+
+#[repr(C)]
+struct OffsetParams {
+    o_off: u32,
+    gpr: u32,
+    gk: u32,
+    _p: u32,
 }
 unsafe impl Send for MetalWeight {}
 unsafe impl Sync for MetalWeight {}
@@ -349,6 +374,8 @@ pub struct MetalBackend {
     queue: Id,
     /// GEMM pipelines indexed by format: bf16, q8, q4.
     pipes: [Id; 3],
+    /// GEMM over affine Q4 weights.
+    pipe_q4a: Id,
     /// Implicit-GEMM convolution pipelines, same order.
     conv_pipes: [Id; 3],
     gemm_f32: Id,
@@ -464,6 +491,7 @@ impl MetalBackend {
             Ok(p)
         };
         let pipes = [pipeline(c"gemm_bf")?, pipeline(c"gemm_q8")?, pipeline(c"gemm_q4")?];
+        let pipe_q4a = pipeline(c"gemm_q4a")?;
         let conv_pipes = [pipeline(c"conv_bf")?, pipeline(c"conv_q8")?, pipeline(c"conv_q4")?];
         let gemm_f32 = pipeline(c"gemm_f32")?;
         let group_stats = pipeline(c"group_stats")?;
@@ -501,6 +529,7 @@ impl MetalBackend {
             device,
             queue,
             pipes,
+            pipe_q4a,
             conv_pipes,
             gemm_f32,
             group_stats,
@@ -622,24 +651,28 @@ impl Backend for MetalBackend {
     }
 
     fn upload(&self, w: &WeightRef, _n_out: usize, _n_in: usize) -> Option<DeviceWeight> {
-        // Affine Q4 (MLX) has no device kernel yet; those layers run on the CPU.
-        if let WeightRef::Q4(m) = w
-            && m.offsets.is_some()
-        {
-            return None;
-        }
         let mw = match w {
             WeightRef::Bf16(w) => MetalWeight {
                 data: self.wrap(w.as_ptr() as *const u8, w.len() * 2)?,
                 scales: None,
+                offsets: None,
             },
             WeightRef::Q8(m) => MetalWeight {
                 data: self.wrap(m.q.as_ptr() as *const u8, m.q.len())?,
                 scales: Some(self.wrap(m.scales.as_ptr() as *const u8, m.scales.len() * 4)?),
+                offsets: None,
             },
             WeightRef::Q4(m) => MetalWeight {
                 data: self.wrap(m.q.as_ptr(), m.q.len())?,
                 scales: Some(self.wrap(m.scales.as_ptr() as *const u8, m.scales.len() * 2)?),
+                offsets: match &m.offsets {
+                    Some(o) => Some((
+                        self.wrap(o.v.as_ptr() as *const u8, o.v.len() * 2)?,
+                        (m.n_in / o.group) as u32,
+                        (o.group / 32) as u32,
+                    )),
+                    None => None,
+                },
             },
         };
         Some(Box::new(mw))
@@ -663,6 +696,9 @@ impl Backend for MetalBackend {
         let Some(mw) = job.dev.downcast_ref::<MetalWeight>() else {
             return false;
         };
+        if mw.offsets.is_some() {
+            return false; // no affine convolution kernel
+        }
         let t_pad = t.div_ceil(TILE) * TILE;
         let mut st = self.staging.lock().unwrap();
         if !self.ensure_staging(&mut st, npx * g.cin * 4, t_pad * job.n_out * 4) {
@@ -1062,7 +1098,27 @@ impl Backend for MetalBackend {
                     w_off: (mw.data.offset_bytes / elem_bytes) as u32,
                     s_off: mw.scales.as_ref().map(|s| s.offset_bytes / scale_bytes).unwrap_or(0) as u32,
                 };
-                set_pipe(enc, self.sels.set_pipeline, self.pipes[fi]);
+                set_pipe(
+                    enc,
+                    self.sels.set_pipeline,
+                    if mw.offsets.is_some() { self.pipe_q4a } else { self.pipes[fi] },
+                );
+                if let Some((ob, gpr, gk)) = &mw.offsets {
+                    let op = OffsetParams {
+                        o_off: (ob.offset_bytes / 2) as u32,
+                        gpr: *gpr,
+                        gk: *gk,
+                        _p: 0,
+                    };
+                    set_buf(enc, self.sels.set_buffer, ob.id, 0, 5);
+                    set_bytes(
+                        enc,
+                        self.sels.set_bytes,
+                        &op as *const OffsetParams as *const c_void,
+                        std::mem::size_of::<OffsetParams>(),
+                        6,
+                    );
+                }
                 set_buf(enc, self.sels.set_buffer, mw.data.id, 0, 0);
                 set_buf(
                     enc,
