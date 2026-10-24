@@ -7,3 +7,4 @@ web/public/oxinfer.wasm
 ios/build/
 ios/OxinferTest/build/
 xcuserdata/
+__pycache__/
