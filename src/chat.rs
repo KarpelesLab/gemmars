@@ -108,17 +108,49 @@ impl ChatFormat for GemmaChat {
 }
 
 /// Qwen3.5 / 3.8 ChatML template: thinking is on by default in the model, so a non-thinking
-/// request closes the think block in the generation prompt.
-pub struct QwenChat;
+/// request closes the think block in the generation prompt. Templates differ in one respect:
+/// Qwen3.8's adds a reasoning-effort instruction to the system turn in thinking mode, Qwen3.5's
+/// does not (and a small model given that instruction anyway can deliberate about it endlessly).
+pub struct QwenChat {
+    pub reasoning_effort: bool,
+}
+
+/// Qwen formats without and with the reasoning-effort instruction.
+pub static QWEN: QwenChat = QwenChat { reasoning_effort: false };
+pub static QWEN_EFFORT: QwenChat = QwenChat { reasoning_effort: true };
+
+impl QwenChat {
+    /// The format matching the model's own chat template (`chat_template.jinja`, or the template
+    /// embedded in `tokenizer_config.json`).
+    pub fn for_model(dir: &std::path::Path) -> &'static QwenChat {
+        let jinja = crate::fsx::read(&dir.join("chat_template.jinja"))
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned());
+        let template = jinja.or_else(|| {
+            let cfg: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("tokenizer_config.json")).ok()?).ok()?;
+            cfg["chat_template"].as_str().map(str::to_string)
+        });
+        if template.is_some_and(|t| t.contains("reasoning_effort")) {
+            &QWEN_EFFORT
+        } else {
+            &QWEN
+        }
+    }
+
+    /// The instruction this template puts first in the system turn when thinking.
+    fn effort(&self, think: bool) -> Option<&'static str> {
+        (think && self.reasoning_effort).then_some(QWEN_REASONING_XHIGH)
+    }
+}
 const QWEN_REASONING_XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
 impl ChatFormat for QwenChat {
     fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
         let mut s = String::new();
-        match (think, system) {
-            (true, Some(sys)) => s.push_str(&format!("<|im_start|>system\n{QWEN_REASONING_XHIGH}\n\n{}<|im_end|>\n", sys.trim())),
-            (true, None) => s.push_str(&format!("<|im_start|>system\n{QWEN_REASONING_XHIGH}<|im_end|>\n")),
-            (false, Some(sys)) => s.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", sys.trim())),
-            (false, None) => {}
+        match (self.effort(think), system) {
+            (Some(e), Some(sys)) => s.push_str(&format!("<|im_start|>system\n{e}\n\n{}<|im_end|>\n", sys.trim())),
+            (Some(e), None) => s.push_str(&format!("<|im_start|>system\n{e}<|im_end|>\n")),
+            (None, Some(sys)) => s.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", sys.trim())),
+            (None, None) => {}
         }
         s
     }
@@ -143,8 +175,8 @@ impl ChatFormat for QwenChat {
             return self.conversation_start(system, think);
         }
         let mut s = String::from("<|im_start|>system\n");
-        if think {
-            s.push_str(QWEN_REASONING_XHIGH);
+        if let Some(e) = self.effort(think) {
+            s.push_str(e);
             s.push_str("\n\n");
         }
         s.push_str(&crate::tools::qwen::tools_block(tools));

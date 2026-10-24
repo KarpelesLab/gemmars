@@ -29,6 +29,9 @@ export async function listFiles(base) {
   }
   const files = ['config.json', 'tokenizer.json'];
   if (await fetchJson(base, 'generation_config.json')) files.push('generation_config.json');
+  // The chat template decides prompt details (Qwen's reasoning-effort line, for one).
+  if (await fetchJson(base, 'tokenizer_config.json')) files.push('tokenizer_config.json');
+  if ((await fetch(`${base}/chat_template.jinja`, { method: 'HEAD' }).catch(() => null))?.ok) files.push('chat_template.jinja');
   const index = await fetchJson(base, 'model.safetensors.index.json');
   if (index && index.weight_map) {
     files.push('model.safetensors.index.json', ...new Set(Object.values(index.weight_map)));
@@ -132,7 +135,7 @@ export async function loadFromUrl(g, base, progress) {
   return total;
 }
 
-const WANTED = /^(config\.json|generation_config\.json|tokenizer\.json|model\.safetensors\.index\.json|.*\.safetensors)$/;
+const WANTED = /^(config\.json|generation_config\.json|tokenizer\.json|tokenizer_config\.json|chat_template\.jinja|model\.safetensors\.index\.json|.*\.safetensors)$/;
 
 /// Reads a folder picked with <input webkitdirectory> into the module.
 export async function loadFromFolder(g, fileList, progress) {

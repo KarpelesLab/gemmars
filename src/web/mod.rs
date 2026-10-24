@@ -47,26 +47,26 @@ pub(crate) fn log(s: &str) {
 
 enum Lm {
     Gemma(Model<'static>, Session),
-    Qwen(QwenModel<'static>, QwenSession),
+    Qwen(QwenModel<'static>, QwenSession, &'static QwenChat),
 }
 
 impl Lm {
     fn forward(&mut self, tokens: &[u32]) -> Vec<f32> {
         match self {
             Lm::Gemma(m, s) => m.forward(s, tokens),
-            Lm::Qwen(m, s) => m.forward(s, tokens),
+            Lm::Qwen(m, s, _) => m.forward(s, tokens),
         }
     }
     fn reset(&mut self) {
         match self {
             Lm::Gemma(m, s) => *s = m.new_session(),
-            Lm::Qwen(m, s) => *s = m.new_session(),
+            Lm::Qwen(m, s, _) => *s = m.new_session(),
         }
     }
     fn fmt(&self) -> &'static dyn ChatFormat {
         match self {
             Lm::Gemma(..) => &GemmaChat,
-            Lm::Qwen(..) => &QwenChat,
+            Lm::Qwen(.., f) => *f,
         }
     }
 }
@@ -190,7 +190,7 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
         let cfg = config::QwenConfig::load(dir)?;
         let m = QwenModel::load(cfg, files, quant)?;
         let s = m.new_session();
-        Lm::Qwen(m, s)
+        Lm::Qwen(m, s, QwenChat::for_model(dir))
     } else {
         let cfg = config::TextConfig::load(dir)?;
         let m = Model::load(cfg, files, quant)?;
@@ -199,7 +199,7 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
     };
     let (layers, hidden, streamed, stored) = match &lm {
         Lm::Gemma(m, _) => (m.cfg.num_hidden_layers, m.cfg.hidden_size, m.streamed_bytes(), m.quant),
-        Lm::Qwen(m, _) => (m.cfg.num_hidden_layers, m.cfg.hidden_size, m.streamed_bytes(), m.quant),
+        Lm::Qwen(m, ..) => (m.cfg.num_hidden_layers, m.cfg.hidden_size, m.streamed_bytes(), m.quant),
     };
     let _ = quant;
     let eos = crate::chat::with_turn_end(lm.fmt(), &tok, eos);

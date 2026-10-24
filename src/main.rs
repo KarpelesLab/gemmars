@@ -1054,7 +1054,8 @@ fn run_qwen(args: Args) -> Result<()> {
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let model = qwen::QwenModel::load(cfg, &files, args.quant)?;
     let tok = Tokenizer::from_file(args.model.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    let eos = chat::with_turn_end(&chat::QwenChat, &tok, eos);
+    let fmt = chat::QwenChat::for_model(&args.model);
+    let eos = chat::with_turn_end(fmt, &tok, eos);
     eprintln!(
         "[loaded Qwen: {} layers, hidden {}, {:.1} GB checkpoint ({}), {:?} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
         model.cfg.num_hidden_layers,
@@ -1069,7 +1070,7 @@ fn run_qwen(args: Args) -> Result<()> {
     if let Some(out) = &args.save_quantized {
         return save_quantized(&args.model, out, &files, model.quant);
     }
-    run_text(&args, &model, &tok, &eos, &chat::QwenChat)
+    run_text(&args, &model, &tok, &eos, fmt)
 }
 
 fn run_gemma(args: Args) -> Result<()> {
