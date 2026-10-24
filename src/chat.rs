@@ -303,11 +303,48 @@ impl QwenChat {
 
 /// Qwen2 / Qwen2.5 ChatML: like Qwen3 without thinking, and the template's default system
 /// prompt when none is given.
-pub struct Qwen2Chat;
-const QWEN2_DEFAULT_SYSTEM: &str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+pub struct Qwen2Chat {
+    pub default_system: Option<String>,
+}
+
+impl Qwen2Chat {
+    /// The format of a chat template: its default system prompt is the literal in
+    /// `'<|im_start|>system\n...<|im_end|>\n'` (Qwen2.5: "You are Qwen, created by Alibaba
+    /// Cloud. You are a helpful assistant."; fine-tunes change it).
+    pub fn for_template(template: &str) -> Qwen2Chat {
+        const OPEN: &str = "'<|im_start|>system\\n";
+        const CLOSE: &str = "<|im_end|>\\n'";
+        let default_system = template.match_indices(OPEN).find_map(|(i, _)| {
+            let rest = &template[i + OPEN.len()..];
+            let body = &rest[..rest.find(CLOSE)?];
+            // Skip the `'<|im_start|>system\n' + messages[0]['content']` concatenation.
+            if body.contains('\'') {
+                return None;
+            }
+            let mut out = String::new();
+            let mut it = body.chars();
+            while let Some(c) = it.next() {
+                match (c, c == '\\') {
+                    (_, true) => match it.next() {
+                        Some('n') => out.push('\n'),
+                        Some(o) => out.push(o),
+                        None => {}
+                    },
+                    (c, false) => out.push(c),
+                }
+            }
+            Some(out)
+        });
+        Qwen2Chat { default_system }
+    }
+}
+
 impl ChatFormat for Qwen2Chat {
     fn conversation_start(&self, system: Option<&str>, _think: bool) -> String {
-        format!("<|im_start|>system\n{}<|im_end|>\n", system.unwrap_or(QWEN2_DEFAULT_SYSTEM))
+        match system.or(self.default_system.as_deref()) {
+            Some(s) => format!("<|im_start|>system\n{s}<|im_end|>\n"),
+            None => String::new(),
+        }
     }
     fn user_turn(&self, content: &str, _think: bool) -> String {
         format!("<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n")

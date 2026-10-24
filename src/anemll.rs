@@ -259,11 +259,32 @@ pub mod yaml {
                 }
             } else if v.starts_with('|') || v.starts_with('>') {
                 Value::Str(self.block_scalar(ind, v.starts_with('>')))
+            } else if (v.starts_with('\'') || v.starts_with('"')) && !quote_closed(v) {
+                Value::Str(self.multiline_quoted(v))
             } else {
                 scalar(v)
             };
             m.push((key, val));
             Ok(())
+        }
+
+        /// A quoted scalar continued over the next lines (folded: a line break is a space, an
+        /// empty line a newline).
+        fn multiline_quoted(&mut self, first: &str) -> String {
+            let mut s = first.to_string();
+            while self.i < self.raw.len() && !quote_closed(&s) {
+                let l = self.raw[self.i].trim();
+                self.i += 1;
+                if l.is_empty() {
+                    s.push('\n');
+                } else {
+                    if !s.ends_with('\n') {
+                        s.push(' ');
+                    }
+                    s.push_str(l);
+                }
+            }
+            unquote(&s)
         }
 
         /// The lines of a `|` / `>` block scalar: everything indented deeper than `ind`.
@@ -308,6 +329,23 @@ pub mod yaml {
             }
         }
         None
+    }
+
+    /// Whether a scalar starting with a quote also ends its quoted part.
+    fn quote_closed(s: &str) -> bool {
+        let q = s.as_bytes()[0];
+        let b = &s.as_bytes()[1..];
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\\' if q == b'"' => i += 1,
+                b'\'' if q == b'\'' && b.get(i + 1) == Some(&b'\'') => i += 1,
+                c if c == q => return true,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
     }
 
     fn unquote(s: &str) -> String {
@@ -429,13 +467,17 @@ pub fn is_anemll(dir: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dir.join("meta.yaml")) else {
         return false;
     };
+    // Compiled parts next to it are enough (the loader then reports any meta.yaml problem).
+    if has_mlmodelc(dir) {
+        return true;
+    }
     let Ok(v) = yaml::parse(&text) else {
         return false;
     };
     let info = v.get("model_info");
     let framework = info.and_then(|i| i.get("framework")).and_then(yaml::Value::as_str).unwrap_or("");
-    let params = info.and_then(|i| i.get("parameters"));
-    params.is_some() && (framework.eq_ignore_ascii_case("core ml") || framework.eq_ignore_ascii_case("coreml") || has_mlmodelc(dir))
+    info.and_then(|i| i.get("parameters")).is_some()
+        && (framework.eq_ignore_ascii_case("core ml") || framework.eq_ignore_ascii_case("coreml"))
 }
 
 fn has_mlmodelc(dir: &Path) -> bool {
@@ -655,6 +697,11 @@ pub enum PrefillMode {
     Auto,
     /// Full batches through the `prefill` functions, the rest token by token.
     Batched,
+    /// As `Batched`, with the last partial batch padded (outside rotate mode): one prediction
+    /// instead of up to `batch_size - 1`, much faster for short prompts, but the KV entries of
+    /// those tokens differ from ANEMLL's runtimes in fp16 rounding (the Swift CLI does the same
+    /// for `update_mask` models).
+    Padded,
     /// Every token through `infer`. Slow (decode speed).
     Single,
 }
@@ -1159,6 +1206,18 @@ impl AnemllModel {
             self.batch(&tok(p)[..b], p, false)?;
             p += b;
         }
+        // The last partial batch, padded with token 0: the pad positions' KV entries lie past
+        // the prompt, hidden by the causal mask and overwritten by the next tokens. Not in
+        // rotate mode, where the window would shift them in.
+        let cap = self.meta.context_length.min(boundary);
+        if self.options.prefill == PrefillMode::Padded && p < fill_end && p + b <= cap {
+            let mut ids = tok(p)[..fill_end - p].to_vec();
+            let valid = ids.len();
+            ids.resize(b, 0);
+            self.fill(&ids, p, valid);
+            self.exec(PlanKind::Prefill, p, false)?;
+            p = fill_end;
+        }
         while p < fill_end {
             self.single(tok(p)[0], p, false)?;
             p += 1;
@@ -1179,7 +1238,8 @@ impl AnemllModel {
     }
 
     /// Writes the shared inputs for `ids` at positions `p..p+ids.len()`.
-    fn fill(&mut self, ids: &[u32], p: usize) {
+    /// `update_mask` marks only the first `valid` tokens (the rest are padding).
+    fn fill(&mut self, ids: &[u32], p: usize, valid: usize) {
         let t = ids.len();
         for k in 0..self.shared.len() {
             let (name, shape, i) = (&self.shared[k].0, &self.shared[k].1, self.shared[k].2);
@@ -1199,7 +1259,7 @@ impl AnemllModel {
                 "update_mask" if shape[3] == t => {
                     let l = shape[2];
                     let mut bits = vec![0u16; l * t];
-                    for r in 0..t {
+                    for r in 0..valid {
                         if p + r < l {
                             bits[(p + r) * t + r] = 0x3C00; // 1.0
                         }
@@ -1240,7 +1300,7 @@ impl AnemllModel {
     /// One token at position `p` through `infer` (`infer_rotate` past the window), and the LM
     /// head when `head` (its outputs are then in the plan's arrays).
     fn single(&mut self, token: u32, p: usize, head: bool) -> Result<()> {
-        self.fill(&[token], p);
+        self.fill(&[token], p, 1);
         let which = if self.use_rotate(p) {
             PlanKind::InferRotate
         } else {
@@ -1251,7 +1311,7 @@ impl AnemllModel {
 
     /// A full batch at positions `p..p+batch` through the prefill functions.
     fn batch(&mut self, ids: &[u32], p: usize, rotate: bool) -> Result<()> {
-        self.fill(ids, p);
+        self.fill(ids, p, ids.len());
         self.exec(if rotate { PlanKind::PrefillRotate } else { PlanKind::Prefill }, p, false)
     }
 
@@ -1311,7 +1371,7 @@ mod tests {
 
     #[test]
     fn meta_yaml_subset() {
-        let src = "model_info:\n  name: anemll-x\n  version: 0.3.5\n  description: |\n    Line one\n    Context length: 512\n  license: MIT\n  framework: Core ML\n  model_type: monolithic\n  parameters:\n    context_length: 4096\n    lut_ffn: 6\n    lut_embeddings: none\n    argmax_in_model: true\n    lm_head_chunk_sizes: [16384, 16384]\n    quoted: \"a: b # c\"\n    functions:\n      - infer\n      - prefill\n    recommended_sampling:\n      temperature: 0.7\n      top_k: 64\n\n# trailing comment\n# key: not a key\n";
+        let src = "model_info:\n  name: anemll-x\n  version: 0.3.5\n  description: |\n    Line one\n    Context length: 512\n  summary: 'Two\n\n    lines\n\n    '\n  license: MIT\n  framework: Core ML\n  model_type: monolithic\n  parameters:\n    context_length: 4096\n    lut_ffn: 6\n    lut_embeddings: none\n    argmax_in_model: true\n    lm_head_chunk_sizes: [16384, 16384]\n    quoted: \"a: b # c\"\n    functions:\n      - infer\n      - prefill\n    sizes:\n    - 3\n    - 4\n    recommended_sampling:\n      temperature: 0.7\n      top_k: 64\n\n# trailing comment\n# key: not a key\n";
         let v = parse(src).unwrap();
         let info = v.get("model_info").unwrap();
         assert_eq!(info.get("version"), Some(&Value::Str("0.3.5".into())));
@@ -1319,6 +1379,7 @@ mod tests {
             info.get("description").and_then(Value::as_str),
             Some("Line one\nContext length: 512\n")
         );
+        assert_eq!(info.get("summary").and_then(Value::as_str), Some("Two\nlines\n"));
         assert_eq!(info.get("framework").and_then(Value::as_str), Some("Core ML"));
         let p = info.get("parameters").unwrap();
         assert_eq!(p.get("context_length").and_then(Value::as_usize), Some(4096));
@@ -1329,6 +1390,8 @@ mod tests {
             Some(vec![16384, 16384])
         );
         assert_eq!(p.get("quoted").and_then(Value::as_str), Some("a: b # c"));
+        assert_eq!(p.get("sizes").and_then(Value::as_usize_list), Some(vec![3, 4]));
+        assert_eq!(p.get("argmax_in_model").and_then(Value::as_bool), Some(true));
         assert_eq!(
             p.get("functions"),
             Some(&Value::List(vec![Value::Str("infer".into()), Value::Str("prefill".into())]))

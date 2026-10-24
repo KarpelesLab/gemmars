@@ -13,7 +13,8 @@ use std::path::Path;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
-/// The chat format matching the model's template (`tokenizer_config.json`).
+/// The chat format matching the model's template (`chat_template.jinja` or
+/// `tokenizer_config.json`).
 fn chat_format(meta: &Meta) -> Result<&'static dyn ChatFormat> {
     let cfg: serde_json::Value = std::fs::read(meta.tokenizer_dir.join("tokenizer_config.json"))
         .ok()
@@ -26,8 +27,9 @@ fn chat_format(meta: &Meta) -> Result<&'static dyn ChatFormat> {
         &chat::Llama3Chat
     } else if tpl.contains("<start_of_turn>") || arch.contains("gemma3") {
         &chat::Gemma3Chat
-    } else if tpl.contains("You are Qwen, created by Alibaba Cloud") || arch.contains("qwen2") {
-        &chat::Qwen2Chat
+    } else if (tpl.contains("<|im_start|>") && !tpl.contains("</think>")) || (tpl.is_empty() && arch.contains("qwen2")) {
+        // Qwen2 / 2.5 ChatML (no thinking block); one per process, so leaking it is fine.
+        Box::leak(Box::new(chat::Qwen2Chat::for_template(tpl)))
     } else if tpl.contains("<|im_start|>") || arch.contains("qwen") {
         chat::QwenChat::for_template(Some(tpl))
     } else {
@@ -110,7 +112,8 @@ fn generate(
         }
         if m.remaining() == 0 {
             printer.flush_text(tok, &out, true);
-            eprintln!("\n[context full: the Core ML model holds {} tokens]", m.context_length());
+            println!();
+            eprintln!("[context full: the Core ML model holds {} tokens]", m.context_length());
             return Ok((out, steps, t0.elapsed().as_secs_f64()));
         }
         next = m.step(id)?;
@@ -170,8 +173,9 @@ pub fn run(args: &Args) -> Result<()> {
         prefill: match args.coreml_prefill.as_deref() {
             None | Some("auto") => PrefillMode::Auto,
             Some("batch") => PrefillMode::Batched,
+            Some("pad") => PrefillMode::Padded,
             Some("single") => PrefillMode::Single,
-            Some(o) => bail!("unknown --coreml-prefill {o} (auto|batch|single)"),
+            Some(o) => bail!("unknown --coreml-prefill {o} (auto|batch|pad|single)"),
         },
     };
     eprintln!(
@@ -195,10 +199,11 @@ pub fn run(args: &Args) -> Result<()> {
     eprintln!(
         "[loaded in {:.1}s; {} prefill{}]",
         m.stats.load_secs,
-        if m.options.prefill == PrefillMode::Batched {
-            "batched"
-        } else {
-            "token-by-token (no batch-prefill flag in meta.yaml; --coreml-prefill batch to force)"
+        match m.options.prefill {
+            PrefillMode::Padded => "padded batch",
+            PrefillMode::Batched => "batched",
+            _ if args.coreml_prefill.is_some() => "token-by-token",
+            _ => "token-by-token (no batch-prefill flag in meta.yaml; --coreml-prefill batch to force)",
         },
         if m.rotation() { "; sliding-window rotation" } else { "" }
     );
