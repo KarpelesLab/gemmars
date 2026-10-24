@@ -465,10 +465,7 @@ fn generate<M: TextLm>(
         // Every token after the first follows one forward pass.
         if let (true, Some(s), Some(s0)) = (trace && out.len() > 1, &stream, &s_last) {
             let now = s.stats();
-            eprintln!(
-                "[token: {}]",
-                stream_line(&(now - *s0), 1, t_last.elapsed().as_secs_f64())
-            );
+            eprintln!("[token: {}]", stream_line(&(now - *s0), 1, t_last.elapsed().as_secs_f64()));
             (s_last, t_last) = (Some(now), Instant::now());
         }
         printer.print(tok, out)
@@ -1117,10 +1114,7 @@ fn run_qwen_mtp(
                 let now = s.stats();
                 if now.bytes_read != sl.bytes_read || now.stall != sl.stall {
                     let n = out.len() - n_last;
-                    eprintln!(
-                        "[step: +{n}: {}]",
-                        stream_line(&(now - *sl), n, t_last.elapsed().as_secs_f64())
-                    );
+                    eprintln!("[step: +{n}: {}]", stream_line(&(now - *sl), n, t_last.elapsed().as_secs_f64()));
                     (s_last, t_last, n_last) = (Some(now), Instant::now(), out.len());
                 }
             }
