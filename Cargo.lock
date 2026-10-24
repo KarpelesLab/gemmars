@@ -370,24 +370,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gemmars"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dlsym",
- "half",
- "memmap2",
- "oxideav-core",
- "oxideav-image",
- "oxideav-meta",
- "oxideav-pipeline",
- "rsurl",
- "serde",
- "serde_json",
- "tokenizers",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -822,6 +804,24 @@ checksum = "f165f68743f086d7349770ed9e9ae5a9acc622a87fc44fe5af5f892f74abf556"
 dependencies = [
  "oxideav-core",
  "oxideav-vp8",
+]
+
+[[package]]
+name = "oxinfer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dlsym",
+ "half",
+ "memmap2",
+ "oxideav-core",
+ "oxideav-image",
+ "oxideav-meta",
+ "oxideav-pipeline",
+ "rsurl",
+ "serde",
+ "serde_json",
+ "tokenizers",
 ]
 
 [[package]]

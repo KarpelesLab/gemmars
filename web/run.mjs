@@ -1,7 +1,7 @@
 #!/usr/bin/env -S deno run --allow-read --allow-env
 // Deno CLI for the browser build: same module and glue as index.html, model from a local directory.
-//   deno run --allow-read web/run.mjs --model ~/.cache/gemmars/hub/Qwen--Qwen3.5-0.8B --quant q8 -p "Hello"
-import { Gemmars, WebGpuHost, wantedFiles, hasJspi, isHostShard } from './gemmars.js';
+//   deno run --allow-read web/run.mjs --model ~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B --quant q8 -p "Hello"
+import { Oxinfer, WebGpuHost, wantedFiles, hasJspi, isHostShard } from './oxinfer.js';
 
 const args = Deno.args;
 const opt = (name, def) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : def; };
@@ -14,10 +14,10 @@ const maxTokens = Number(opt('--max-tokens', '128'));
 const chunk = Number(opt('--chunk', '0'));
 const log = (s) => console.error(s);
 
-const wasmPath = new URL('./target/wasm32-unknown-unknown/release/gemmars_web.wasm', import.meta.url);
+const wasmPath = new URL('./target/wasm32-unknown-unknown/release/oxinfer_web.wasm', import.meta.url);
 const gpu = has('--cpu') ? null : await WebGpuHost.create(log);
 log(`[host: deno ${Deno.version.deno}, jspi ${hasJspi}, gpu ${gpu ? 'yes' : 'no'}]`);
-const g = await Gemmars.create(Deno.readFileSync(wasmPath), { gpu, log, jspi: !has('--no-jspi') });
+const g = await Oxinfer.create(Deno.readFileSync(wasmPath), { gpu, log, jspi: !has('--no-jspi') });
 
 const t0 = performance.now();
 let total = 0;

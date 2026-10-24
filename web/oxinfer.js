@@ -1,4 +1,4 @@
-// Host side of the gemmars WebAssembly module (browser and Deno, ES module, no build step).
+// Host side of the oxinfer WebAssembly module (browser and Deno, ES module, no build step).
 //
 // The module is plain C-ABI wasm (see src/lib.rs). This file provides its imports: a log sink, a
 // clock, randomness, and the WebGPU backend (`gpu_upload` / `gpu_matmul`). GPU readback is
@@ -262,11 +262,11 @@ const dec = new TextDecoder();
 
 export const hasJspi = typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
 
-export class Gemmars {
+export class Oxinfer {
   /// `source`: the .wasm bytes, a Response, or a URL string. `gpu`: a WebGpuHost, null for CPU only.
   /// `jspi: false` forces the plain synchronous exports (CPU only), as on engines without JSPI.
   static async create(source, { gpu = null, log = (s) => console.error(s), jspi = hasJspi } = {}) {
-    const g = new Gemmars();
+    const g = new Oxinfer();
     g.log = log;
     jspi = jspi && hasJspi;
     g.gpu = jspi ? gpu : null;

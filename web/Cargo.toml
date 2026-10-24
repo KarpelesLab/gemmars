@@ -1,14 +1,14 @@
 [package]
-name = "gemmars-web"
+name = "oxinfer-web"
 version = "0.1.0"
 edition = "2024"
-description = "Browser / Deno build of gemmars: a C-ABI wasm module with a WebGPU backend driven from JavaScript"
+description = "Browser / Deno build of oxinfer: a C-ABI wasm module with a WebGPU backend driven from JavaScript"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-gemmars = { path = "..", default-features = false }
+oxinfer = { path = "..", default-features = false }
 anyhow = "1.0.104"
 getrandom = { version = "0.3", default-features = false }
 tokenizers = { version = "0.23.2", default-features = false, features = ["unstable_wasm"] }

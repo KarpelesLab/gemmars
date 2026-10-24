@@ -1,5 +1,5 @@
 // Standalone check of the WGSL GEMM against a JS reference, for the three weight formats.
-import { WebGpuHost } from './gemmars.js';
+import { WebGpuHost } from './oxinfer.js';
 const gpu = await WebGpuHost.create((s) => console.error(s));
 const f16 = (v) => { // f32 -> f16 bits (round to nearest, enough for small scales)
   const f = new Float32Array([v]); const u = new Uint32Array(f.buffer)[0];

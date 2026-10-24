@@ -1,7 +1,7 @@
 //! Fetching and caching HuggingFace model repositories by name, over rsurl (pure-Rust HTTP).
 //!
-//! `--model google/gemma-4-E4B-it` resolves to `$GEMMARS_CACHE/google--gemma-4-E4B-it` (default
-//! `~/.cache/gemmars/hub`), downloading the config, tokenizer, template and safetensors files that
+//! `--model google/gemma-4-E4B-it` resolves to `$OXINFER_CACHE/google--gemma-4-E4B-it` (default
+//! `~/.cache/oxinfer/hub`), downloading the config, tokenizer, template and safetensors files that
 //! are missing or incomplete. Downloads are resumable. Gated repos need `HF_TOKEN`.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub fn cache_root() -> PathBuf {
-    if let Ok(p) = std::env::var("GEMMARS_CACHE") {
+    if let Ok(p) = std::env::var("OXINFER_CACHE") {
         return PathBuf::from(p);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".cache").join("gemmars").join("hub")
+    PathBuf::from(home).join(".cache").join("oxinfer").join("hub")
 }
 
 /// A local directory is used as is; otherwise `spec` must be a repo id (`org/name`), which is
@@ -46,7 +46,7 @@ fn request(url: &str) -> Result<Request> {
         .map_err(|e| anyhow!("{url}: {e}"))?
         .follow_redirects(true)
         .max_redirs(10)
-        .header("User-Agent", "gemmars/0.1")
+        .header("User-Agent", "oxinfer/0.1")
         // The resumable downloader stores raw bytes; refuse compressed transfer encodings.
         .header("Accept-Encoding", "identity");
     if let Some(t) = token() {

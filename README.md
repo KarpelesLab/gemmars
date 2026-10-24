@@ -1,13 +1,15 @@
-# gemmars
+# oxinfer
 
-Gemma 4 text inference in pure Rust on the CPU. No GPU, no BLAS, no ML framework:
-bf16 weights are read straight out of the HuggingFace safetensors files and every
-operation (matmuls, attention, norms, RoPE, sampling) is implemented here and run
-across threads with NEON SIMD.
+Local LLM inference in pure Rust: Gemma 4 (text, images, audio) and Qwen 3.5 / 3.8 today, more
+model families as they come. No BLAS, no ML framework: weights are read straight out of the
+HuggingFace safetensors files and every operation (matmuls, attention, norms, RoPE, sampling) is
+implemented here, with hand-written SIMD kernels (NEON, AVX2, wasm simd128) and its own thread
+pool. The CPU path runs everywhere; GPUs (Metal, CUDA, WebGPU in the browser) are detected at
+run time and used for prefill when present, with nothing linked at build time.
 
-Output is validated against the `transformers` float32 reference: on E2B-it the
-last-token logits agree to a max absolute difference of about 1e-4 and greedy
-decoding produces identical tokens.
+Output is validated against the `transformers` float32 reference: on Gemma 4 E2B-it the
+last-token logits agree to a max absolute difference of about 1e-4 and greedy decoding produces
+identical tokens.
 
 ## Supported models
 
@@ -39,7 +41,7 @@ Text, images and audio are supported (E2B/E4B have both towers). Video is not.
 ## Images and audio
 
 ```sh
-./target/release/gemmars --model models/gemma-4-E4B-it --quant q4 \
+./target/release/oxinfer --model models/gemma-4-E4B-it --quant q4 \
     --image photo.jpg --audio clip.wav --prompt "Describe the image and transcribe the audio."
 ```
 
@@ -63,12 +65,12 @@ stays causal, matching the E2B/E4B configuration.
 ## Getting weights
 
 `--model` accepts a HuggingFace repo id and fetches it on first use (resumable, pure-Rust HTTP via
-[rsurl](https://crates.io/crates/rsurl)) into `~/.cache/gemmars/hub` (or `$GEMMARS_CACHE`,
+[rsurl](https://crates.io/crates/rsurl)) into `~/.cache/oxinfer/hub` (or `$OXINFER_CACHE`,
 or `--cache-dir`):
 
 ```sh
-./target/release/gemmars --model google/gemma-4-E4B-it --quant q4 -p "Hello"
-./target/release/gemmars --model Qwen/Qwen3.8-27B --download-only     # just fetch
+./target/release/oxinfer --model google/gemma-4-E4B-it --quant q4 -p "Hello"
+./target/release/oxinfer --model Qwen/Qwen3.8-27B --download-only     # just fetch
 ```
 
 Set `HF_TOKEN` for gated repos. The Gemma 4 checkpoints are Apache 2.0 and not gated; manual
@@ -89,9 +91,9 @@ For speculative decoding also fetch `google/gemma-4-E4B-it-assistant` (160 MB) t
 
 ```sh
 cargo build --release
-./target/release/gemmars --model models/gemma-4-E4B-it --prompt "Explain RMSNorm in two sentences."
-./target/release/gemmars --model models/gemma-4-E4B-it --chat          # interactive, multi-turn
-./target/release/gemmars --model models/gemma-4-E4B-it --think -p "..."  # enable thinking mode
+./target/release/oxinfer --model models/gemma-4-E4B-it --prompt "Explain RMSNorm in two sentences."
+./target/release/oxinfer --model models/gemma-4-E4B-it --chat          # interactive, multi-turn
+./target/release/oxinfer --model models/gemma-4-E4B-it --think -p "..."  # enable thinking mode
 ```
 
 Useful flags:
@@ -173,8 +175,8 @@ here, and they are a different fine-tune (KL 0.03 from the regular model).
 result instead, so later runs (and browsers) load the int8 / int4 blocks as they are:
 
 ```sh
-./target/release/gemmars --model google/gemma-4-E4B-it --quant q4 --save-quantized models/gemma-4-E4B-it-q4
-./target/release/gemmars --model models/gemma-4-E4B-it-q4 -p "Hello"     # precision comes from the file
+./target/release/oxinfer --model google/gemma-4-E4B-it --quant q4 --save-quantized models/gemma-4-E4B-it-q4
+./target/release/oxinfer --model models/gemma-4-E4B-it-q4 -p "Hello"     # precision comes from the file
 ```
 
 The output is ordinary safetensors: each quantized matrix `X` becomes `X.q8` (I8) + `X.q8s` (F32
@@ -185,7 +187,7 @@ precision. Shards are at most 1 GiB (one allocation must stay under 2 GiB in was
 tensors start on 16 KiB boundaries so Metal wraps them in place. The embedding tables are stored
 quantized too and dequantized one row per token; tables that are only ever looked up (Gemma's
 per-layer embeddings, Qwen 27B's untied input embedding) go to separate `model-tables-*` shards,
-which the browser host keeps outside wasm memory. `GEMMARS_TABLE_QUANT=bf16|q8|q4` overrides
+which the browser host keeps outside wasm memory. `OXINFER_TABLE_QUANT=bf16|q8|q4` overrides
 their precision (default: the model's).
 
 | Model | bf16 checkpoint | Q4 file | Load (in RAM) | KL vs bf16: Q4 at load / Q4 file |
@@ -255,8 +257,8 @@ maximum for the threads target to 4 GiB. The model directory is passed in as a p
 cargo build --release --target wasm32-wasip1 --no-default-features
 # threads (wasi-threads): wasmtime up to v30 runs it; v31+ dropped the wasi-threads proposal
 cargo build --release --target wasm32-wasip1-threads --no-default-features
-wasmtime run -W threads=y -S threads=y --dir ~/.cache/gemmars/hub/Qwen--Qwen3.5-0.8B::/model \
-  target/wasm32-wasip1-threads/release/gemmars.wasm --model /model --quant q8 -j 16 -p "Hello"
+wasmtime run -W threads=y -S threads=y --dir ~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B::/model \
+  target/wasm32-wasip1-threads/release/oxinfer.wasm --model /model --quant q8 -j 16 -p "Hello"
 ```
 
 Qwen3.5-0.8B Q8, 18-core M5 Max, 17-token prompt:
@@ -274,8 +276,8 @@ always read into memory.
 
 ### Browser (WebGPU)
 
-`web/` is a second crate (`gemmars-web`, `cdylib`) that wraps the library in a plain C-ABI wasm
-module, no bindgen, plus the JavaScript host `web/gemmars.js` and a page `web/index.html`. The
+`web/` is a second crate (`oxinfer-web`, `cdylib`) that wraps the library in a plain C-ABI wasm
+module, no bindgen, plus the JavaScript host `web/oxinfer.js` and a page `web/index.html`. The
 host registers the model files in the module's in-memory filesystem (streamed straight from
 `fetch` or a local folder into module memory) and drives a chat session token by token.
 
@@ -288,8 +290,8 @@ Promise Integration, Chrome 137+). Without JSPI or WebGPU the same page runs on 
 WebGL is not used: it has no compute shaders.
 
 ```sh
-cd web && cargo build --release --target wasm32-unknown-unknown     # web/target/.../gemmars_web.wasm
-deno run --allow-net --allow-read web/serve.ts ~/.cache/gemmars/hub   # http://localhost:8080/, models at /models/<dir>
+cd web && cargo build --release --target wasm32-unknown-unknown     # web/target/.../oxinfer_web.wasm
+deno run --allow-net --allow-read web/serve.ts ~/.cache/oxinfer/hub   # http://localhost:8080/, models at /models/<dir>
 # or from Deno directly (Deno has WebGPU, but its readback polls every ~14 ms, so --cpu is as fast there):
 deno run --allow-read --allow-env web/run.mjs --model models/gemma-4-E4B-it-q4 --cpu -p "Hello"
 ```
@@ -361,6 +363,6 @@ Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex bac
 ```sh
 python3 -m venv venv && ./venv/bin/pip install torch transformers safetensors numpy
 printf '<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n' > prompt.txt
-./target/release/gemmars --model models/gemma-4-E2B-it --prompt "What is the capital of France?" --dump-logits ours.bin
+./target/release/oxinfer --model models/gemma-4-E2B-it --prompt "What is the capital of France?" --dump-logits ours.bin
 ./venv/bin/python tools/ref_logits.py models/gemma-4-E2B-it prompt.txt ours.bin --generate 12
 ```

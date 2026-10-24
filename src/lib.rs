@@ -1,4 +1,4 @@
-//! gemmars: CPU-first inference for Gemma 4 and Qwen 3.5/3.8 in pure Rust, with optional
+//! oxinfer: CPU-first inference for Gemma 4 and Qwen 3.5/3.8 in pure Rust, with optional
 //! runtime-detected accelerators.
 
 pub mod audio;

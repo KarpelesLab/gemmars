@@ -1,14 +1,14 @@
 [package]
-name = "gemmars"
+name = "oxinfer"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "gemmars"
+name = "oxinfer"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gemmars"
+name = "oxinfer"
 path = "src/main.rs"
 
 [[bin]]

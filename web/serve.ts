@@ -1,6 +1,6 @@
 // Development server for the browser build: serves this directory, mounts a local model directory
 // at /models/, and prints lines posted to /log (used by index.html?auto=1 for headless runs).
-//   deno run --allow-net --allow-read web/serve.ts ~/.cache/gemmars/hub [port]
+//   deno run --allow-net --allow-read web/serve.ts ~/.cache/oxinfer/hub [port]
 const models = Deno.args[0] ? Deno.args[0].replace(/\/$/, '') : null;
 const port = Number(Deno.args[1] || 8080);
 const root = new URL('.', import.meta.url).pathname.replace(/\/$/, '');

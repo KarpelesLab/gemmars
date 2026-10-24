@@ -125,7 +125,7 @@ impl Pool {
         let mut handles: Vec<thread::Thread> = Vec::with_capacity(threads.max(1) - 1);
         for i in 0..threads.max(1) - 1 {
             let s = shared.clone();
-            match thread::Builder::new().name(format!("gemmars-{i}")).spawn(move || worker(s)) {
+            match thread::Builder::new().name(format!("oxinfer-{i}")).spawn(move || worker(s)) {
                 Ok(h) => handles.push(h.thread().clone()),
                 Err(_) => break,
             }

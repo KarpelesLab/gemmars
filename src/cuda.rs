@@ -211,7 +211,7 @@ impl CudaBackend {
             unsafe { Nvrtc::open_first(NVRTC_CANDIDATES.iter().copied()) }.map_err(|e| anyhow!("libnvrtc (ships with the CUDA toolkit): {e}"))?
         };
         let src = CString::new(KERNEL_SRC)?;
-        let name = CString::new("gemmars.cu")?;
+        let name = CString::new("oxinfer.cu")?;
         let mut prog: *mut c_void = std::ptr::null_mut();
         let rc = unsafe { nvrtc.nvrtcCreateProgram(&mut prog, src.as_ptr(), name.as_ptr(), 0, std::ptr::null(), std::ptr::null()) };
         if rc != 0 {

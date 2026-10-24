@@ -43,15 +43,15 @@ impl Quant {
     }
     /// The precision a pre-quantized checkpoint was written with (overrides `--quant`).
     pub fn stored(files: &ModelFiles) -> Option<Quant> {
-        files.metadata("gemmars_quant").and_then(Quant::parse)
+        files.metadata("oxinfer_quant").and_then(Quant::parse)
     }
 }
 
 /// Precision of the embedding tables written by `--save-quantized` (rows are dequantized one
-/// token at a time, so they are never streamed in full): `GEMMARS_TABLE_QUANT=bf16|q8|q4`,
+/// token at a time, so they are never streamed in full): `OXINFER_TABLE_QUANT=bf16|q8|q4`,
 /// default the model precision.
 pub fn table_quant(quant: Quant) -> Quant {
-    std::env::var("GEMMARS_TABLE_QUANT").ok().and_then(|v| Quant::parse(&v)).unwrap_or(quant)
+    std::env::var("OXINFER_TABLE_QUANT").ok().and_then(|v| Quant::parse(&v)).unwrap_or(quant)
 }
 
 /// An embedding table `[rows, cols]` read one row at a time: borrowed bf16 or pre-quantized.
@@ -440,9 +440,9 @@ impl<'a> Model<'a> {
         let lin_with = |name: &str, n_out: usize, n_in: usize, q: Quant| load_lin(files, &format!("{prefix}{name}"), n_out, n_in, q);
         let lin = |name: &str, n_out: usize, n_in: usize| lin_with(name, n_out, n_in, quant);
         // The PLE projection feeds every layer directly: keep it at Q8 under Q4. The LM head follows
-        // GEMMARS_HEAD_Q8=1 (Q8) or defaults to the model precision.
+        // OXINFER_HEAD_Q8=1 (Q8) or defaults to the model precision.
         let hi_quant = if quant == Quant::Q4 { Quant::Q8 } else { quant };
-        let head_quant = if quant == Quant::Q4 && std::env::var("GEMMARS_HEAD_Q8").is_ok() { Quant::Q8 } else { quant };
+        let head_quant = if quant == Quant::Q4 && std::env::var("OXINFER_HEAD_Q8").is_ok() { Quant::Q8 } else { quant };
 
         // Tied: lookups and the LM head read the same tensor (one copy in a pre-quantized file).
         let embed = Table::load(files, &format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h, head_quant)?;

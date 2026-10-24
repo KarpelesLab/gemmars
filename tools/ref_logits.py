@@ -3,7 +3,7 @@
 
 usage: ref_logits.py MODEL_DIR PROMPT_TEXT_FILE OURS_LOGITS.bin [--generate N] [--bf16]
 
-PROMPT_TEXT_FILE holds the exact templated text (including <bos>) that gemmars tokenized.
+PROMPT_TEXT_FILE holds the exact templated text (including <bos>) that oxinfer tokenized.
 Prints token ids, compares our logits with the reference and optionally greedy-generates.
 """
 import sys, struct, time

@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn pre_quantized_round_trip() {
-        let dir = std::env::temp_dir().join(format!("gemmars-qtest-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oxinfer-qtest-{}", std::process::id()));
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let (r, c) = (48, 96);
@@ -650,11 +650,11 @@ mod tests {
         files.mark_quant("tab", QKind::Q4);
         files.note_use("tab", false, true);
         files.bf16("norm").unwrap();
-        let written = files.write_quantized(&out, &[("gemmars_quant", "q4")]).unwrap();
+        let written = files.write_quantized(&out, &[("oxinfer_quant", "q4")]).unwrap();
         assert_eq!(written.len(), 2, "weights and tables shards: {written:?}");
 
         let back = ModelFiles::open(&out, false).unwrap();
-        assert_eq!(back.metadata("gemmars_quant"), Some("q4"));
+        assert_eq!(back.metadata("oxinfer_quant"), Some("q4"));
         assert_eq!(back.bf16("norm").unwrap(), &n[..c]);
         let (ea, eb, et) = (quantize_bf16(&a, r, c), quantize_q4(&b, r, c), quantize_q4(&t, r, c));
         match unsafe { back.quantized("a", r, c) }.unwrap() {

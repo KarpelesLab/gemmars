@@ -1,4 +1,4 @@
-//! gemmars in the browser (and Deno): a plain C-ABI WebAssembly module, no bindgen. The host
+//! oxinfer in the browser (and Deno): a plain C-ABI WebAssembly module, no bindgen. The host
 //! registers the model files in the module's virtual filesystem, then drives a chat session token
 //! by token. GPU work goes the other way: the module imports `gpu_*` functions that the host
 //! implements with WebGPU, and the host wraps them with JSPI (`WebAssembly.Suspending`) so the
@@ -11,11 +11,11 @@
 mod webgpu;
 
 use anyhow::{anyhow, bail, Result};
-use gemmars::chat::{ChatFormat, GemmaChat, QwenChat};
-use gemmars::model::{Model, Quant, Session};
-use gemmars::qwen::{QwenModel, QwenSession};
-use gemmars::sampler::Sampler;
-use gemmars::{config, fsx, quant::PageVec, safetensors};
+use oxinfer::chat::{ChatFormat, GemmaChat, QwenChat};
+use oxinfer::model::{Model, Quant, Session};
+use oxinfer::qwen::{QwenModel, QwenSession};
+use oxinfer::sampler::Sampler;
+use oxinfer::{config, fsx, quant::PageVec, safetensors};
 use std::cell::RefCell;
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -170,7 +170,7 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
     if gpu {
         webgpu::install();
     }
-    let t0 = gemmars::clock::Instant::now();
+    let t0 = oxinfer::clock::Instant::now();
     let model_type = config::model_type(dir)?;
     let eos = config::load_eos_ids(dir);
     let tok = Tokenizer::from_bytes(fsx::read(&dir.join("tokenizer.json"))?).map_err(|e| anyhow!("tokenizer: {e}"))?;
@@ -196,7 +196,7 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
         files.total_bytes() as f64 / 1e9,
         if Quant::stored(files).is_some() { " (pre-quantized)" } else { "" },
         streamed as f64 / 1e9,
-        gemmars::gpu::active().map(|b| b.name().to_string()).unwrap_or_else(|| "cpu".into()),
+        oxinfer::gpu::active().map(|b| b.name().to_string()).unwrap_or_else(|| "cpu".into()),
         t0.elapsed().as_secs_f64()
     ));
     Ok(Engine {
@@ -205,7 +205,7 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
         eos,
         sampler: Sampler::new(0.0, 0, 1.0, 0),
         // Each GPU batch costs a host round trip, so larger chunks amortize better there.
-        prefill_chunk: if prefill_chunk != 0 { prefill_chunk } else if gemmars::gpu::active().is_some() { 512 } else { 256 },
+        prefill_chunk: if prefill_chunk != 0 { prefill_chunk } else if oxinfer::gpu::active().is_some() { 512 } else { 256 },
         logits: Vec::new(),
         out: Vec::new(),
         turns: 0,
@@ -352,7 +352,7 @@ pub extern "C" fn web_gpu_stats(len: *mut usize) -> *const u8 {
         let mut g = g.borrow_mut();
         match g.as_mut() {
             Some(e) => {
-                e.text = gemmars::gpu::active().and_then(|b| b.stats()).unwrap_or_default();
+                e.text = oxinfer::gpu::active().and_then(|b| b.stats()).unwrap_or_default();
                 unsafe { *len = e.text.len() };
                 e.text.as_ptr()
             }

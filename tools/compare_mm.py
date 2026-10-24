@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare gemmars multimodal dumps (--dump-mm PREFIX) with tools/ref_mm.py dumps.
+"""Compare oxinfer multimodal dumps (--dump-mm PREFIX) with tools/ref_mm.py dumps.
 usage: compare_mm.py OURS_PREFIX REF_PREFIX HIDDEN
 """
 import sys, numpy as np

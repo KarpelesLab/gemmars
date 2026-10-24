@@ -1,9 +1,9 @@
 //! Memory bandwidth and matmul-kernel microbenchmark.
 //! usage: membench [GB]   (default 4 GB buffer)
 
-use gemmars::{kernels, pool};
+use oxinfer::{kernels, pool};
 #[cfg(any(feature = "gpu", target_arch = "aarch64"))]
-use gemmars::quant;
+use oxinfer::quant;
 use std::time::Instant;
 
 fn bench_read(buf: &[u64], threads: usize) -> f64 {
@@ -44,10 +44,10 @@ fn bench_matmul(w: &[u16], n_out: usize, n_in: usize, t: usize, threads: usize) 
 /// `membench gpu [n_out n_in]`: checks and times the accelerator matmul against the CPU kernels.
 #[cfg(feature = "gpu")]
 fn bench_gpu(n_out: usize, n_in: usize) {
-    use gemmars::gpu::{self, WeightRef};
-    let plat = gemmars::platform::detect();
+    use oxinfer::gpu::{self, WeightRef};
+    let plat = oxinfer::platform::detect();
     println!("{}", plat.summary());
-    let Some(be) = gpu::init(&plat, gemmars::platform::DevicePref::Auto) else {
+    let Some(be) = gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
         println!("no accelerator backend");
         return;
     };

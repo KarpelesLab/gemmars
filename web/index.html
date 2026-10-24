@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gemmars in the browser</title>
+<title>oxinfer in the browser</title>
 <style>
   :root { color-scheme: light dark; --fg: #222; --bg: #fafafa; --muted: #777; --box: #fff; --line: #ddd; --accent: #2a6; }
   @media (prefers-color-scheme: dark) { :root { --fg: #ddd; --bg: #151515; --muted: #888; --box: #1e1e1e; --line: #333; } }
@@ -25,7 +25,7 @@
 </style>
 </head>
 <body>
-<h1>gemmars in the browser</h1>
+<h1>oxinfer in the browser</h1>
 <p>Gemma 4 / Qwen 3.5 inference compiled to WebAssembly (simd128), with prefill matmuls on WebGPU when the browser supports it and JSPI. Everything runs locally; the weights never leave your machine.</p>
 
 <fieldset>
@@ -63,7 +63,7 @@
 <pre id="log"></pre>
 
 <script type="module">
-import { Gemmars, WebGpuHost, hasJspi, isHostShard } from './gemmars.js';
+import { Oxinfer, WebGpuHost, hasJspi, isHostShard } from './oxinfer.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -187,7 +187,7 @@ async function load() {
     const gpu = wantGpu ? await WebGpuHost.create(log) : null;
     if (wantGpu && !gpu) log('[webgpu: no adapter; using CPU]');
     if (wantGpu && !hasJspi) log('[webgpu: this browser has no JSPI (WebAssembly.Suspending); GPU disabled]');
-    g = await Gemmars.create('./target/wasm32-unknown-unknown/release/gemmars_web.wasm', { gpu, log });
+    g = await Oxinfer.create('./target/wasm32-unknown-unknown/release/oxinfer_web.wasm', { gpu, log });
     const url = $('url').value.trim();
     const folder = $('folder').files;
     if (folder.length) await loadFromFiles(g, folder);

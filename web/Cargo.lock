@@ -230,28 +230,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
-name = "gemmars"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "half",
- "memmap2",
- "serde",
- "serde_json",
- "tokenizers",
-]
-
-[[package]]
-name = "gemmars-web"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gemmars",
- "getrandom",
- "tokenizers",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -393,6 +371,28 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "oxinfer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
+name = "oxinfer-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "getrandom",
+ "oxinfer",
+ "tokenizers",
+]
 
 [[package]]
 name = "paste"

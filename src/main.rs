@@ -1,13 +1,13 @@
-use gemmars::chat::{self, ChatFormat};
-use gemmars::model::{Model, Quant, Session};
-use gemmars::sampler::{argmax, Sampler};
-use gemmars::{config, drafter, platform, pool, prof, qwen, safetensors};
+use oxinfer::chat::{self, ChatFormat};
+use oxinfer::model::{Model, Quant, Session};
+use oxinfer::sampler::{argmax, Sampler};
+use oxinfer::{config, drafter, platform, pool, prof, qwen, safetensors};
 #[cfg(feature = "media")]
-use gemmars::{audio, mm_config, vision};
+use oxinfer::{audio, mm_config, vision};
 #[cfg(feature = "hf")]
-use gemmars::hf;
+use oxinfer::hf;
 #[cfg(feature = "media")]
-use gemmars::media;
+use oxinfer::media;
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -49,9 +49,9 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: gemmars --model DIR|org/name [options]\n\
+        "usage: oxinfer --model DIR|org/name [options]\n\
          \n\
-         A HuggingFace repo id is fetched into the cache (~/.cache/gemmars/hub or $GEMMARS_CACHE)\n\
+         A HuggingFace repo id is fetched into the cache (~/.cache/oxinfer/hub or $OXINFER_CACHE)\n\
          on first use; downloads resume. Set HF_TOKEN for gated repos.\n\
          \n\
          options:\n\
@@ -460,7 +460,7 @@ fn generate_speculative(
             cur = d;
         }
         stats.drafted += drafts.len();
-        if stats.forwards == 0 && std::env::var("GEMMARS_DEBUG_DRAFT").is_ok() {
+        if stats.forwards == 0 && std::env::var("OXINFER_DEBUG_DRAFT").is_ok() {
             eprintln!("[debug: pos {pos} last {last} drafts {drafts:?}]");
         }
 
@@ -468,7 +468,7 @@ fn generate_speculative(
         let mut seq = Vec::with_capacity(drafts.len() + 1);
         seq.push(last);
         seq.extend_from_slice(&drafts);
-        let check = std::env::var("GEMMARS_CHECK_SPEC").is_ok();
+        let check = std::env::var("OXINFER_CHECK_SPEC").is_ok();
         let sess_before = if check { Some(sess.clone()) } else { None };
         let hs = model.forward_hidden(sess, &seq);
         let logits = model.logits(&hs, seq.len());
@@ -501,7 +501,7 @@ fn generate_speculative(
         } else if n == 0 {
             k_cur = (k_cur - 1).max(k_min);
         }
-        if stats.forwards == 1 && std::env::var("GEMMARS_DEBUG_DRAFT").is_ok() {
+        if stats.forwards == 1 && std::env::var("OXINFER_DEBUG_DRAFT").is_ok() {
             let truth: Vec<u32> = (0..seq.len()).map(|i| argmax(&logits[i * v..(i + 1) * v])).collect();
             eprintln!("[debug: main argmax after each of {seq:?} = {truth:?}; accepted {n}]");
         }
@@ -609,11 +609,11 @@ fn save_quantized(src: &Path, out: &Path, files: &safetensors::ModelFiles, quant
     }
     std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
     let t0 = Instant::now();
-    let table = gemmars::model::table_quant(quant);
+    let table = oxinfer::model::table_quant(quant);
     let source = src.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let written = files.write_quantized(
         out,
-        &[("format", "pt"), ("gemmars_quant", quant.as_str()), ("gemmars_table_quant", table.as_str()), ("gemmars_source", &source)],
+        &[("format", "pt"), ("oxinfer_quant", quant.as_str()), ("oxinfer_table_quant", table.as_str()), ("oxinfer_source", &source)],
     )?;
     let mut copied = Vec::new();
     for e in std::fs::read_dir(src)? {
@@ -658,7 +658,7 @@ fn main() -> Result<()> {
 fn run(mut args: Args) -> Result<()> {
     let plat = platform::detect();
     eprintln!("[platform: {}]", plat.summary());
-    let gpu = gemmars::gpu::init(&plat, args.device);
+    let gpu = oxinfer::gpu::init(&plat, args.device);
     match gpu {
         Some(b) => eprintln!("[device: {} (prefill matmuls on the GPU, everything else on the CPU)]", b.name()),
         None => eprintln!("[device: cpu]"),
