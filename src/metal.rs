@@ -633,6 +633,19 @@ struct MetalWeight {
     scales: Option<Buf>,
     /// Affine Q4: the offsets buffer, offsets per row, and blocks of 32 per offset group.
     offsets: Option<(Buf, u32, u32)>,
+    /// `objc_msgSend` as `release`, and its selector.
+    release: (MsgVoid, Sel),
+}
+
+impl Drop for MetalWeight {
+    fn drop(&mut self) {
+        let (f, sel) = self.release;
+        let ids = [Some(&self.data), self.scales.as_ref(), self.offsets.as_ref().map(|o| &o.0)];
+        for b in ids.into_iter().flatten() {
+            // SAFETY: each buffer was created by this weight and is released once.
+            unsafe { f(b.id, sel) };
+        }
+    }
 }
 
 #[repr(C)]
@@ -987,6 +1000,7 @@ impl Backend for MetalBackend {
     }
 
     fn upload(&self, w: &WeightRef, _n_out: usize, _n_in: usize) -> Option<DeviceWeight> {
+        let release: (MsgVoid, Sel) = (self.o.msg_send(), self.sels.release);
         let mw = match w {
             WeightRef::Gguf(m) => {
                 self.gguf_pipe(m.kind)?;
@@ -994,17 +1008,20 @@ impl Backend for MetalBackend {
                     data: self.wrap(m.data.as_ptr(), m.data.len())?,
                     scales: None,
                     offsets: None,
+                    release,
                 }
             }
             WeightRef::Bf16(w) => MetalWeight {
                 data: self.wrap(w.as_ptr() as *const u8, w.len() * 2)?,
                 scales: None,
                 offsets: None,
+                release,
             },
             WeightRef::Q8(m) => MetalWeight {
                 data: self.wrap(m.q.as_ptr() as *const u8, m.q.len())?,
                 scales: Some(self.wrap(m.scales.as_ptr() as *const u8, m.scales.len() * 4)?),
                 offsets: None,
+                release,
             },
             WeightRef::Q4(m) => MetalWeight {
                 data: self.wrap(m.q.as_ptr(), m.q.len())?,
@@ -1017,6 +1034,7 @@ impl Backend for MetalBackend {
                     )),
                     None => None,
                 },
+                release,
             },
         };
         Some(Box::new(mw))

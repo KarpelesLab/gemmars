@@ -142,7 +142,7 @@ pub struct StreamStats {
     pub stalls: u64,
     /// Reader busy time (including throttling).
     pub io_busy: Duration,
-    /// Part of `io_busy` spent sleeping for the bandwidth throttle.
+    /// Time reader threads slept for the bandwidth throttle (summed over the threads).
     pub throttled: Duration,
     /// Streamed (non-resident) unit uses.
     pub units: u64,
@@ -596,9 +596,10 @@ impl Inner {
                     failures += u.spans.iter().filter(|s| !sys::lock(**s)).count().min(1);
                 }
                 ResidentMode::Copy => {
-                    // Only whole pages can be remapped; the shared edge pages stay file-backed.
-                    self.load(u, false);
+                    // Only whole pages can be remapped; the shared edge pages stay file-backed
+                    // (and are loaded after: the copied pages count as resident).
                     failures += u.inner.iter().filter(|s| !sys::copy_in(&self.files[s.file], **s)).count().min(1);
+                    self.load(u, false);
                 }
             }
         }
@@ -788,6 +789,8 @@ mod sys {
         fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
         fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         fn posix_fadvise(fd: i32, off: i64, len: i64, advice: i32) -> i32;
@@ -800,6 +803,8 @@ mod sys {
     const PROT_READ: i32 = 1;
     const PROT_WRITE: i32 = 2;
     const MAP_PRIVATE: i32 = 2;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const MAP_SHARED: i32 = 1;
     const MAP_FIXED: i32 = 0x10;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     const MAP_ANON: i32 = 0x1000;
@@ -886,6 +891,17 @@ mod sys {
             let buf = std::slice::from_raw_parts_mut(s.addr as *mut u8, s.len);
             let ok = f.read_exact_at(buf, s.off).is_ok();
             mprotect(p, s.len, PROT_READ);
+            // The read cached the file pages too; the copy replaces them.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                let t = mmap(std::ptr::null_mut(), s.len, PROT_READ, MAP_SHARED, f.as_raw_fd(), s.off as i64);
+                if t as isize != -1 {
+                    msync(t, s.len, MS_INVALIDATE);
+                    munmap(t, s.len);
+                }
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            posix_fadvise(f.as_raw_fd(), s.off as i64, s.len as i64, 4);
             ok
         }
     }
@@ -939,9 +955,12 @@ pub fn attach_qwen(
     }
     units.extend(mu);
     let s = Streamer::new(files, units, opts)?;
+    let streamed: Vec<bool> = s.plan().units.iter().map(|u| !u.2).collect();
     if let Some(m) = mtp {
+        m.mark_streamed(&streamed[..base]);
         m.set_stream(Some(StreamHook::new(s.clone(), 0)));
     }
+    model.mark_streamed(&streamed[base..]);
     model.set_stream(Some(StreamHook::new(s.clone(), base)));
     Ok(s)
 }
@@ -964,6 +983,84 @@ mod tests {
             bytes,
             resident: false,
         }
+    }
+
+    /// Streams the tensors of a small mapped file as units, with a resident set, eviction and a
+    /// throttle, in each resident mode: the data reads back intact and the counters add up.
+    #[test]
+    fn streams_units_of_a_mapped_file() {
+        const N: usize = 4;
+        const SZ: usize = 1 << 20;
+        let dir = std::env::temp_dir().join(format!("oxinfer-stream-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        let mut head = String::from("{");
+        for i in 0..N {
+            head += &format!(
+                "\"t{i}\":{{\"dtype\":\"U8\",\"shape\":[{SZ}],\"data_offsets\":[{},{}]}},",
+                i * SZ,
+                (i + 1) * SZ
+            );
+        }
+        head.pop();
+        head.push('}');
+        while !head.len().is_multiple_of(8) {
+            head.push(' ');
+        }
+        let mut bytes = (head.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(head.as_bytes());
+        bytes.extend((0..N * SZ).map(|i| (i * 7 + i / SZ) as u8));
+        std::fs::write(&path, &bytes).unwrap();
+        let want: Vec<u64> = (0..N).map(|t| (0..SZ).map(|i| ((t * SZ + i) * 7 + t) as u8 as u64).sum()).collect();
+
+        for mode in [ResidentMode::Cache, ResidentMode::Lock, ResidentMode::Copy] {
+            let files = ModelFiles::open(&dir, false).unwrap();
+            let units: Vec<UnitSpec> = (0..N)
+                .map(|i| {
+                    let b = files.bytes(&format!("t{i}")).unwrap();
+                    UnitSpec {
+                        name: format!("t{i}"),
+                        ranges: vec![(b.as_ptr() as usize, b.len())],
+                        // Unit 0 is reused, so it is the resident one.
+                        uses: if i == 0 { 3.0 } else { 1.0 },
+                    }
+                })
+                .collect();
+            let opts = StreamOptions {
+                resident_bytes: Some(SZ as u64 + (64 << 10)),
+                prefetch_bytes: SZ as u64,
+                resident_mode: mode,
+                flash_bytes_per_sec: Some(200e6),
+                chunk_bytes: 256 << 10,
+                ..Default::default()
+            };
+            let s = Streamer::new(&[&files], units, opts).unwrap();
+            assert_eq!(s.plan().units.iter().map(|u| u.2).collect::<Vec<_>>(), [true, false, false, false]);
+            assert_eq!(s.plan().unmapped_bytes, 0);
+            let hook = StreamHook::new(s.clone(), 0);
+            let t = Instant::now();
+            for _pass in 0..2 {
+                for (i, w) in want.iter().enumerate() {
+                    let _g = hook.enter(i);
+                    let b = files.bytes(&format!("t{i}")).unwrap();
+                    assert_eq!(b.iter().map(|&v| v as u64).sum::<u64>(), *w, "{mode:?}: unit {i}");
+                }
+            }
+            let st = s.stats();
+            assert_eq!((st.units, st.resident_uses), (6, 2), "{mode:?}");
+            // Three streamed units of at least 1 MiB per pass, all accounted for.
+            assert!(st.bytes_read + st.bytes_cached >= 6 * SZ as u64, "{mode:?}: {st:?}");
+            if cfg!(any(target_os = "macos", target_os = "ios")) {
+                // Evicted after use, so every pass reads them again, at the emulated 200 MB/s.
+                assert!(st.bytes_read >= 5 * SZ as u64, "{mode:?}: {st:?}");
+                assert!(t.elapsed().as_secs_f64() >= 0.02, "{mode:?}");
+                let cached = s.cached_bytes().unwrap();
+                assert!(cached <= 3 * SZ as u64 + (256 << 10), "{mode:?}: {cached} cached");
+            }
+            drop(hook);
+            drop(s);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -543,10 +543,9 @@ impl<'a> QwenModel<'a> {
         })
     }
 
-    /// The streaming units of this model in execution order (see `crate::stream`): the layers,
-    /// then the LM head.
-    pub fn stream_units(&self) -> Vec<crate::stream::UnitSpec> {
-        let mut v: Vec<crate::stream::UnitSpec> = self
+    /// The weights of each streaming unit, in execution order: the layers, then the LM head.
+    fn unit_lins(&self) -> Vec<(String, Vec<&Lin<'a>>)> {
+        let mut v: Vec<(String, Vec<&Lin>)> = self
             .layers
             .iter()
             .enumerate()
@@ -556,19 +555,34 @@ impl<'a> QwenModel<'a> {
                     Mixer::Attn(a) => a.lins().to_vec(),
                 };
                 lins.extend(layer.ffn.lins());
-                crate::stream::UnitSpec {
-                    name: format!("layer.{l}"),
-                    ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
-                    uses: 1.0,
-                }
+                (format!("layer.{l}"), lins)
             })
             .collect();
-        v.push(crate::stream::UnitSpec {
-            name: "lm_head".into(),
-            ranges: self.lm_head.mem_ranges(),
-            uses: 1.0,
-        });
+        v.push(("lm_head".into(), vec![&self.lm_head]));
         v
+    }
+
+    /// The streaming units of this model in execution order (see `crate::stream`): the layers,
+    /// then the LM head.
+    pub fn stream_units(&self) -> Vec<crate::stream::UnitSpec> {
+        self.unit_lins()
+            .into_iter()
+            .map(|(name, lins)| crate::stream::UnitSpec {
+                name,
+                ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
+                uses: 1.0,
+            })
+            .collect()
+    }
+
+    /// Marks the weights of the units with `streamed[i]` set as streamed: no accelerator state
+    /// is kept for them between calls (see `Lin::set_transient_device`).
+    pub fn mark_streamed(&self, streamed: &[bool]) {
+        for ((_, lins), &s) in self.unit_lins().iter().zip(streamed) {
+            for l in lins {
+                l.set_transient_device(s);
+            }
+        }
     }
 
     /// Brackets every layer and the LM head with `hook`'s units (None stops streaming).

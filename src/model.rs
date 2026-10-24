@@ -359,6 +359,8 @@ pub fn load_lin_experts<'a>(files: &'a ModelFiles, full: &str, n_exp: usize, n_o
 pub struct Lin<'a> {
     pub w: Weight<'a>,
     dev: std::sync::OnceLock<Option<crate::gpu::DeviceWeight>>,
+    /// Device state is created per call and dropped right after (see `set_transient_device`).
+    transient: std::sync::atomic::AtomicBool,
 }
 
 pub enum Weight<'a> {
@@ -376,6 +378,7 @@ impl<'a> Lin<'a> {
         Self {
             w: Weight::Bf16(unsafe { crate::quant::QBuf::borrowed(w) }, std::marker::PhantomData),
             dev: std::sync::OnceLock::new(),
+            transient: std::sync::atomic::AtomicBool::new(false),
         }
     }
     /// bf16 weights converted or reordered at load time (e.g. from fp16 checkpoints).
@@ -383,18 +386,21 @@ impl<'a> Lin<'a> {
         Self {
             w: Weight::Bf16(w.into(), std::marker::PhantomData),
             dev: std::sync::OnceLock::new(),
+            transient: std::sync::atomic::AtomicBool::new(false),
         }
     }
     pub fn q8(m: QMatrix) -> Self {
         Self {
             w: Weight::Q8(m),
             dev: std::sync::OnceLock::new(),
+            transient: std::sync::atomic::AtomicBool::new(false),
         }
     }
     pub fn q4(m: Q4Matrix) -> Self {
         Self {
             w: Weight::Q4(m),
             dev: std::sync::OnceLock::new(),
+            transient: std::sync::atomic::AtomicBool::new(false),
         }
     }
     /// A GGUF weight (`GgufMatrix::borrowed` keeps it zero-copy over a mapped file).
@@ -402,6 +408,7 @@ impl<'a> Lin<'a> {
         Self {
             w: Weight::Gguf(m),
             dev: std::sync::OnceLock::new(),
+            transient: std::sync::atomic::AtomicBool::new(false),
         }
     }
     /// A GGUF tensor's raw bytes (`n_out` rows of `n_in` elements of `kind`), borrowed for 'a.
@@ -457,6 +464,14 @@ impl<'a> Lin<'a> {
         }
         self.dev.get_or_init(|| be.upload(&self.as_ref(), n_out, n_in)).as_ref()
     }
+    /// Don't keep device-side state between calls: an accelerator mapping of streamed weights
+    /// (Metal wraps them in place) keeps their pages from leaving the page cache while it lives.
+    pub fn set_transient_device(&self, on: bool) {
+        self.transient.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn is_transient(&self) -> bool {
+        self.transient.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Fused matmuls over one shared input (any mix of storage formats).
@@ -467,10 +482,23 @@ pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, 
     // Accelerator first (one submission for the whole batch); whatever it declines runs on the CPU.
     let mut rest: Vec<(&Lin, usize, &mut [f32])> = Vec::with_capacity(jobs.len());
     let be = crate::gpu::active();
+    // Transient device state (streamed weights), released when this call returns.
+    let owned: Vec<Option<crate::gpu::DeviceWeight>> = jobs
+        .iter()
+        .map(|(l, n, _)| match be {
+            Some(b) if l.is_transient() && b.wants(*n, n_in, t) => b.upload(&l.as_ref(), *n, n_in),
+            _ => None,
+        })
+        .collect();
     let mut gpu: Vec<crate::gpu::Job> = Vec::with_capacity(jobs.len());
     let mut gpu_meta: Vec<(&Lin, usize)> = Vec::with_capacity(jobs.len());
-    for (l, n, y) in jobs.iter_mut() {
-        match be.and_then(|_| l.device_state(*n, n_in, t)) {
+    for ((l, n, y), own) in jobs.iter_mut().zip(&owned) {
+        let dev = match own {
+            Some(d) => Some(d),
+            None if l.is_transient() => None,
+            None => be.and_then(|_| l.device_state(*n, n_in, t)),
+        };
+        match dev {
             Some(dev) => {
                 gpu.push(crate::gpu::Job {
                     w: l.as_ref(),

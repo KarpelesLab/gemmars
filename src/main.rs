@@ -108,7 +108,7 @@ fn usage() -> ! {
          \x20 --prefill-chunk N    tokens per prefill chunk (default 256 on CPU, 1024 with a GPU backend)\n\
          \x20 --draft DIR          speculative decoding with a Gemma 4 assistant (drafter) model; greedy only\n\
          \x20 --draft-tokens N     max draft tokens per round (default 6 with --draft, adaptive from 3;\n\
-         \x20                      3 with --mtp)\n\
+         \x20                      3 with --mtp, 8 with --mtp --stream)\n\
          \x20 --mtp                Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token\n\
          \x20                      prediction layer (greedy and sampled; same output distribution)\n\
          \x20 --mtp-fixed          with --mtp, always draft --draft-tokens (default: adaptive 1..N)\n\
@@ -1070,8 +1070,8 @@ fn run_qwen_mtp(
         adaptive: !args.mtp_fixed,
         stop: eos.to_vec(),
         cost_aware: !args.mtp_fixed && args.mtp_cost.unwrap_or(args.stream),
-        // Long drafts stay exact when streaming (verification is IO-bound there).
-        exact: args.stream,
+        // Long drafts stay exact (the decode kernels are also faster than the GEMM at 8-15 tokens).
+        exact: true,
     };
     eprintln!(
         "[MTP speculative decoding: {} draft tokens{}, {}]",
@@ -1085,15 +1085,15 @@ fn run_qwen_mtp(
         },
         if args.temperature > 0.0 { "sampled" } else { "greedy" }
     );
-    if opts.draft_tokens > oxinfer::qwen_mtp::MAX_EXACT_DRAFT && !opts.exact {
+    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
+    let mut dec = MtpDecoder::new(model, mtp, opts);
+    if dec.opts.draft_tokens > oxinfer::qwen_mtp::max_exact_draft() {
         eprintln!(
             "[note: verifying more than {} drafts runs the prefill GEMM kernels, whose rounding differs from decoding: \
              the output can drift from plain decoding at near-ties]",
-            oxinfer::qwen_mtp::MAX_EXACT_DRAFT
+            oxinfer::qwen_mtp::max_exact_draft()
         );
     }
-    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
-    let mut dec = MtpDecoder::new(model, mtp, opts);
     let chunk = args.prefill_chunk.unwrap_or(256);
     let mut turn = |dec: &mut MtpDecoder, text: &str| -> Result<()> {
         let ids = encode(text)?;

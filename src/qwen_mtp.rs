@@ -135,27 +135,40 @@ impl<'a> QwenMtp<'a> {
         })
     }
 
+    /// The weights of each streaming unit: the layer (with `fc`), then the trimmed draft head.
+    fn unit_lins(&self) -> Vec<(&'static str, Vec<&Lin<'a>>)> {
+        let mut lins = vec![&self.fc];
+        lins.extend(self.attn.lins());
+        lins.extend(self.ffn.lins());
+        let mut v = vec![("mtp", lins)];
+        if let Some(d) = &self.head {
+            v.push(("draft_head", vec![&d.head]));
+        }
+        v
+    }
+
     /// The streaming units in execution order (see `crate::stream`): the layer (with `fc`), then
     /// the trimmed draft head if there is one (drafts otherwise use the main model's LM head).
     /// `draft_tokens` is how many times a round runs them (their residency priority).
     pub fn stream_units(&self, draft_tokens: usize) -> Vec<crate::stream::UnitSpec> {
-        let mut lins = vec![&self.fc];
-        lins.extend(self.attn.lins());
-        lins.extend(self.ffn.lins());
         let uses = draft_tokens.max(1) as f64 + 0.5;
-        let mut v = vec![crate::stream::UnitSpec {
-            name: "mtp".into(),
-            ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
-            uses,
-        }];
-        if let Some(d) = &self.head {
-            v.push(crate::stream::UnitSpec {
-                name: "draft_head".into(),
-                ranges: d.head.mem_ranges(),
+        self.unit_lins()
+            .into_iter()
+            .map(|(name, lins)| crate::stream::UnitSpec {
+                name: name.into(),
+                ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
                 uses,
-            });
+            })
+            .collect()
+    }
+
+    /// See `QwenModel::mark_streamed`.
+    pub fn mark_streamed(&self, streamed: &[bool]) {
+        for ((_, lins), &s) in self.unit_lins().iter().zip(streamed) {
+            for l in lins {
+                l.set_transient_device(s);
+            }
         }
-        v
     }
 
     /// Brackets the layer and the draft head with `hook`'s units (None stops streaming).
