@@ -413,8 +413,33 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// An ANEMLL Core ML repository: `meta.yaml` plus compiled `.mlmodelc` directories.
+fn is_anemll_listing(list: &Listing) -> bool {
+    list.contains_key("meta.yaml") && list.keys().any(|k| k.contains(".mlmodelc/"))
+}
+
+/// Files of an ANEMLL repository worth fetching: everything but its Python chat scripts,
+/// uncompiled `.mlpackage`s and Finder / git metadata.
+fn anemll_wanted(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    !(base == ".DS_Store"
+        || base == ".gitattributes"
+        || (base.starts_with("chat") && base.ends_with(".py"))
+        || name.contains(".mlpackage/"))
+}
+
 fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     let list = listing(repo)?;
+    if is_anemll_listing(&list) {
+        let mut files: Vec<&String> = list.keys().filter(|k| anemll_wanted(k)).collect();
+        files.sort();
+        let count = files.len();
+        for (i, f) in files.iter().enumerate() {
+            let (size, src) = &list[*f];
+            fetch_file(repo, dir, f, *size, src, i + 1, count)?;
+        }
+        return Ok(());
+    }
     let mut files: Vec<String> = SMALL_FILES
         .iter()
         .filter(|f| list.contains_key(**f))

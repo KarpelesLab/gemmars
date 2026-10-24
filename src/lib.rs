@@ -5,6 +5,8 @@
 // one loop counter; iterator chains there obscure the access pattern and can defeat unrolling.
 #![allow(clippy::needless_range_loop)]
 
+#[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+pub mod anemll;
 pub mod audio;
 pub mod bert;
 #[cfg(feature = "capi")]
@@ -12,6 +14,8 @@ pub mod capi;
 pub mod chat;
 pub mod clock;
 pub mod config;
+#[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+pub mod coreml;
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
 pub mod cuda;
 pub mod drafter;

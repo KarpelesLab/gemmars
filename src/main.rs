@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
+#[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+mod anemll_cli;
+
 struct Args {
     model: PathBuf,
     prompt: Option<String>,
@@ -61,6 +64,9 @@ struct Args {
     sparse: bool,
     colbert: bool,
     dim: Option<usize>,
+    // ANEMLL Core ML models.
+    coreml_units: Option<String>,
+    coreml_prefill: Option<String>,
 }
 
 fn usage() -> ! {
@@ -120,6 +126,10 @@ fn usage() -> ! {
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
+         \n\
+         ANEMLL Core ML models (a meta.yaml folder; macOS 15 / iOS 18, Apple Neural Engine):\n\
+         \x20 --coreml-units U     ane (CPU + Neural Engine, default) | all | gpu (CPU + GPU) | cpu\n\
+         \x20 --coreml-prefill M   auto (default: batch if meta.yaml allows it) | batch | single\n\
          \n\
          embeddings (sentence-transformers models are detected; --embed forces it):\n\
          \x20 --embed              embed the prompt, or each stdin line: one JSON array per line\n\
@@ -183,6 +193,8 @@ fn parse_args() -> Result<Args> {
         sparse: false,
         colbert: false,
         dim: None,
+        coreml_units: None,
+        coreml_prefill: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -258,6 +270,8 @@ fn parse_args() -> Result<Args> {
             "--sparse" => a.sparse = true,
             "--colbert" => a.colbert = true,
             "--dim" => a.dim = Some(val()?.parse()?),
+            "--coreml-units" => a.coreml_units = Some(val()?),
+            "--coreml-prefill" => a.coreml_prefill = Some(val()?),
             "--show-tokens" => a.show_tokens = true,
             "-h" | "--help" => usage(),
             _ => {
@@ -426,6 +440,19 @@ fn main() -> Result<()> {
 }
 
 fn run(mut args: Args) -> Result<()> {
+    // ANEMLL models (meta.yaml + compiled Core ML parts) run on Core ML, not on our kernels.
+    #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+    if anemll_cli::detect(&args.model) {
+        return anemll_cli::run(&args);
+    }
+    let mlmodelc =
+        |d: &Path| std::fs::read_dir(d).is_ok_and(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".mlmodelc")));
+    if args.model.join("meta.yaml").is_file() && mlmodelc(&args.model) {
+        bail!(
+            "{}: an ANEMLL Core ML model; these run only in Apple Silicon macOS / iOS builds with the `gpu` feature",
+            args.model.display()
+        );
+    }
     let plat = platform::detect();
     eprintln!("[platform: {}]", plat.summary());
     let gpu = oxinfer::gpu::init(&plat, args.device);

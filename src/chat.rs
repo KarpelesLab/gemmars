@@ -301,6 +301,94 @@ impl QwenChat {
     }
 }
 
+/// Qwen2 / Qwen2.5 ChatML: like Qwen3 without thinking, and the template's default system
+/// prompt when none is given.
+pub struct Qwen2Chat;
+const QWEN2_DEFAULT_SYSTEM: &str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+impl ChatFormat for Qwen2Chat {
+    fn conversation_start(&self, system: Option<&str>, _think: bool) -> String {
+        format!("<|im_start|>system\n{}<|im_end|>\n", system.unwrap_or(QWEN2_DEFAULT_SYSTEM))
+    }
+    fn user_turn(&self, content: &str, _think: bool) -> String {
+        format!("<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n")
+    }
+    fn end_of_model_turn(&self) -> String {
+        "<|im_end|>\n".to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        "<|im_end|>"
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("", "")
+    }
+    fn starts_in_thinking(&self, _think: bool) -> bool {
+        false
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, _tools: &[ToolSpec]) -> String {
+        self.conversation_start(system, think)
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        ""
+    }
+    fn parse_tool_calls(&self, _raw: &str) -> Vec<ToolCall> {
+        Vec::new()
+    }
+    fn tool_results(&self, _results: &[ToolResult], _think: bool) -> String {
+        String::new()
+    }
+}
+
+/// Llama 3.x instruct: header-delimited turns; the template always opens with a system turn
+/// carrying the knowledge cutoff and today's date ("25 Oct 2026", as `strftime_now("%d %b %Y")`).
+pub struct Llama3Chat;
+impl Llama3Chat {
+    fn today() -> String {
+        const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        let (t, _, _, _) = crate::tools::local_now();
+        let m: usize = t[5..7].parse().unwrap_or(1);
+        format!("{} {} {}", &t[8..10], MONTHS[m.clamp(1, 12) - 1], &t[..4])
+    }
+}
+impl ChatFormat for Llama3Chat {
+    fn conversation_start(&self, system: Option<&str>, _think: bool) -> String {
+        format!(
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: {}\n\n{}<|eot_id|>",
+            Self::today(),
+            system.map(str::trim).unwrap_or("")
+        )
+    }
+    fn user_turn(&self, content: &str, _think: bool) -> String {
+        format!(
+            "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            content.trim()
+        )
+    }
+    fn end_of_model_turn(&self) -> String {
+        "<|eot_id|>".to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        "<|eot_id|>"
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("", "")
+    }
+    fn starts_in_thinking(&self, _think: bool) -> bool {
+        false
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, _tools: &[ToolSpec]) -> String {
+        self.conversation_start(system, think)
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        ""
+    }
+    fn parse_tool_calls(&self, _raw: &str) -> Vec<ToolCall> {
+        Vec::new()
+    }
+    fn tool_results(&self, _results: &[ToolResult], _think: bool) -> String {
+        String::new()
+    }
+}
+
 /// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
 pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &tokenizers::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
     if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())
