@@ -727,3 +727,188 @@ unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act
     }
     out
 }
+
+// ---- Dequantization (prefill and tables) -------------------------------------------------------
+// The same unpacking, then f32 scaling in the operation order of ggml's reference code, so the
+// values are bit-identical to `super::dequantize_row`.
+
+/// Dequantizes one row of `n` elements into `out`; false if `kind` has no NEON version.
+pub(super) unsafe fn dequant_row(kind: GgmlType, row: *const u8, n: usize, out: *mut f32) -> bool {
+    match kind {
+        GgmlType::Q4_K => deq_q4k::<false>(row, n, out),
+        GgmlType::Q5_K => deq_q4k::<true>(row, n, out),
+        GgmlType::Q6_K => deq_sb16::<Q6K>(row, n, out),
+        GgmlType::Q3_K => deq_sb16::<Q3K>(row, n, out),
+        GgmlType::IQ2_XXS => deq_sb16::<Iq2Xxs>(row, n, out),
+        GgmlType::IQ2_XS => deq_sb16::<Iq2Xs>(row, n, out),
+        GgmlType::IQ2_S => deq_sb16::<Iq2S>(row, n, out),
+        GgmlType::IQ3_XXS => deq_sb16::<Iq3Xxs>(row, n, out),
+        GgmlType::IQ3_S => deq_sb16::<Iq3S>(row, n, out),
+        GgmlType::IQ4_XS => deq_iq4xs(row, n, out),
+        _ => return false,
+    }
+    true
+}
+
+/// Stores `v * s` (16 int8 values times an f32 scale) at `o`.
+#[inline(always)]
+unsafe fn st16(o: *mut f32, v: int8x16_t, s: f32) {
+    let lo = vmovl_s8(vget_low_s8(v));
+    let hi = vmovl_high_s8(v);
+    vst1q_f32(o, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))), s));
+    vst1q_f32(o.add(4), vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(lo)), s));
+    vst1q_f32(o.add(8), vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))), s));
+    vst1q_f32(o.add(12), vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(hi)), s));
+}
+
+/// The per-16 f32 scales of a super-block exactly as ggml's dequantization computes them.
+trait Sb16Exact: Sb16 {
+    unsafe fn exact_scales(b: *const u8, s: &mut [f32; 16]);
+}
+impl Sb16Exact for Q6K {
+    unsafe fn exact_scales(b: *const u8, s: &mut [f32; 16]) {
+        let d = f16p(b.add(208));
+        for k in 0..16 {
+            s[k] = d * (*b.add(192 + k) as i8) as f32;
+        }
+    }
+}
+impl Sb16Exact for Q3K {
+    unsafe fn exact_scales(b: *const u8, s: &mut [f32; 16]) {
+        let d = f16p(b.add(108));
+        let sc = q3k_scales(std::slice::from_raw_parts(b.add(96), 12));
+        for k in 0..16 {
+            s[k] = d * (sc[k] as i32 - 32) as f32;
+        }
+    }
+}
+impl Sb16Exact for Iq2Xxs {
+    unsafe fn exact_scales(b: *const u8, s: &mut [f32; 16]) {
+        let d = f16p(b);
+        for ib in 0..8 {
+            let db = d * (0.5 + (rd32(b.add(6 + 8 * ib)) >> 28) as f32) * 0.25;
+            s[2 * ib] = db;
+            s[2 * ib + 1] = db;
+        }
+    }
+}
+impl Sb16Exact for Iq2Xs {
+    unsafe fn exact_scales(b: *const u8, s: &mut [f32; 16]) {
+        let d = f16p(b);
+        for ib in 0..8 {
+            let v = *b.add(66 + ib);
+            s[2 * ib] = d * (0.5 + (v & 0xF) as f32) * 0.25;
+            s[2 * ib + 1] = d * (0.5 + (v >> 4) as f32) * 0.25;
+        }
+    }
+}
+impl Sb16Exact for Iq2S {
+    unsafe fn exact_scales(b: *const u8, s: &mut [f32; 16]) {
+        let d = f16p(b);
+        for ib in 0..8 {
+            let v = *b.add(74 + ib);
+            s[2 * ib] = d * (0.5 + (v & 0xF) as f32) * 0.25;
+            s[2 * ib + 1] = d * (0.5 + (v >> 4) as f32) * 0.25;
+        }
+    }
+}
+impl Sb16Exact for Iq3Xxs {
+    unsafe fn exact_scales(b: *const u8, s: &mut [f32; 16]) {
+        let d = f16p(b);
+        for ib in 0..8 {
+            let db = d * (0.5 + (rd32(b.add(66 + 4 * ib)) >> 28) as f32) * 0.5;
+            s[2 * ib] = db;
+            s[2 * ib + 1] = db;
+        }
+    }
+}
+impl Sb16Exact for Iq3S {
+    unsafe fn exact_scales(b: *const u8, s: &mut [f32; 16]) {
+        let d = f16p(b);
+        for ib in 0..8 {
+            let db = d * (1 + 2 * ((*b.add(106 + ib / 2) >> (4 * (ib % 2))) & 0xF) as i32) as f32;
+            s[2 * ib] = db;
+            s[2 * ib + 1] = db;
+        }
+    }
+}
+
+unsafe fn deq_sb16<U: Sb16Exact>(row: *const u8, n: usize, out: *mut f32) {
+    for sb in 0..n / QK_K {
+        let b = row.add(sb * U::TSZ);
+        let mut w = [vdupq_n_s8(0); 16];
+        let mut sci = [0i8; 16];
+        U::unpack(b, &mut w, &mut sci);
+        let mut s = [0f32; 16];
+        U::exact_scales(b, &mut s);
+        for k in 0..16 {
+            st16(out.add(sb * QK_K + 16 * k), w[k], s[k]);
+        }
+    }
+}
+
+unsafe fn deq_q4k<const FIVE: bool>(row: *const u8, n: usize, out: *mut f32) {
+    let tsz = if FIVE { 176 } else { 144 };
+    let m4 = vdupq_n_u8(0x0F);
+    let b16 = vdupq_n_u8(16);
+    for sb in 0..n / QK_K {
+        let b = row.add(sb * tsz);
+        let (d, min) = (f16p(b), f16p(b.add(2)));
+        let scales = std::slice::from_raw_parts(b.add(4), 12);
+        let qs = b.add(if FIVE { 48 } else { 16 });
+        let (h0, h1) = if FIVE {
+            (vld1q_u8(b.add(16)), vld1q_u8(b.add(32)))
+        } else {
+            (vdupq_n_u8(0), vdupq_n_u8(0))
+        };
+        for j in 0..4 {
+            let v0 = vld1q_u8(qs.add(32 * j));
+            let v1 = vld1q_u8(qs.add(32 * j + 16));
+            for h in 0..2 {
+                let (sc, mn) = super::scale_min_k4(2 * j + h, scales);
+                let (d1, m1) = (vdupq_n_f32(d * sc as f32), vdupq_n_f32(min * mn as f32));
+                let mut q = if h == 0 {
+                    [vandq_u8(v0, m4), vandq_u8(v1, m4)]
+                } else {
+                    [vshrq_n_u8::<4>(v0), vshrq_n_u8::<4>(v1)]
+                };
+                if FIVE {
+                    let u = vdupq_n_u8(1 << (2 * j + h));
+                    q[0] = vorrq_u8(q[0], vandq_u8(vtstq_u8(h0, u), b16));
+                    q[1] = vorrq_u8(q[1], vandq_u8(vtstq_u8(h1, u), b16));
+                }
+                let o = out.add(sb * QK_K + 64 * j + 32 * h);
+                for (k, qv) in q.into_iter().enumerate() {
+                    let lo = vmovl_u8(vget_low_u8(qv));
+                    let hi = vmovl_high_u8(qv);
+                    let f = [
+                        vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo))),
+                        vcvtq_f32_u32(vmovl_high_u16(lo)),
+                        vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi))),
+                        vcvtq_f32_u32(vmovl_high_u16(hi)),
+                    ];
+                    for (i, fv) in f.into_iter().enumerate() {
+                        vst1q_f32(o.add(16 * k + 4 * i), vsubq_f32(vmulq_f32(d1, fv), m1));
+                    }
+                }
+            }
+        }
+    }
+}
+
+unsafe fn deq_iq4xs(row: *const u8, n: usize, out: *mut f32) {
+    let m4 = vdupq_n_u8(0x0F);
+    let kv = vld1q_s8(KVALUES_IQ4NL.as_ptr());
+    for sb in 0..n / QK_K {
+        let b = row.add(sb * 136);
+        let blk = std::slice::from_raw_parts(b, 136);
+        let d = f16p(b);
+        for ib in 0..8 {
+            let dl = d * super::iq4xs_scale(blk, ib) as f32;
+            let v = vld1q_u8(b.add(8 + 16 * ib));
+            let o = out.add(sb * QK_K + 32 * ib);
+            st16(o, vqtbl1q_s8(kv, vandq_u8(v, m4)), dl);
+            st16(o.add(16), vqtbl1q_s8(kv, vshrq_n_u8::<4>(v)), dl);
+        }
+    }
+}

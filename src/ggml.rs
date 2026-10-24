@@ -222,11 +222,18 @@ impl GgufMatrix {
     pub fn bytes(&self) -> usize {
         self.data.len()
     }
-    /// Dequantizes rows `r0..r1` into `out` (f32 row-major, `(r1 - r0) * n_in`).
+    /// Dequantizes rows `r0..r1` into `out` (f32 row-major, `(r1 - r0) * n_in`); the same values
+    /// as `dequantize_row`, through NEON where available.
     pub fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
         let n = self.n_in;
         for (i, r) in (r0..r1).enumerate() {
-            dequantize_row(self.kind, self.row(r), &mut out[i * n..(i + 1) * n]);
+            let o = &mut out[i * n..(i + 1) * n];
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: the row holds `n` elements of `kind` and `o` has room for them.
+            if unsafe { neon::dequant_row(self.kind, self.row(r).as_ptr(), n, o.as_mut_ptr()) } {
+                continue;
+            }
+            dequantize_row(self.kind, self.row(r), o);
         }
     }
 }
@@ -1102,6 +1109,21 @@ mod tests {
             let mut y = vec![0f32; FIXTURE_ELEMS];
             dequantize_row(kind, &fixture(kind), &mut y);
             assert_eq!(fnv(&y), want, "{kind}: dequantized values differ from ggml");
+        }
+    }
+
+    /// `GgufMatrix::dequantize_rows` (NEON on aarch64) is bit-identical to `dequantize_row`.
+    #[test]
+    fn row_dequantization_paths_agree() {
+        for kind in GgmlType::ALL {
+            let raw = fixture(kind);
+            let n = FIXTURE_ELEMS / 4;
+            let m = GgufMatrix::from_bytes(kind, &raw, 4, n).unwrap();
+            let mut fast = vec![0f32; FIXTURE_ELEMS];
+            m.dequantize_rows(0, 4, &mut fast);
+            let mut want = vec![0f32; FIXTURE_ELEMS];
+            dequantize_row(kind, &raw, &mut want);
+            assert!(fast.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "{kind}");
         }
     }
 
