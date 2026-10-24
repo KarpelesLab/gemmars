@@ -196,6 +196,20 @@ impl SafeTensors {
         Ok(&self.mmap[t.start..t.end])
     }
 
+    /// Raw bytes of a tensor; from a host-kept file they are copied out (loaders that convert every
+    /// weight anyway, like the diffusion models, can then leave whole files outside module memory).
+    pub fn bytes_cow(&self, name: &str) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let t = self.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;
+        match &self.mmap {
+            Storage::Host(h) => {
+                let mut buf = vec![0u8; t.end - t.start];
+                crate::fsx::read_host(*h, t.start as u64, &mut buf)?;
+                Ok(std::borrow::Cow::Owned(buf))
+            }
+            m => Ok(std::borrow::Cow::Borrowed(&m[t.start..t.end])),
+        }
+    }
+
     /// Returns a bf16 tensor as a slice of raw u16 bit patterns.
     pub fn bf16(&self, name: &str) -> Result<&[u16]> {
         let t = self.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;

@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, reactive, ref } from 'vue';
 import { Oxinfer, WebGpuHost, hasJspi } from './lib/oxinfer.js';
 import { cachedBytes, clearCache, loadFromFolder, loadFromUrl, sourceBase } from './lib/loader.js';
 import Reply from './components/Reply.vue';
+import ImageStudio from './components/ImageStudio.vue';
 
 const WASM_URL = `${import.meta.env.BASE_URL}oxinfer.wasm`;
 const REPO = 'https://github.com/KarpelesLab/oxinfer';
@@ -10,6 +11,7 @@ const PRESET = { repo: 'Qwen/Qwen3.5-0.8B', name: 'Qwen 3.5 0.8B' };
 
 const params = new URLSearchParams(location.search);
 const auto = params.get('auto') === '1';
+const mode = ref(params.get('mode') === 'image' ? 'image' : 'chat');
 
 // ---- device -------------------------------------------------------------------------------------
 const device = reactive({ checked: false, gpuName: '', gpu: false });
@@ -216,8 +218,8 @@ async function scrollDown() {
 onMounted(async () => {
   await probeDevice();
   storage.value = await cachedBytes();
-  if (auto) {
-    log(`[browser: ${navigator.userAgent}; jspi ${hasJspi}; webgpu ${device.gpu ? device.gpuName : 'none'}]`);
+  if (auto) log(`[browser: ${navigator.userAgent}; jspi ${hasJspi}; webgpu ${device.gpu ? device.gpuName : 'none'}]`);
+  if (auto && mode.value === 'chat') {
     await load();
     for (let i = 0; i < Number(params.get('repeat') || 1) && engine; i++) {
       newConversation();
@@ -232,11 +234,18 @@ onMounted(async () => {
 <template>
   <header class="masthead">
     <h1 class="wordmark">oxinfer</h1>
-    <p class="lede">Run an open language model in this tab. The weights download once and stay in this browser; nothing you type leaves the page.</p>
-    <a class="repo" :href="REPO">Source on GitHub</a>
+    <p class="lede">Chat with a language model or make images, all in this tab. The weights download once and stay in this browser; nothing you type leaves the page.</p>
+    <nav class="nav">
+      <div class="modes" role="group" aria-label="Mode">
+        <button type="button" :aria-pressed="mode === 'chat'" @click="mode = 'chat'">Chat</button>
+        <button type="button" :aria-pressed="mode === 'image'" @click="mode = 'image'">Image</button>
+      </div>
+      <a class="repo" :href="REPO">Source on GitHub</a>
+    </nav>
   </header>
 
-  <main class="layout">
+  <ImageStudio v-if="mode === 'image'" :device="device" :auto="auto" :log="log" @storage="(v) => (storage = v)" />
+  <main v-else class="layout">
     <aside class="side">
       <section aria-labelledby="model-h">
         <h2 id="model-h">Model</h2>
@@ -391,8 +400,33 @@ onMounted(async () => {
   max-width: 52ch;
   color: var(--muted);
 }
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+}
 .repo {
   white-space: nowrap;
+}
+.modes {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.modes button {
+  padding: 0.35rem 0.9rem;
+  border: 0;
+  background: transparent;
+  font-family: var(--display);
+  font-weight: 600;
+}
+.modes button + button {
+  border-left: 1px solid var(--line);
+}
+.modes button[aria-pressed='true'] {
+  background: var(--verdigris-deep);
+  color: var(--paper);
 }
 
 .layout {

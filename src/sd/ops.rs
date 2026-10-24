@@ -78,7 +78,7 @@ impl Tensors {
     /// A tensor as f32, whatever its stored float type.
     pub fn f32(&self, name: &str) -> Result<Vec<f32>> {
         let info = self.st.info(name).with_context(|| format!("missing tensor {name}"))?;
-        let b = self.st.bytes(name)?;
+        let b = self.st.bytes_cow(name)?;
         Ok(match info.dtype.as_str() {
             "F16" => b.as_chunks::<2>().0.iter().map(|c| half::f16::from_le_bytes(*c).to_f32()).collect(),
             "BF16" => b
@@ -100,7 +100,7 @@ impl Tensors {
         }
         Ok(Some(
             self.st
-                .bytes(name)?
+                .bytes_cow(name)?
                 .as_chunks::<2>()
                 .0
                 .iter()

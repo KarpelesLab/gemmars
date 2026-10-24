@@ -398,3 +398,144 @@ pub unsafe extern "C" fn web_gpu_stats(len: *mut usize) -> *const u8 {
         }
     })
 }
+
+// ---- image generation (Stable Diffusion) -------------------------------------------------------
+
+#[link(wasm_import_module = "env")]
+unsafe extern "C" {
+    /// Called after each denoising step.
+    fn host_progress(step: u32, total: u32);
+}
+
+struct SdState {
+    pipe: crate::sd::Pipeline,
+    image: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+thread_local! {
+    static SD: RefCell<Option<SdState>> = const { RefCell::new(None) };
+}
+
+/// Loads the diffusers pipeline in directory `dir` of the virtual filesystem (its `.safetensors`
+/// files are best registered with `web_put_host_file`: weights are converted on load, so the
+/// files never need to be in module memory). `gpu` non-zero uses the host's WebGPU.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_sd_load(dir: *const u8, dir_len: usize, gpu: u32) -> i32 {
+    install_panic_hook();
+    let dir = unsafe { str_arg(dir, dir_len) }.to_string();
+    if gpu != 0 {
+        webgpu::install();
+    }
+    let t0 = crate::clock::Instant::now();
+    match crate::sd::Pipeline::load(Path::new(&dir)) {
+        Ok(pipe) => {
+            log(&format!(
+                "[loaded diffusion pipeline in {:.1}s{}; device {}]",
+                t0.elapsed().as_secs_f64(),
+                if pipe.turbo { ", turbo" } else { "" },
+                crate::gpu::active().map(|b| b.name().to_string()).unwrap_or_else(|| "cpu".into())
+            ));
+            SD.with(|s| {
+                *s.borrow_mut() = Some(SdState {
+                    pipe,
+                    image: Vec::new(),
+                    width: 0,
+                    height: 0,
+                })
+            });
+            0
+        }
+        Err(e) => set_error(&e),
+    }
+}
+
+/// Defaults for the loaded pipeline into `out[0..4]`: image side, steps, guidance, turbo (0/1).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_sd_defaults(out: *mut f32) -> i32 {
+    SD.with(|s| match s.borrow().as_ref() {
+        Some(st) => {
+            let v = [
+                st.pipe.default_size() as f32,
+                if st.pipe.turbo { 1.0 } else { 25.0 },
+                if st.pipe.turbo { 0.0 } else { 7.5 },
+                st.pipe.turbo as u8 as f32,
+            ];
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out, 4) };
+            0
+        }
+        None => set_error(&anyhow!("no image model loaded")),
+    })
+}
+
+/// Generates an image; read it with `web_sd_image`. `sampler`: 0 Euler, 1 Euler ancestral.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn web_sd_generate(
+    prompt: *const u8,
+    prompt_len: usize,
+    negative: *const u8,
+    negative_len: usize,
+    steps: u32,
+    guidance: f32,
+    seed: f64,
+    width: u32,
+    height: u32,
+    sampler: u32,
+) -> i32 {
+    let prompt = unsafe { str_arg(prompt, prompt_len) }.to_string();
+    let negative = if negative.is_null() {
+        String::new()
+    } else {
+        unsafe { str_arg(negative, negative_len) }.to_string()
+    };
+    SD.with(|s| {
+        let mut s = s.borrow_mut();
+        let Some(st) = s.as_mut() else {
+            return set_error(&anyhow!("no image model loaded"));
+        };
+        let params = crate::sd::Params {
+            prompt,
+            negative,
+            steps: steps.max(1) as usize,
+            guidance,
+            seed: seed as u64,
+            width: width as usize,
+            height: height as usize,
+            sampler: if sampler == 0 {
+                crate::sd::sched::Sampler::Euler
+            } else {
+                crate::sd::sched::Sampler::EulerAncestral
+            },
+        };
+        match st.pipe.generate(&params, &mut |i, n| unsafe { host_progress(i as u32, n as u32) }) {
+            Ok((img, tm)) => {
+                log(&format!(
+                    "[text {:.2}s | denoise {:.2}s ({} UNet passes) | decode {:.2}s]",
+                    tm.text, tm.denoise, tm.unet_calls, tm.decode
+                ));
+                st.width = img.width as u32;
+                st.height = img.height as u32;
+                st.image = img.rgb;
+                0
+            }
+            Err(e) => set_error(&e),
+        }
+    })
+}
+
+/// The last generated image as RGB bytes (`width * height * 3`); dimensions to `*w`, `*h`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_sd_image(w: *mut u32, h: *mut u32) -> *const u8 {
+    SD.with(|s| match s.borrow().as_ref() {
+        Some(st) => {
+            unsafe {
+                *w = st.width;
+                *h = st.height;
+            }
+            st.image.as_ptr()
+        }
+        None => std::ptr::null(),
+    })
+}

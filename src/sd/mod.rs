@@ -115,7 +115,8 @@ impl Pipeline {
             );
         }
         let vae = vae::VaeDecoder::load(&va, &weights(&va, "diffusion_pytorch_model")?)?;
-        let name = dir.to_string_lossy().to_lowercase();
+        // Distilled single-step models are named as such (folder, or the name recorded at export).
+        let name = format!("{} {}", dir.to_string_lossy(), index["_name_or_path"].as_str().unwrap_or("")).to_lowercase();
         Ok(Self {
             tokenizer: clip::ClipTokenizer::load(&dir.join("tokenizer"))?,
             text,

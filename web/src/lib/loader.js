@@ -80,10 +80,10 @@ async function cachedResponse(url, onBytes) {
   return { response: again, cached: false };
 }
 
-async function readInto(g, name, size, stream, onBytes) {
+async function readInto(g, name, size, stream, onBytes, host = isHostShard(name)) {
   const path = `${ROOT}/${name}`;
   const reader = stream.getReader();
-  if (isHostShard(name)) {
+  if (host) {
     const bytes = new Uint8Array(size);
     let off = 0;
     for (;;) {
@@ -158,4 +158,78 @@ export async function cachedBytes() {
 
 export async function clearCache() {
   if (typeof caches !== 'undefined') await caches.delete(CACHE);
+}
+
+// ---- diffusers pipelines (image generation) ------------------------------------------------------
+
+const DIFFUSERS_SMALL = [
+  'model_index.json',
+  'scheduler/scheduler_config.json',
+  'text_encoder/config.json',
+  'tokenizer/vocab.json',
+  'tokenizer/merges.txt',
+  'tokenizer/tokenizer_config.json',
+  'unet/config.json',
+  'vae/config.json',
+];
+const DIFFUSERS_WEIGHTS = [
+  ['text_encoder/model.fp16.safetensors', 'text_encoder/model.safetensors'],
+  ['unet/diffusion_pytorch_model.fp16.safetensors', 'unet/diffusion_pytorch_model.safetensors'],
+  ['vae/diffusion_pytorch_model.fp16.safetensors', 'vae/diffusion_pytorch_model.safetensors'],
+];
+
+/// True when `base` serves a diffusers pipeline (it has model_index.json).
+export async function isDiffusers(base) {
+  return !!(await fetchJson(base, 'model_index.json'));
+}
+
+/// Downloads (or reuses) a Stable Diffusion pipeline. Weights stay in JavaScript memory (the
+/// module converts them tensor by tensor), configs and the tokenizer go into module memory.
+export async function loadDiffusersFromUrl(g, base, progress) {
+  const count = DIFFUSERS_SMALL.length + DIFFUSERS_WEIGHTS.length;
+  let index = 0;
+  for (const name of DIFFUSERS_SMALL) {
+    const { response } = await cachedResponse(`${base}/${name}`, () => {});
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    g.putFile(`${ROOT}/${name}`, bytes);
+    progress({ file: name, index: index++, count, got: bytes.byteLength, size: bytes.byteLength, phase: 'read' });
+  }
+  for (const choices of DIFFUSERS_WEIGHTS) {
+    let done = false;
+    for (const name of choices) {
+      let response;
+      try {
+        ({ response } = await cachedResponse(`${base}/${name}`, (got, size) => progress({ file: name, index, count, got, size, phase: 'download' })));
+      } catch {
+        continue; // try the other variant
+      }
+      const size = Number(response.headers.get('content-length') || 0);
+      const report = (got) => progress({ file: name, index, count, got, size, phase: 'read' });
+      if (size && response.body) await readInto(g, name, size, response.body, report, true);
+      else {
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        g.putHostFile(`${ROOT}/${name}`, bytes);
+      }
+      done = true;
+      break;
+    }
+    if (!done) throw new Error(`${base}: none of ${choices.join(', ')} could be downloaded`);
+    index++;
+  }
+}
+
+/// Reads a diffusers folder picked with <input webkitdirectory>, keeping its subfolders.
+export async function loadDiffusersFromFolder(g, fileList, progress) {
+  const files = [...fileList];
+  const rel = (f) => (f.webkitRelativePath || f.name).split('/').slice(1).join('/');
+  if (!files.some((f) => rel(f) === 'model_index.json')) throw new Error('That folder has no model_index.json, so it is not a diffusers pipeline.');
+  const wanted = files.filter((f) => /^(model_index\.json|scheduler\/.*\.json|tokenizer\/.*|(text_encoder|unet|vae)\/.*\.(json|safetensors))$/.test(rel(f)));
+  for (const [index, f] of wanted.entries()) {
+    const name = rel(f);
+    if (name.endsWith('.safetensors')) {
+      await readInto(g, name, f.size, f.stream(), (got) => progress({ file: name, index, count: wanted.length, got, size: f.size, phase: 'read' }), true);
+    } else {
+      g.putFile(`${ROOT}/${name}`, new Uint8Array(await f.arrayBuffer()));
+    }
+  }
 }

@@ -31,6 +31,8 @@ identical tokens.
 | google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
 | Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text only; matches the bf16 reference; see below |
 | Qwen/Qwen3.5-0.8B | 0.8B | 1.7 GB | text only; the small one used for the wasm measurements |
+| stabilityai/sd-turbo | 1.3B | 2.6 GB (fp16) | text-to-image in one step; matches diffusers (see Image generation) |
+| stable-diffusion-v1-5/stable-diffusion-v1-5 (and SD 1.x / 2.x fine-tunes) | 1.1B | 2.0 GB (fp16) | text-to-image; matches diffusers |
 
 ### Qwen3.5 / Qwen3.8
 
@@ -47,7 +49,42 @@ otherwise the generation prompt closes the think block.
 
 Text, images and audio are supported (E2B/E4B have both towers). Video is not.
 
-## Images and audio
+## Image generation
+
+A diffusers folder (one with `model_index.json`) switches oxinfer to text-to-image with Stable
+Diffusion 1.x / 2.x, which includes SD 1.5, SD 2.1 and the one-step SD-Turbo (`src/sd/`):
+
+```sh
+./target/release/oxinfer --model models/sd-turbo -p "a red fox in a snowy forest" -o fox.png
+./target/release/oxinfer --model models/sd-v1-5 -p "a watercolor lighthouse" --negative "blurry" \
+    --steps 25 --guidance 7.5 --sampler euler_a --size 512x512 --seed 7 -o lighthouse.png
+```
+
+Turbo models (recognised by name) default to 1 step without guidance, others to 25 Euler-ancestral
+steps at guidance 7.5. The CLIP tokenizer and text encoder, the UNet (ResNets, spatial transformers
+with GEGLU, skip connections), the VAE decoder and the Euler samplers are implemented here.
+Activations are channels-last, so every convolution unfolds into the same matmul the language models
+use: the SIMD kernels apply on every CPU, and GPU backends run convolutions directly as an implicit
+GEMM (`Backend::conv2d`: the kernel gathers each pixel's neighbourhood itself; Metal measured, CUDA
+compile-checked, WebGPU in the browser). Weights are converted from fp16 to bf16 at load.
+
+`tools/ref_sd.py` runs diffusers on the same noise and compares every stage (`OXINFER_SD_DUMP=dir`).
+With the weights rounded to bf16 on both sides the outputs agree to about 1e-6 (79 dB PSNR on
+the SD-Turbo image, 75 dB on SD 1.5 after 4 guided steps), so the only difference from the fp32
+reference is the bf16 weight storage (47 dB).
+
+512x512 on the M5 Max:
+
+| | Text | UNet pass | VAE decode | SD-Turbo image | SD 1.5, 25 steps + guidance |
+|---|---|---|---|---|---|
+| CPU only (18 threads) | 0.08 s | 0.91 s | 2.87 s | 3.9 s | |
+| CPU + Metal convolutions | 0.08 s | 0.67 s | 0.77 s | 1.6 s | 35 s |
+| Browser (Chrome, WebGPU, one CPU thread) | 0.3 s | 6.6 s | 5.8 s | 12.7 s | |
+
+Attention, normalization and the remaining element-wise work run on the CPU; moving them onto
+the GPU is the next lever. SDXL, SD 3 and Flux use different architectures and are not supported.
+
+## Image and audio input
 
 ```sh
 ./target/release/oxinfer --model models/gemma-4-E4B-it --quant q4 \
@@ -285,6 +322,10 @@ always read into memory.
 
 ### Browser (WebGPU)
 
+The site has a Chat mode and an Image mode; Image mode loads SD-Turbo (2.6 GB of fp16 weights)
+from Hugging Face by default. Diffusion weights stay in JavaScript memory and the module converts
+them tensor by tensor, so only the bf16 copy counts against the 4 GiB of wasm memory.
+
 The `web` feature (`src/web/`) turns the library into a plain C-ABI wasm module, no bindgen;
 `cargo build-web` builds it as a `cdylib` for `wasm32-unknown-unknown` (the crate type is given on
 the command line, so native builds never link a shared library). `web/` is the site deployed to
@@ -357,6 +398,9 @@ Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex bac
   real filesystem or on the browser's in-memory table; `src/web/` (feature `web`): the browser module's
   C-ABI exports and the WebGPU backend calling back into the host; `web/` at the root: the
   JavaScript host and page.
+- `sd/`: Stable Diffusion: `clip.rs` (BPE tokenizer, text encoder), `unet.rs`, `vae.rs`, `sched.rs`
+  (Euler samplers), `ops.rs` (channels-last convolution, group/layer norm, multi-head attention on
+  the f32 GEMM tiles); `png.rs`: a dependency-free PNG writer.
 - `kernels.rs`: NEON kernels (`kernels_x86.rs`, `kernels_wasm.rs`: the AVX2 and simd128 equivalents, selected by `build.rs` through the `has_simd` cfg). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
   prefers few long streams); prefill packs activations into 8-token panels and runs an 8-row x 8-token
   outer-product kernel that broadcasts bf16 weights by lane. Also RMSNorm, GELU (tanh approximation via

@@ -11,8 +11,29 @@ const TILE = 64;
 // ---- WGSL ----------------------------------------------------------------------------------------
 // y[t][n] = sum_k x[t][k] * w[n][k]; one workgroup computes a 64 (n) x 64 (t) tile with 256 threads,
 // each 4x4 outputs; weights are dequantized to f32 in workgroup memory, 32 k per step.
+// Matmul shaders read x densely ([t][n_in]); convolution shaders gather each pixel's k x k
+// neighbourhood from the channels-last image (implicit GEMM; cin % 32 == 0, so a 32-wide block of
+// K is one tap's contiguous channel slice), with zeros outside the image.
+const X_DENSE = `
+    let xb = (t0 + lr) * p.n_in + k0 + lc * 8u;
+    for (var j = 0u; j < 8u; j++) { put_x(lc * 8u + j, lr, x[xb + j]); }`;
+const X_CONV = `
+    let tok = t0 + lr;
+    let tap = k0 / p.cin;
+    let ci0 = k0 - tap * p.cin;
+    let iy = i32(tok / p.ow) * i32(p.stride) + i32(tap / p.k) - i32(p.padk);
+    let ix = i32(tok % p.ow) * i32(p.stride) + i32(tap % p.k) - i32(p.padk);
+    if (tok < p.npix && iy >= 0 && ix >= 0 && iy < i32(p.h) && ix < i32(p.w)) {
+      let xb = (u32(iy) * p.w + u32(ix)) * p.cin + ci0 + lc * 8u;
+      for (var j = 0u; j < 8u; j++) { put_x(lc * 8u + j, lr, x[xb + j]); }
+    } else {
+      for (var j = 0u; j < 8u; j++) { put_x(lc * 8u + j, lr, 0.0); }
+    }`;
+const P_DENSE = 'struct P { n_out: u32, n_in: u32, t_pad: u32, pad: u32 }';
+const P_CONV = 'struct P { n_out: u32, n_in: u32, t_pad: u32, pad: u32, h: u32, w: u32, cin: u32, k: u32, stride: u32, ow: u32, npix: u32, padk: u32 }';
+
 const WGSL_COMMON = `
-struct P { n_out: u32, n_in: u32, t_pad: u32, pad: u32 }
+__P__
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> w: array<u32>;
 @group(0) @binding(2) var<storage, read> s: array<u32>;
@@ -42,8 +63,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
   var a3 = vec4<f32>(0.0);
   for (var k0 = 0u; k0 < p.n_in; k0 += 32u) {
     load_w(n0 + lr, k0, lr, lc);
-    let xb = (t0 + lr) * p.n_in + k0 + lc * 8u;
-    for (var j = 0u; j < 8u; j++) { put_x(lc * 8u + j, lr, x[xb + j]); }
+__X__
     workgroupBarrier();
     for (var k = 0u; k < 32u; k++) {
       let wi = k * 64u + tn * 4u;
@@ -149,15 +169,58 @@ export class WebGpuHost {
     return host;
   }
 
-  pipeline(kind) {
-    if (!this.pipelines[kind]) {
-      const module = this.device.createShaderModule({ code: WGSL_LOAD[kind] + WGSL_COMMON });
-      this.pipelines[kind] = this.device.createComputePipeline({
+  pipeline(kind, conv = false) {
+    const key = `${kind}${conv ? 'c' : ''}`;
+    if (!this.pipelines[key]) {
+      const code = WGSL_LOAD[kind] + WGSL_COMMON.replace('__P__', conv ? P_CONV : P_DENSE).replace('__X__', conv ? X_CONV : X_DENSE);
+      const module = this.device.createShaderModule({ code });
+      this.pipelines[key] = this.device.createComputePipeline({
         layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.layout] }),
         compute: { module, entryPoint: 'main' },
       });
     }
-    return this.pipelines[kind];
+    return this.pipelines[key];
+  }
+
+  /// k x k convolution: `x` is the channels-last image ([h*w, cin] f32 view, copied by
+  /// writeBuffer at once), `d` its geometry; resolves after `writeY(Float32Array)`.
+  async conv(x, d, writeY) {
+    const wt = this.weights[d.handle];
+    if (!wt || wt.nOut !== d.nOut || wt.nIn !== d.nIn) throw new Error(`bad conv: handle ${d.handle}`);
+    const t = d.oh * d.ow;
+    const tPad = Math.ceil(t / TILE) * TILE;
+    const xBytes = Math.max(16, x.byteLength);
+    if (!this.cxBuf || this.cxBuf.size < xBytes) {
+      if (this.cxBuf) this.cxBuf.destroy();
+      this.cxBuf = this.device.createBuffer({ size: xBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    }
+    this.device.queue.writeBuffer(this.cxBuf, 0, x.buffer, x.byteOffset, x.byteLength);
+    if (!this.convParams) this.convParams = this.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.convParams, 0, new Uint32Array([d.nOut, d.nIn, tPad, 0, d.h, d.w, d.cin, d.k, d.stride, d.ow, t, (d.k / 2) | 0]));
+    const ySize = tPad * d.nOut * 4;
+    const y = this.yFor(ySize, 0);
+    const st = this.stageFor(t * d.nOut * 4, 0);
+    const bg = this.device.createBindGroup({
+      layout: this.layout,
+      entries: [
+        { binding: 0, resource: { buffer: this.convParams } },
+        { binding: 1, resource: { buffer: wt.w } },
+        { binding: 2, resource: { buffer: wt.s } },
+        { binding: 3, resource: { buffer: this.cxBuf, size: xBytes } },
+        { binding: 4, resource: { buffer: y, size: ySize } },
+      ],
+    });
+    const enc = this.device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.pipeline(wt.kind, true));
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(d.nOut / TILE, tPad / TILE, 1);
+    pass.end();
+    enc.copyBufferToBuffer(y, 0, st, 0, t * d.nOut * 4);
+    this.device.queue.submit([enc.finish()]);
+    await st.mapAsync(GPUMapMode.READ, 0, t * d.nOut * 4);
+    writeY(new Float32Array(st.getMappedRange(0, t * d.nOut * 4)));
+    st.unmap();
   }
 
   storage(bytes, extra = 0) {
@@ -292,6 +355,20 @@ export class Oxinfer {
         if (!g.gpu) return -1;
         return g.gpu.upload(kind, g.u8(dp, dn), sn ? g.u8(sp, sn) : null, nOut, nIn);
       },
+      host_progress: (step, total) => g.onProgress?.(step, total),
+      gpu_conv: async (xp, dp) => {
+        if (!g.gpu) return 1;
+        try {
+          const v = new Uint32Array(g.memory.buffer, dp >>> 0, 12);
+          const d = { handle: v[0], nOut: v[1], nIn: v[2], h: v[3], w: v[4], cin: v[5], k: v[6], stride: v[7], oh: v[8], ow: v[9], y: v[10] };
+          const x = new Float32Array(g.memory.buffer, xp >>> 0, d.h * d.w * d.cin);
+          await g.gpu.conv(x, d, (out) => new Float32Array(g.memory.buffer, d.y >>> 0, out.length).set(out));
+          return 0;
+        } catch (e) {
+          log(`[webgpu: ${e.message || e}]`);
+          return 2;
+        }
+      },
       gpu_matmul: async (xp, t, nIn, jp, nJobs) => {
         if (!g.gpu) return 1;
         try {
@@ -310,7 +387,12 @@ export class Oxinfer {
         }
       },
     };
-    if (jspi) env.gpu_matmul = new WebAssembly.Suspending(env.gpu_matmul);
+    if (jspi) {
+      env.gpu_matmul = new WebAssembly.Suspending(env.gpu_matmul);
+      env.gpu_conv = new WebAssembly.Suspending(env.gpu_conv);
+    } else {
+      env.gpu_conv = () => 1;
+    }
     let bytes = source;
     if (typeof source === 'string') source = await fetch(source);
     if (source instanceof Response) bytes = await source.arrayBuffer();
@@ -320,6 +402,7 @@ export class Oxinfer {
     // Exports that can reach gpu_matmul must be promising (they return promises then).
     g.chatTurnRaw = jspi ? WebAssembly.promising(g.ex.web_chat_turn) : async (...a) => g.ex.web_chat_turn(...a);
     g.nextRaw = jspi ? WebAssembly.promising(g.ex.web_next) : async () => g.ex.web_next();
+    g.sdGenerateRaw = jspi ? WebAssembly.promising(g.ex.web_sd_generate) : async (...a) => g.ex.web_sd_generate(...a);
     return g;
   }
 
@@ -378,6 +461,46 @@ export class Oxinfer {
     const rc = this.ex.web_put_host_file(pp, pn, id, bytes.byteLength);
     this.ex.web_free(pp, pn);
     if (rc < 0) throw new Error(this.lastError());
+  }
+
+  // ---- image generation ----
+
+  /// Loads a diffusers Stable Diffusion folder registered under `dir`.
+  sdLoad(dir) {
+    const [dp, dn] = this.strArg(dir);
+    const rc = this.ex.web_sd_load(dp, dn, this.gpu ? 1 : 0);
+    this.ex.web_free(dp, dn);
+    if (rc < 0) throw new Error(this.lastError());
+  }
+
+  /// { size, steps, guidance, turbo } for the loaded pipeline.
+  sdDefaults() {
+    const p = this.ex.web_alloc(16) >>> 0;
+    const rc = this.ex.web_sd_defaults(p);
+    const v = new Float32Array(this.memory.buffer, p, 4).slice();
+    this.ex.web_free(p, 16);
+    if (rc < 0) throw new Error(this.lastError());
+    return { size: v[0], steps: v[1], guidance: v[2], turbo: v[3] !== 0 };
+  }
+
+  /// Generates an image; resolves to { width, height, rgb: Uint8Array }.
+  async sdGenerate({ prompt, negative = '', steps = 1, guidance = 0, seed = 0, width = 512, height = 512, ancestral = true }, onProgress) {
+    const [pp, pn] = this.strArg(prompt);
+    const [np, nn] = negative ? this.strArg(negative) : [0, 0];
+    this.onProgress = onProgress;
+    try {
+      const rc = await this.sdGenerateRaw(pp, pn, np, nn, steps, guidance, seed, width, height, ancestral ? 1 : 0);
+      if (rc < 0) throw new Error(this.lastError());
+    } finally {
+      this.onProgress = null;
+      this.ex.web_free(pp, pn);
+      if (nn) this.ex.web_free(np, nn);
+    }
+    const dims = this.ex.web_alloc(8) >>> 0;
+    const ptr = this.ex.web_sd_image(dims, dims + 4) >>> 0;
+    const [w, h] = new Uint32Array(this.memory.buffer, dims, 2);
+    this.ex.web_free(dims, 8);
+    return { width: w, height: h, rgb: new Uint8Array(this.memory.buffer, ptr, w * h * 3).slice() };
   }
 
   /// quant: 'bf16' | 'q8' | 'q4' (ignored for pre-quantized checkpoints, which carry their own).

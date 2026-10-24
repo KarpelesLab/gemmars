@@ -15,6 +15,26 @@ unsafe extern "C" {
     fn gpu_upload(kind: u32, data: *const u8, data_len: usize, scales: *const u8, scales_len: usize, n_out: u32, n_in: u32) -> i32;
     /// Runs `n_jobs` matmuls over `x` ([t, n_in] f32); each job is a `JobDesc`. Returns 0 on success.
     fn gpu_matmul(x: *const f32, t: u32, n_in: u32, jobs: *const JobDesc, n_jobs: u32) -> i32;
+    /// A k x k convolution of `x` (`[h*w, cin]` f32) with weight `handle` into `y`
+    /// (`[oh*ow, n_out]`); see `ConvDesc`. Returns 0 on success.
+    fn gpu_conv(x: *const f32, desc: *const ConvDesc) -> i32;
+}
+
+/// Convolution geometry for the host (all u32; `y` is a module-memory pointer).
+#[repr(C)]
+pub struct ConvDesc {
+    handle: u32,
+    n_out: u32,
+    n_in: u32,
+    h: u32,
+    w: u32,
+    cin: u32,
+    k: u32,
+    stride: u32,
+    oh: u32,
+    ow: u32,
+    y: u32,
+    _pad: u32,
 }
 
 /// One matmul for the host: output `y` is [t, n_out] f32 in module memory.
@@ -94,6 +114,37 @@ impl Backend for WebGpuBackend {
             return None;
         }
         Some(Box::new(Handle(h)))
+    }
+    fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, job: &mut Job) -> bool {
+        let Some(h) = job.dev.downcast_ref::<Handle>() else { return false };
+        if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(64) {
+            return false;
+        }
+        let t0 = crate::clock::Instant::now();
+        let d = ConvDesc {
+            handle: h.0 as u32,
+            n_out: job.n_out as u32,
+            n_in: (g.k * g.k * g.cin) as u32,
+            h: g.h as u32,
+            w: g.w as u32,
+            cin: g.cin as u32,
+            k: g.k as u32,
+            stride: g.stride as u32,
+            oh: g.oh as u32,
+            ow: g.ow as u32,
+            y: job.y.as_mut_ptr() as u32,
+            _pad: 0,
+        };
+        let rc = unsafe { gpu_conv(x.as_ptr(), &d) };
+        if rc != 0 {
+            super::log(&format!("[webgpu: conv failed ({rc}); falling back to CPU]"));
+            return false;
+        }
+        let flops = 2.0 * (g.oh * g.ow) as f64 * job.n_out as f64 * (g.k * g.k * g.cin) as f64;
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.flops.fetch_add(flops as u64, Ordering::Relaxed);
+        self.micros.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        true
     }
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool {
         let t0 = crate::clock::Instant::now();
