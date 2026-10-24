@@ -4,6 +4,7 @@ import { Oxinfer, WebGpuHost, hasJspi } from './lib/oxinfer.js';
 import { cachedBytes, clearCache, loadFromFolder, loadFromUrl, sourceBase } from './lib/loader.js';
 import Reply from './components/Reply.vue';
 import ImageStudio from './components/ImageStudio.vue';
+import { TOOL_SPECS, runTool, systemPrompt } from './lib/tools.js';
 
 const WASM_URL = `${import.meta.env.BASE_URL}oxinfer.wasm`;
 const REPO = 'https://github.com/KarpelesLab/oxinfer';
@@ -121,6 +122,8 @@ async function load() {
     await pause();
     engine.load('/model', precision.value);
     engine.setSampling({ temperature: temperature.value, topK: 64, topP: 0.95, seed: Date.now() % 1e9 });
+    resetSystem();
+    applyTools();
     phase.value = 'ready';
   } catch (e) {
     error.value = friendly(e);
@@ -155,6 +158,32 @@ const stats = ref(null);
 let stopRequested = false;
 const transcript = ref(null);
 
+// ---- tools and system prompt ----
+const useTools = ref(params.get('tools') !== '0');
+const systemText = ref('');
+const MAX_TOOL_ROUNDS = 5;
+
+function resetSystem() {
+  systemText.value = systemPrompt({ tools: useTools.value, gpuName: gpuHost ? device.gpuName : '', modelName: modelName.value });
+}
+
+function applyTools() {
+  engine?.setTools(useTools.value ? TOOL_SPECS : []);
+}
+
+function toggleTools() {
+  // Takes effect from the next conversation: the declarations live in its first system turn.
+  applyTools();
+  resetSystem();
+  newConversation();
+}
+
+function toolLabel(m) {
+  if (m.name === 'get_datetime') return m.running ? 'Checking the date and time…' : 'Checked the date and time';
+  if (m.name === 'run_javascript') return m.running ? 'Running JavaScript…' : 'Ran JavaScript';
+  return m.running ? `Calling ${m.name}…` : `Called ${m.name}`;
+}
+
 async function send() {
   const text = draft.value.trim();
   if (!engine || !text || phase.value !== 'ready') return;
@@ -163,22 +192,43 @@ async function send() {
   phase.value = 'generating';
   messages.value.push({ role: 'user', text });
   messages.value.push({ role: 'model', text: '' });
-  const reply = messages.value[messages.value.length - 1];
+  let reply = messages.value[messages.value.length - 1];
   await scrollDown();
   try {
     engine.setSampling({ temperature: temperature.value, topK: 64, topP: 0.95, seed: Date.now() % 1e9 });
     const t0 = performance.now();
-    const promptTokens = await engine.chatTurn(text, { think: think.value, maxTokens: maxTokens.value });
+    const promptTokens = await engine.chatTurn(text, { system: systemText.value.trim() || null, think: think.value, maxTokens: maxTokens.value });
     const t1 = performance.now();
     let tokens = 0;
-    while (!stopRequested && (await engine.next()) >= 0) {
-      tokens++;
-      const t = engine.text();
-      if (!t.endsWith('�')) reply.text = t;
-      await pause(); // a real task boundary, so the browser paints between tokens
-      if (tokens % 8 === 0) scrollDown();
+    for (let round = 0; ; round++) {
+      while (!stopRequested && (await engine.next()) >= 0) {
+        tokens++;
+        const t = engine.text();
+        if (!t.endsWith('�')) reply.text = t;
+        await pause(); // a real task boundary, so the browser paints between tokens
+        if (tokens % 8 === 0) scrollDown();
+      }
+      reply.text = engine.text();
+      if (stopRequested || !useTools.value || round >= MAX_TOOL_ROUNDS) break;
+      const calls = engine.toolCalls();
+      if (!calls.length) break;
+      // The model asked for tools: show each call, run it, feed the results back, keep going.
+      if (!reply.text.trim()) messages.value.splice(messages.value.indexOf(reply), 1);
+      const results = [];
+      for (const c of calls) {
+        messages.value.push({ role: 'tool', name: c.name, args: c.arguments, result: '', running: true });
+        const m = messages.value[messages.value.length - 1];
+        await scrollDown();
+        m.result = await runTool(c);
+        m.running = false;
+        log(`[tool ${c.name}(${JSON.stringify(c.arguments)}) -> ${m.result.replace(/\n/g, '\\n').slice(0, 300)}]`);
+        results.push({ name: c.name, content: m.result });
+      }
+      messages.value.push({ role: 'model', text: '' });
+      reply = messages.value[messages.value.length - 1];
+      await scrollDown();
+      await engine.toolResults(results);
     }
-    reply.text = engine.text();
     const t2 = performance.now();
     stats.value = { promptTokens, prefill: promptTokens / ((t1 - t0) / 1e3), tokens, decode: tokens / Math.max(1e-3, (t2 - t1) / 1e3), stopped: stopRequested };
     log(`[prefill ${promptTokens} tok at ${stats.value.prefill.toFixed(1)} tok/s | decode ${tokens} tok at ${stats.value.decode.toFixed(1)} tok/s]`);
@@ -331,6 +381,12 @@ onMounted(async () => {
         <label class="inline">Temperature <input v-model.number="temperature" class="num" type="number" min="0" max="2" step="0.1" /></label>
         <label class="inline">Longest reply <input v-model.number="maxTokens" class="num" type="number" min="1" max="8192" step="1" /> tokens</label>
         <label class="inline"><input v-model="think" type="checkbox" /> Let the model think first</label>
+        <label class="inline"><input v-model="useTools" type="checkbox" @change="toggleTools" /> Let the model use tools</label>
+        <p class="hint">It can read the date and time, and run JavaScript in a sandboxed worker with no network or storage access.</p>
+        <label class="block">System prompt
+          <textarea v-model="systemText" class="sys" rows="7" spellcheck="false" aria-label="System prompt"></textarea>
+        </label>
+        <p class="hint">Applies from the next conversation. <button class="link" type="button" :disabled="!engine" @click="resetSystem">Reset</button></p>
       </details>
 
       <details class="more">
@@ -349,12 +405,19 @@ onMounted(async () => {
         <p v-if="!messages.length" class="empty">
           {{ phase === 'ready' ? 'Ask it something.' : 'Load a model, then ask it something.' }}
         </p>
-        <article v-for="(m, i) in messages" :key="i" :class="['msg', m.role]">
-          <h3 class="who">{{ m.role === 'user' ? 'You' : modelName }}</h3>
-          <p v-if="m.role === 'user'" class="said">{{ m.text }}</p>
-          <Reply v-else-if="m.text" :text="m.text" />
-          <p v-else class="thinking">Reading your message…</p>
-        </article>
+        <template v-for="(m, i) in messages" :key="i">
+          <details v-if="m.role === 'tool'" class="tool" :open="m.name === 'run_javascript' && !m.running">
+            <summary>{{ toolLabel(m) }}</summary>
+            <pre v-if="m.name === 'run_javascript'" class="code">{{ m.args.code }}</pre>
+            <pre v-if="m.result" class="result">{{ m.result }}</pre>
+          </details>
+          <article v-else :class="['msg', m.role]">
+            <h3 class="who">{{ m.role === 'user' ? 'You' : modelName }}</h3>
+            <p v-if="m.role === 'user'" class="said">{{ m.text }}</p>
+            <Reply v-else-if="m.text" :text="m.text" />
+            <p v-else class="thinking">{{ i > 0 && messages[i - 1].role === 'tool' ? 'Reading the result…' : 'Reading your message…' }}</p>
+          </article>
+        </template>
       </div>
 
       <form class="composer" @submit.prevent="send">
@@ -583,6 +646,48 @@ button:disabled {
 }
 .speed dd {
   margin: 0;
+}
+.block {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0.8rem 0 0;
+}
+.sys {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  font-size: 0.8rem;
+  line-height: 1.4;
+  resize: vertical;
+}
+.tool {
+  max-width: 68ch;
+  margin: -0.6rem 0 1.4rem;
+  padding: 0.4rem 0.75rem;
+  border-left: 3px solid var(--copper);
+  background: var(--surface);
+  border-radius: 0 4px 4px 0;
+  font-size: 0.9rem;
+}
+.tool summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-family: var(--display);
+  font-weight: 600;
+}
+.tool pre {
+  margin: 0.5rem 0 0.2rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.8rem;
+}
+.tool .code {
+  padding: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--paper);
 }
 .more summary {
   cursor: pointer;

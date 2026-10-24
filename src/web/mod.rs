@@ -86,6 +86,10 @@ struct Engine {
     think: bool,
     /// Scratch for strings handed to the host (kept alive until the next call).
     text: String,
+    /// Tools declared to the model at the start of each conversation (`web_set_tools`).
+    tools: Vec<crate::tools::ToolSpec>,
+    /// The token that opens a tool call; reply text is shown up to it.
+    call_token: Option<u32>,
 }
 
 thread_local! {
@@ -226,6 +230,12 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
         max_tokens: 0,
         think: false,
         text: String::new(),
+        tools: Vec::new(),
+        call_token: None,
+    })
+    .map(|mut e| {
+        e.call_token = e.tok.token_to_id(e.lm.fmt().tool_call_marker());
+        e
     })
 }
 
@@ -286,7 +296,7 @@ impl Engine {
         let fmt = self.lm.fmt();
         let mut text = String::new();
         if self.turns == 0 {
-            text.push_str(&fmt.conversation_start(system, think));
+            text.push_str(&fmt.conversation_start_tools(system, think, &self.tools));
         } else if !self.out.is_empty() {
             // The previous reply ended (with or without its stop token); close the model turn.
             text.push_str(&fmt.end_of_model_turn());
@@ -327,10 +337,87 @@ impl Engine {
         Some(id)
     }
 
+    /// The visible reply: up to the first tool call, without special tokens.
     fn decoded(&self) -> String {
-        let shown: Vec<u32> = self.out.iter().copied().filter(|t| !self.eos.contains(t)).collect();
+        let end = self.call_token.and_then(|c| self.out.iter().position(|&t| t == c)).unwrap_or(self.out.len());
+        let shown: Vec<u32> = self.out[..end].iter().copied().filter(|t| !self.eos.contains(t)).collect();
         self.tok.decode(&shown, true).unwrap_or_default()
     }
+
+    /// Tool calls in the reply that just ended.
+    fn tool_calls(&self) -> Vec<crate::tools::ToolCall> {
+        let raw = self.tok.decode(&self.out, false).unwrap_or_default();
+        self.lm.fmt().parse_tool_calls(&raw)
+    }
+
+    /// Feeds tool results after a reply that ended on its calls; generation then continues
+    /// (`web_next`) with a new reply segment. Returns the number of tokens fed.
+    fn tool_results(&mut self, results: &[crate::tools::ToolResult]) -> Result<usize> {
+        let text = self.lm.fmt().tool_results(results, self.think);
+        let ids = self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec();
+        self.out.clear();
+        self.logits.clear();
+        for c in ids.chunks(self.prefill_chunk) {
+            self.logits = self.lm.forward(c);
+        }
+        Ok(ids.len())
+    }
+}
+
+/// Declares tools for the next conversation: a JSON array of `{name, description, parameters}`
+/// (parameters as a JSON schema object). An empty array removes them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_set_tools(json: *const u8, len: usize) -> i32 {
+    let json = unsafe { str_arg(json, len) };
+    let tools: Vec<crate::tools::ToolSpec> = match serde_json::from_str(json) {
+        Ok(t) => t,
+        Err(e) => return set_error(&anyhow!("tools: {e}")),
+    };
+    ENGINE.with(|g| match g.borrow_mut().as_mut() {
+        Some(e) => {
+            e.tools = tools;
+            0
+        }
+        None => set_error(&anyhow!("no model loaded")),
+    })
+}
+
+/// The tool calls of the reply that just ended, as a JSON array of `{name, arguments}` (pointer;
+/// length to `*len`; `[]` when there are none).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_tool_calls(len: *mut usize) -> *const u8 {
+    ENGINE.with(|g| {
+        let mut g = g.borrow_mut();
+        match g.as_mut() {
+            Some(e) => {
+                e.text = serde_json::to_string(&e.tool_calls()).unwrap_or_else(|_| "[]".into());
+                unsafe { *len = e.text.len() };
+                e.text.as_ptr()
+            }
+            None => {
+                unsafe { *len = 0 };
+                std::ptr::null()
+            }
+        }
+    })
+}
+
+/// Feeds the results of those calls (a JSON array of `{name, content}`) and prepares the next
+/// reply segment; then call `web_next` again. Returns the number of tokens fed, or < 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_tool_results(json: *const u8, len: usize) -> i32 {
+    let json = unsafe { str_arg(json, len) };
+    let results: Vec<crate::tools::ToolResult> = match serde_json::from_str(json) {
+        Ok(r) => r,
+        Err(e) => return set_error(&anyhow!("tool results: {e}")),
+    };
+    ENGINE.with(|g| match g.borrow_mut().as_mut() {
+        Some(e) => match e.tool_results(&results) {
+            Ok(n) => n as i32,
+            Err(err) => set_error(&err),
+        },
+        None => set_error(&anyhow!("no model loaded")),
+    })
 }
 
 /// Generates one token: returns its id, or -1 when the reply is complete (stop token or limit).

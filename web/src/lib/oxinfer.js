@@ -403,6 +403,7 @@ export class Oxinfer {
     g.chatTurnRaw = jspi ? WebAssembly.promising(g.ex.web_chat_turn) : async (...a) => g.ex.web_chat_turn(...a);
     g.nextRaw = jspi ? WebAssembly.promising(g.ex.web_next) : async () => g.ex.web_next();
     g.sdGenerateRaw = jspi ? WebAssembly.promising(g.ex.web_sd_generate) : async (...a) => g.ex.web_sd_generate(...a);
+    g.toolResultsRaw = jspi ? WebAssembly.promising(g.ex.web_tool_results) : async (...a) => g.ex.web_tool_results(...a);
     return g;
   }
 
@@ -461,6 +462,35 @@ export class Oxinfer {
     const rc = this.ex.web_put_host_file(pp, pn, id, bytes.byteLength);
     this.ex.web_free(pp, pn);
     if (rc < 0) throw new Error(this.lastError());
+  }
+
+  // ---- tools ----
+
+  /// Declares tools ([{ name, description, parameters }]) for the next conversation.
+  setTools(specs) {
+    const [p, n] = this.strArg(JSON.stringify(specs || []));
+    const rc = this.ex.web_set_tools(p, n);
+    this.ex.web_free(p, n);
+    if (rc < 0) throw new Error(this.lastError());
+  }
+
+  /// Tool calls in the reply that just ended: [{ name, arguments }].
+  toolCalls() {
+    const lenBuf = this.ex.web_alloc(8) >>> 0;
+    const p = this.ex.web_tool_calls(lenBuf);
+    const n = new Uint32Array(this.memory.buffer, lenBuf, 1)[0];
+    const s = n ? this.str(p, n) : '[]';
+    this.ex.web_free(lenBuf, 8);
+    return JSON.parse(s);
+  }
+
+  /// Feeds results ([{ name, content }]); then keep calling next() for the continued reply.
+  async toolResults(results) {
+    const [p, n] = this.strArg(JSON.stringify(results));
+    const rc = await this.toolResultsRaw(p, n);
+    this.ex.web_free(p, n);
+    if (rc < 0) throw new Error(this.lastError());
+    return rc;
   }
 
   // ---- image generation ----
