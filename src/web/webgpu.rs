@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 unsafe extern "C" {
     /// Non-zero when the host has a WebGPU device and can suspend the module (JSPI).
     fn gpu_available() -> i32;
-    /// Uploads a weight matrix. `kind`: 0 bf16, 1 q8, 2 q4. `scales` is null for bf16.
+    /// Uploads a weight matrix. `kind`: 0 bf16, 1 q8, 2 q4, 4 affine q4 (`scales` holds the f16
+    /// scales padded to 4 bytes, then the bf16 group offsets). `scales` is null for bf16.
     /// Returns a handle, or -1 when the host could not allocate it (the matrix stays on the CPU).
     fn gpu_upload(kind: u32, data: *const u8, data_len: usize, scales: *const u8, scales_len: usize, n_out: u32, n_in: u32) -> i32;
     /// Runs `n_jobs` matmuls over `x` ([t, n_in] f32); each job is a `JobDesc`. Returns 0 on success.
@@ -104,12 +105,20 @@ impl Backend for WebGpuBackend {
         t >= MIN_T && n_out.is_multiple_of(64) && n_in.is_multiple_of(32) && 2.0 * t as f64 * n_out as f64 * n_in as f64 >= MIN_FLOPS
     }
     fn upload(&self, w: &WeightRef, n_out: usize, n_in: usize) -> Option<DeviceWeight> {
-        // Affine Q4 (MLX) has no device kernel yet; those layers run on the CPU.
-        if let WeightRef::Q4(m) = w
-            && m.offsets.is_some()
-        {
-            return None;
-        }
+        // Affine Q4: one auxiliary buffer, scales then offsets.
+        let aux: Vec<u16> = match w {
+            WeightRef::Q4(m) if m.offsets.is_some() => {
+                let o = m.offsets.as_ref().unwrap();
+                let mut v = Vec::with_capacity(m.scales.len() + 1 + o.v.len());
+                v.extend_from_slice(&m.scales);
+                if v.len() % 2 == 1 {
+                    v.push(0);
+                }
+                v.extend_from_slice(&o.v);
+                v
+            }
+            _ => Vec::new(),
+        };
         let h = unsafe {
             match w {
                 WeightRef::Bf16(w) => gpu_upload(
@@ -127,6 +136,15 @@ impl Backend for WebGpuBackend {
                     m.q.len(),
                     m.scales.as_ptr() as *const u8,
                     m.scales.len() * 4,
+                    n_out as u32,
+                    n_in as u32,
+                ),
+                WeightRef::Q4(m) if !aux.is_empty() => gpu_upload(
+                    4,
+                    m.q.as_ptr(),
+                    m.q.len(),
+                    aux.as_ptr() as *const u8,
+                    aux.len() * 2,
                     n_out as u32,
                     n_in as u32,
                 ),
@@ -149,6 +167,9 @@ impl Backend for WebGpuBackend {
     fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {
         use crate::gpu::NormKind;
         let Some(h) = job.dev.downcast_ref::<Handle>() else { return false };
+        if matches!(job.w, WeightRef::Q4(m) if m.offsets.is_some()) {
+            return false; // no affine convolution shader
+        }
         if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(64) {
             return false;
         }

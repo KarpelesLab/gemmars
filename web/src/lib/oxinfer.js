@@ -30,7 +30,8 @@ const X_CONV = `
     } else {
       for (var j = 0u; j < 8u; j++) { put_x(lc * 8u + j, lr, 0.0); }
     }`;
-const P_DENSE = 'struct P { n_out: u32, n_in: u32, t_pad: u32, pad: u32 }';
+// gk: affine Q4 only, blocks of 32 per offset group.
+const P_DENSE = 'struct P { n_out: u32, n_in: u32, t_pad: u32, gk: u32 }';
 // Convolutions may normalize their input as they load it (mode 1 group norm, 2 layer norm; st holds
 // (mean, 1/std) per group or input pixel, gb gamma then beta), then apply SiLU.
 const P_CONV = `struct P { n_out: u32, n_in: u32, t_pad: u32, pad: u32, h: u32, w: u32, cin: u32, k: u32, stride: u32, ow: u32, npix: u32, padk: u32, mode: u32, silu: u32, cpg: u32, pad2: u32 }
@@ -233,6 +234,22 @@ fn load_w(row: u32, k0: u32, lr: u32, lc: u32) {
     let byte = (u >> (8u * i)) & 0xffu;
     put_w(lc * 4u + i, lr, d * (f32(byte & 15u) - 8.0));
     put_w(16u + lc * 4u + i, lr, d * (f32(byte >> 4u) - 8.0));
+  }
+}`,
+  // affine q4 (MLX): q4_0 plus a bf16 offset per group of p.gk blocks, stored after the f16
+  // scales (which are padded to a whole u32).
+  4: `
+fn load_w(row: u32, k0: u32, lr: u32, lc: u32) {
+  let bpr = p.n_in / 32u;
+  let b = row * bpr + k0 / 32u;
+  let d = unpack2x16float(s[b / 2u])[b % 2u];
+  let oi = (p.n_out * bpr + 1u) / 2u * 2u + row * (bpr / p.gk) + (k0 / 32u) / p.gk;
+  let m = bitcast<f32>(((s[oi / 2u] >> (16u * (oi % 2u))) & 0xffffu) << 16u);
+  let u = w[b * 4u + lc];
+  for (var i = 0u; i < 4u; i++) {
+    let byte = (u >> (8u * i)) & 0xffu;
+    put_w(lc * 4u + i, lr, d * (f32(byte & 15u) - 8.0) + m);
+    put_w(16u + lc * 4u + i, lr, d * (f32(byte >> 4u) - 8.0) + m);
   }
 }`,
 };
@@ -481,7 +498,15 @@ export class WebGpuHost {
     try {
       const w = this.storage(data);
       const s = scales ? this.storage(scales) : this.dummy;
-      this.weights.push({ kind, w, s, nOut, nIn });
+      // Affine q4: the offsets follow the f16 scales; their count gives the group size.
+      let gk = 0;
+      if (kind === 4) {
+        const bpr = nIn / 32;
+        const gpr = (scales.byteLength / 2 - Math.ceil((nOut * bpr) / 2) * 2) / nOut;
+        gk = bpr / gpr;
+        if (!Number.isInteger(gk) || gk < 1) return -1;
+      }
+      this.weights.push({ kind, w, s, nOut, nIn, gk });
       this.bytesUploaded += data.byteLength + (scales ? scales.byteLength : 0);
       return this.weights.length - 1;
     } catch (e) {
@@ -489,12 +514,12 @@ export class WebGpuHost {
     }
   }
 
-  paramsFor(nOut, nIn, tPad) {
-    const key = `${nOut},${nIn},${tPad}`;
+  paramsFor(nOut, nIn, tPad, gk = 0) {
+    const key = `${nOut},${nIn},${tPad},${gk}`;
     let b = this.params.get(key);
     if (!b) {
       b = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      this.device.queue.writeBuffer(b, 0, new Uint32Array([nOut, nIn, tPad, 0]));
+      this.device.queue.writeBuffer(b, 0, new Uint32Array([nOut, nIn, tPad, gk]));
       this.params.set(key, b);
     }
     return b;
@@ -541,7 +566,7 @@ export class WebGpuHost {
       const bg = this.device.createBindGroup({
         layout: this.layout,
         entries: [
-          { binding: 0, resource: { buffer: this.paramsFor(j.nOut, nIn, tPad) } },
+          { binding: 0, resource: { buffer: this.paramsFor(j.nOut, nIn, tPad, wt.gk) } },
           { binding: 1, resource: { buffer: wt.w } },
           { binding: 2, resource: { buffer: wt.s } },
           { binding: 3, resource: { buffer: this.xBuf, size: xBytes } },

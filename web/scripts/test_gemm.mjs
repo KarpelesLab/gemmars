@@ -22,6 +22,24 @@ async function check(kind, nOut, nIn, t) {
     for (let i = 0; i < sc.length; i++) sc[i] = rnd() * 0.02 + 0.001;
     for (let i = 0; i < q.length; i++) { q[i] = Math.floor(rnd() * 255) - 127; wf[i] = q[i] * sc[Math.floor(i / 32)]; }
     data = new Uint8Array(q.buffer); scales = new Uint8Array(sc.buffer);
+  } else if (kind === 4) {
+    // affine q4, groups of 64: f16 scales (padded to 4 bytes) then bf16 offsets per group
+    const bpr = nIn / 32, gpr = nIn / 64, base = Math.ceil(nOut * bpr / 2) * 2;
+    const q = new Uint8Array(nOut * nIn / 2); const aux = new Uint16Array(base + nOut * gpr);
+    const tmp = new Float32Array(1); const tu = new Uint32Array(tmp.buffer);
+    for (let r = 0; r < nOut; r++) for (let g = 0; g < gpr; g++) {
+      const sv = f16(rnd() * 0.02 + 0.001); tmp[0] = rnd() * 0.2 - 0.1; const ob = tu[0] >>> 16; tu[0] = ob << 16; const m = tmp[0];
+      aux[base + r * gpr + g] = ob;
+      for (const b of [r * bpr + 2 * g, r * bpr + 2 * g + 1]) {
+        aux[b] = sv; const d = f16to32(sv);
+        for (let j = 0; j < 16; j++) {
+          const lo = Math.floor(rnd() * 16), hi = Math.floor(rnd() * 16);
+          q[b * 16 + j] = lo | (hi << 4);
+          wf[b * 32 + j] = (lo - 8) * d + m; wf[b * 32 + j + 16] = (hi - 8) * d + m;
+        }
+      }
+    }
+    data = q; scales = new Uint8Array(aux.buffer);
   } else {
     const q = new Uint8Array(nOut * nIn / 2); const sc = new Uint16Array(nOut * nIn / 32);
     for (let i = 0; i < sc.length; i++) sc[i] = f16(rnd() * 0.02 + 0.001);
@@ -47,7 +65,8 @@ async function check(kind, nOut, nIn, t) {
   }
   console.log(`kind ${kind} ${nOut}x${nIn} t=${t}: max diff ${maxd.toExponential(2)} (max |ref| ${maxr.toFixed(2)}) ${ms.toFixed(2)} ms`);
 }
-for (const kind of [0, 1, 2]) await check(kind, 128, 64, 70);
+for (const kind of [0, 1, 2, 4]) await check(kind, 128, 64, 70);
+await check(4, 192, 256, 33);
 await check(0, 256, 96, 16);
 // timing at model-like sizes
 async function bench(kind, nOut, nIn, t, reps = 10) {

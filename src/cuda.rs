@@ -93,6 +93,13 @@ __device__ __forceinline__ void load8(Q4W w, unsigned int n_in, unsigned int row
     if (k0 < 16) { for (int i = 0; i < 8; i++) out[i] = (float)((int)(blk[k0 + i] & 15) - 8) * d; }
     else { for (int i = 0; i < 8; i++) out[i] = (float)((int)(blk[k0 - 16 + i] >> 4) - 8) * d; }
 }
+// Affine Q4 (MLX): a bf16 offset per group of `gk` blocks is added to every element.
+struct Q4A { Q4W b; const unsigned short* o; unsigned int gpr; unsigned int gk; };
+__device__ __forceinline__ void load8(Q4A w, unsigned int n_in, unsigned int row, unsigned int b, unsigned int k0, float* out) {
+    load8(w.b, n_in, row, b, k0, out);
+    float m = bf16f(w.o[(size_t)row * w.gpr + b / w.gk]);
+    for (int i = 0; i < 8; i++) out[i] += m;
+}
 __device__ __forceinline__ void load8(Q8W w, unsigned int n_in, unsigned int row, unsigned int b, unsigned int k0, float* out) {
     float d = w.s[(size_t)row * (n_in / 32) + b];
     const signed char* p = w.q + (size_t)row * n_in + b * 32 + k0;
@@ -185,6 +192,9 @@ __device__ __forceinline__ void gemm_body(W w, X xl, float* __restrict__ y, unsi
 extern "C" __global__ void gemm_q4(const unsigned char* q, const unsigned short* s, const float* x, float* y, unsigned int n_out, unsigned int n_in) {
     Q4W w = { q, s }; XDense xl = { x, n_in }; gemm_body(w, xl, y, n_out, n_in);
 }
+extern "C" __global__ void gemm_q4a(const unsigned char* q, const unsigned short* s, const float* x, float* y, unsigned int n_out, unsigned int n_in, const unsigned short* o, unsigned int gpr, unsigned int gk) {
+    Q4A w = { { q, s }, o, gpr, gk }; XDense xl = { x, n_in }; gemm_body(w, xl, y, n_out, n_in);
+}
 extern "C" __global__ void gemm_q8(const signed char* q, const float* s, const float* x, float* y, unsigned int n_out, unsigned int n_in) {
     Q8W w = { q, s }; XDense xl = { x, n_in }; gemm_body(w, xl, y, n_out, n_in);
 }
@@ -257,6 +267,10 @@ extern "C" __global__ void softmax_rows(float* s, unsigned int cols, unsigned in
 struct CudaWeight {
     data: u64,
     scales: u64,
+    /// Affine Q4: device offsets (0 if none), offsets per row, blocks of 32 per offset group.
+    offsets: u64,
+    gpr: u32,
+    gk: u32,
 }
 
 struct Staging {
@@ -288,6 +302,8 @@ pub struct CudaBackend {
     _module: *mut c_void,
     /// bf16, q8, q4
     funcs: [*mut c_void; 3],
+    /// GEMM over affine Q4 weights.
+    func_q4a: *mut c_void,
     /// Implicit-GEMM convolutions, same order.
     conv_funcs: [*mut c_void; 3],
     /// gemm_f32, group_stats, row_stats, softmax_rows.
@@ -373,6 +389,12 @@ impl CudaBackend {
                 "cuModuleGetFunction",
             )?;
         }
+        let mut func_q4a = std::ptr::null_mut();
+        check(
+            &cu,
+            unsafe { cu.cuModuleGetFunction(&mut func_q4a, module, c"gemm_q4a".as_ptr()) },
+            "cuModuleGetFunction",
+        )?;
         let mut aux_funcs = [std::ptr::null_mut(); 4];
         for (i, fname) in [c"gemm_f32", c"group_stats", c"row_stats", c"softmax_rows"].iter().enumerate() {
             check(
@@ -393,6 +415,7 @@ impl CudaBackend {
             cu,
             _module: module,
             funcs,
+            func_q4a,
             conv_funcs,
             aux_funcs,
             staging: Mutex::new(Staging {
@@ -543,16 +566,13 @@ impl Backend for CudaBackend {
     }
 
     fn upload(&self, w: &WeightRef, _n_out: usize, _n_in: usize) -> Option<DeviceWeight> {
-        // Affine Q4 (MLX) has no device kernel yet; those layers run on the CPU.
-        if let WeightRef::Q4(m) = w
-            && m.offsets.is_some()
-        {
-            return None;
-        }
         let cw = match w {
             WeightRef::Bf16(w) => CudaWeight {
                 data: self.upload_bytes(w.as_ptr() as *const u8, w.len() * 2)?,
                 scales: 0,
+                offsets: 0,
+                gpr: 0,
+                gk: 0,
             },
             WeightRef::Q8(m) => {
                 let data = self.upload_bytes(m.q.as_ptr() as *const u8, m.q.len())?;
@@ -563,7 +583,13 @@ impl Backend for CudaBackend {
                         return None;
                     }
                 };
-                CudaWeight { data, scales }
+                CudaWeight {
+                    data,
+                    scales,
+                    offsets: 0,
+                    gpr: 0,
+                    gk: 0,
+                }
             }
             WeightRef::Q4(m) => {
                 let data = self.upload_bytes(m.q.as_ptr(), m.q.len())?;
@@ -574,7 +600,27 @@ impl Backend for CudaBackend {
                         return None;
                     }
                 };
-                CudaWeight { data, scales }
+                let (mut offsets, mut gpr, mut gk) = (0, 0, 0);
+                if let Some(o) = &m.offsets {
+                    offsets = match self.upload_bytes(o.v.as_ptr() as *const u8, o.v.len() * 2) {
+                        Some(p) => p,
+                        None => {
+                            unsafe {
+                                self.cu.cuMemFree_v2(data);
+                                self.cu.cuMemFree_v2(scales);
+                            }
+                            return None;
+                        }
+                    };
+                    (gpr, gk) = ((m.n_in / o.group) as u32, (o.group / 32) as u32);
+                }
+                CudaWeight {
+                    data,
+                    scales,
+                    offsets,
+                    gpr,
+                    gk,
+                }
             }
         };
         Some(Box::new(CudaWeightBox(cw)))
@@ -598,6 +644,9 @@ impl Backend for CudaBackend {
         let Some(cw) = job.dev.downcast_ref::<CudaWeightBox>() else {
             return false;
         };
+        if cw.0.offsets != 0 {
+            return false; // no affine convolution kernel
+        }
         let cw = &cw.0;
         let t_pad = t.div_ceil(TILE) * TILE;
         let mut st = self.staging.lock().unwrap();
@@ -897,17 +946,23 @@ impl Backend for CudaBackend {
             let mut p_y = st.y + (y_off * 4) as u64;
             let mut n_out = j.n_out as u32;
             let mut n_in_u = n_in as u32;
-            let mut params: [*mut c_void; 6] = [
+            let (mut p_o, mut gpr, mut gk) = (cw.offsets, cw.gpr, cw.gk);
+            let mut params: [*mut c_void; 9] = [
                 &mut p_w as *mut u64 as *mut c_void,
                 &mut p_s as *mut u64 as *mut c_void,
                 &mut p_x as *mut u64 as *mut c_void,
                 &mut p_y as *mut u64 as *mut c_void,
                 &mut n_out as *mut u32 as *mut c_void,
                 &mut n_in_u as *mut u32 as *mut c_void,
+                &mut p_o as *mut u64 as *mut c_void,
+                &mut gpr as *mut u32 as *mut c_void,
+                &mut gk as *mut u32 as *mut c_void,
             ];
+            // The plain kernels take the first six parameters; the affine one all nine.
+            let func = if cw.offsets != 0 { self.func_q4a } else { self.funcs[fi] };
             let rc = unsafe {
                 self.cu.cuLaunchKernel(
-                    self.funcs[fi],
+                    func,
                     (j.n_out / TILE) as u32,
                     (t_pad / TILE) as u32,
                     1,
