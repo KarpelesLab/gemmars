@@ -43,6 +43,13 @@ struct Args {
     cache_dir: Option<PathBuf>,
     download_only: bool,
     save_quantized: Option<PathBuf>,
+    // Image generation (diffusers folders).
+    output: Option<PathBuf>,
+    steps: Option<usize>,
+    guidance: Option<f32>,
+    negative: String,
+    size: Option<(usize, usize)>,
+    sampler: Option<String>,
     device: platform::DevicePref,
     devices: bool,
 }
@@ -81,6 +88,15 @@ fn usage() -> ! {
          \x20 --download-only      fetch the model (and drafter) and exit\n\
          \x20 --save-quantized DIR write a text-only checkpoint with the weights already quantized to\n\
          \x20                      --quant (loads zero-copy with no quantization pass; for browsers, mmap)\n\
+         \n\
+         image generation (a diffusers folder: Stable Diffusion 1.x / 2.x, SD-Turbo):\n\
+         \x20 -o, --output FILE     PNG to write (default image.png)\n\
+         \x20 --steps N            denoising steps (default 1 for turbo models, else 25)\n\
+         \x20 --guidance F         classifier-free guidance (default 0 for turbo, else 7.5)\n\
+         \x20 --negative TEXT      negative prompt (with guidance > 1)\n\
+         \x20 --size WxH           image size, multiples of 64 (default the model's)\n\
+         \x20 --sampler NAME       euler or euler_a (default euler_a)\n\
+         \x20 --seed N             noise seed (default 42)\n\
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
@@ -119,6 +135,12 @@ fn parse_args() -> Result<Args> {
         cache_dir: None,
         download_only: false,
         save_quantized: None,
+        output: None,
+        steps: None,
+        guidance: None,
+        negative: String::new(),
+        size: None,
+        sampler: None,
         device: platform::DevicePref::Auto,
         devices: false,
     };
@@ -163,6 +185,18 @@ fn parse_args() -> Result<Args> {
                 a.mmap = true;
             }
             "--devices" => a.devices = true,
+            "--output" | "-o" => a.output = Some(PathBuf::from(val()?)),
+            "--steps" => a.steps = Some(val()?.parse()?),
+            "--guidance" | "--cfg" => a.guidance = Some(val()?.parse()?),
+            "--negative" => a.negative = val()?,
+            "--sampler" => a.sampler = Some(val()?),
+            "--size" => {
+                let v = val()?;
+                let (w, h) = v
+                    .split_once(['x', 'X'])
+                    .with_context(|| format!("--size expects WIDTHxHEIGHT, got {v}"))?;
+                a.size = Some((w.parse()?, h.parse()?));
+            }
             "--device" => {
                 let v = val()?;
                 a.device = platform::DevicePref::parse(&v).with_context(|| format!("unknown device {v} (auto|cpu|cuda|metal|vulkan)"))?;
@@ -733,12 +767,73 @@ fn run(mut args: Args) -> Result<()> {
     // Bigger prefill chunks keep the GPU busier (577 vs 431 tok/s on E4B q4 at 1024 vs 256);
     // on the CPU 256 keeps the activations in cache.
     args.prefill_chunk = Some(args.prefill_chunk.unwrap_or(if gpu.is_some() { 1024 } else { 256 }));
+    if oxinfer::sd::is_diffusers(&args.model) {
+        return run_image(&args);
+    }
     let model_type = config::model_type(&args.model)?;
     match model_type.as_str() {
         "gemma4" | "gemma4_text" => run_gemma(args),
         "qwen3_5" | "qwen3_5_text" | "qwen3_6" | "qwen3_8" => run_qwen(args),
         other => bail!("unsupported model_type {other}"),
     }
+}
+
+/// Text-to-image with a diffusers Stable Diffusion folder.
+fn run_image(args: &Args) -> Result<()> {
+    use oxinfer::sd::{Params, Pipeline, sched::Sampler};
+    let t0 = Instant::now();
+    let pipe = Pipeline::load(&args.model)?;
+    eprintln!(
+        "[loaded diffusion pipeline in {:.2}s{}]",
+        t0.elapsed().as_secs_f64(),
+        if pipe.turbo { ", turbo" } else { "" }
+    );
+    let prompt = match &args.prompt {
+        Some(p) => p.clone(),
+        None => {
+            let mut s = String::new();
+            std::io::stdin().read_line(&mut s)?;
+            s.trim().to_string()
+        }
+    };
+    let side = pipe.default_size();
+    let (width, height) = args.size.unwrap_or((side, side));
+    let sampler = match args.sampler.as_deref().unwrap_or("euler_a") {
+        "euler" => Sampler::Euler,
+        "euler_a" | "euler_ancestral" => Sampler::EulerAncestral,
+        other => bail!("unknown sampler {other} (use euler or euler_a)"),
+    };
+    let params = Params {
+        prompt,
+        negative: args.negative.clone(),
+        steps: args.steps.unwrap_or(if pipe.turbo { 1 } else { 25 }),
+        guidance: args.guidance.unwrap_or(if pipe.turbo { 0.0 } else { 7.5 }),
+        seed: args.seed,
+        width,
+        height,
+        sampler,
+    };
+    eprintln!(
+        "[{}x{}, {} steps, guidance {}, {:?}, seed {}]",
+        width, height, params.steps, params.guidance, sampler, params.seed
+    );
+    let (img, tm) = pipe.generate(&params, &mut |i, n| eprint!("\r[step {i}/{n}]"))?;
+    eprintln!();
+    let out = args.output.clone().unwrap_or_else(|| PathBuf::from("image.png"));
+    std::fs::write(&out, oxinfer::png::encode_rgb(img.width, img.height, &img.rgb)).with_context(|| format!("write {}", out.display()))?;
+    eprintln!(
+        "[text {:.2}s | denoise {:.2}s ({} UNet passes, {:.2}s each) | decode {:.2}s | wrote {}]",
+        tm.text,
+        tm.denoise,
+        tm.unet_calls,
+        tm.denoise / tm.unet_calls.max(1) as f64,
+        tm.decode,
+        out.display()
+    );
+    if args.profile {
+        prof::report(tm.text + tm.denoise + tm.decode, tm.unet_calls.max(1));
+    }
+    Ok(())
 }
 
 /// Plain generation (single prompt or chat) for any model family, without attachments or drafter.

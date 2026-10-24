@@ -225,23 +225,32 @@ pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize
     })
 }
 
-/// A linear layer's weight `[n_out, n_in]`: borrowed bf16 or quantized, plus lazily created
-/// device-side state when an accelerator backend is active.
+/// A linear layer's weight `[n_out, n_in]`: bf16 (borrowed from the checkpoint or owned) or
+/// quantized, plus lazily created device-side state when an accelerator backend is active.
 pub struct Lin<'a> {
     pub w: Weight<'a>,
     dev: std::sync::OnceLock<Option<crate::gpu::DeviceWeight>>,
 }
 
 pub enum Weight<'a> {
-    Bf16(&'a [u16]),
+    /// Borrowed for 'a (see `Lin::bf16`) or owned (`Lin::bf16_owned`).
+    Bf16(crate::quant::QBuf<u16>, std::marker::PhantomData<&'a [u16]>),
     Q8(QMatrix),
     Q4(Q4Matrix),
 }
 
 impl<'a> Lin<'a> {
     pub fn bf16(w: &'a [u16]) -> Self {
+        // SAFETY: the PhantomData ties the borrow to 'a, so `w` outlives this Lin.
         Self {
-            w: Weight::Bf16(w),
+            w: Weight::Bf16(unsafe { crate::quant::QBuf::borrowed(w) }, std::marker::PhantomData),
+            dev: std::sync::OnceLock::new(),
+        }
+    }
+    /// bf16 weights converted or reordered at load time (e.g. from fp16 checkpoints).
+    pub fn bf16_owned(w: crate::quant::PageVec<u16>) -> Self {
+        Self {
+            w: Weight::Bf16(w.into(), std::marker::PhantomData),
             dev: std::sync::OnceLock::new(),
         }
     }
@@ -262,7 +271,7 @@ impl<'a> Lin<'a> {
     }
     pub fn as_ref(&self) -> crate::gpu::WeightRef<'_> {
         match &self.w {
-            Weight::Bf16(w) => crate::gpu::WeightRef::Bf16(w),
+            Weight::Bf16(w, _) => crate::gpu::WeightRef::Bf16(w),
             Weight::Q8(m) => crate::gpu::WeightRef::Q8(m),
             Weight::Q4(m) => crate::gpu::WeightRef::Q4(m),
         }
@@ -314,11 +323,11 @@ pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, 
         return;
     }
     let jobs = &mut rest[..];
-    if jobs.iter().all(|(l, _, _)| matches!(l.w, Weight::Bf16(_))) {
+    if jobs.iter().all(|(l, _, _)| matches!(l.w, Weight::Bf16(..))) {
         let mut v: Vec<(&[u16], usize, &mut [f32])> = jobs
             .iter_mut()
             .map(|(l, n, y)| match &l.w {
-                Weight::Bf16(w) => (*w, *n, &mut **y),
+                Weight::Bf16(w, _) => (&w[..], *n, &mut **y),
                 _ => unreachable!(),
             })
             .collect();

@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Reference outputs for the Stable Diffusion pipeline, to compare with `OXINFER_SD_DUMP`.
+
+Runs the diffusers components in float32 (fp16 weights upcast) step by step, exactly as
+oxinfer does: CLIP text encoding, Euler or Euler-ancestral denoising from saved noise, VAE
+decoding. Writes latents_in.bin (standard normal noise, [4, h, w] f32), which oxinfer reads
+from the same directory, and the reference stages as ref_*.bin.
+
+  python tools/ref_sd.py models/sd-turbo OUT "a red fox" --steps 1 --guidance 0
+  OXINFER_SD_DUMP=OUT oxinfer --model models/sd-turbo -p "a red fox" --steps 1 --guidance 0 --sampler euler
+  python tools/ref_sd.py --compare OUT
+"""
+import argparse, os, sys
+import numpy as np
+
+
+def save(path, t):
+    np.asarray(t, dtype=np.float32).tofile(path)
+
+
+def compare(out):
+    pairs = [("text_cond.bin", "ref_text_cond.bin"), ("unet_out0.bin", "ref_unet_out0.bin"),
+             ("latents_out.bin", "ref_latents_out.bin"), ("image.bin", "ref_image.bin")]
+    for ours, ref in pairs:
+        a = np.fromfile(os.path.join(out, ours), dtype=np.float32)
+        b = np.fromfile(os.path.join(out, ref), dtype=np.float32)
+        if a.shape != b.shape:
+            print(f"{ours}: shape {a.shape} vs {b.shape}")
+            continue
+        d = np.abs(a - b)
+        rel = np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-12)
+        line = f"{ours:16s} max|diff| {d.max():.4g}  rel L2 {rel:.3e}"
+        if ours == "image.bin":
+            pa = np.clip((a + 1) / 2, 0, 1) * 255
+            pb = np.clip((b + 1) / 2, 0, 1) * 255
+            mse = np.mean((np.round(pa) - np.round(pb)) ** 2)
+            line += f"  PSNR {10 * np.log10(255 ** 2 / max(mse, 1e-12)):.1f} dB (8-bit)"
+        print(line)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("model", nargs="?")
+    ap.add_argument("out", nargs="?")
+    ap.add_argument("prompt", nargs="?")
+    ap.add_argument("--steps", type=int, default=1)
+    ap.add_argument("--guidance", type=float, default=0.0)
+    ap.add_argument("--negative", default="")
+    ap.add_argument("--size", type=int, default=512)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--compare", metavar="DIR")
+    ap.add_argument("--bf16-weights", action="store_true", help="round matmul/conv weights to bf16 as oxinfer stores them (isolates implementation error)")
+    a = ap.parse_args()
+    if a.compare:
+        return compare(a.compare)
+
+    import torch
+    from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
+    from transformers import CLIPTextModel, CLIPTokenizer
+
+    os.makedirs(a.out, exist_ok=True)
+    variant = "fp16" if os.path.exists(os.path.join(a.model, "unet", "diffusion_pytorch_model.fp16.safetensors")) else None
+    kw = dict(torch_dtype=torch.float32, variant=variant)
+    tok = CLIPTokenizer.from_pretrained(a.model, subfolder="tokenizer")
+    te = CLIPTextModel.from_pretrained(a.model, subfolder="text_encoder", **kw).eval()
+    unet = UNet2DConditionModel.from_pretrained(a.model, subfolder="unet", **kw).eval()
+    vae = AutoencoderKL.from_pretrained(a.model, subfolder="vae", **kw).eval()
+    sched = EulerDiscreteScheduler.from_pretrained(a.model, subfolder="scheduler")
+    if a.bf16_weights:
+        # oxinfer keeps Linear/Conv weights in bf16 (biases, norms and embeddings stay exact).
+        for m in (te, unet, vae):
+            for mod in m.modules():
+                if isinstance(mod, (torch.nn.Linear, torch.nn.Conv2d)):
+                    mod.weight.data = mod.weight.data.to(torch.bfloat16).to(torch.float32)
+
+    def encode(text):
+        ids = tok(text, padding="max_length", max_length=tok.model_max_length, truncation=True, return_tensors="pt").input_ids
+        return ids, te(ids)[0]
+
+    with torch.no_grad():
+        ids, cond = encode(a.prompt)
+        print("ids", ids[0, :24].tolist())
+        save(os.path.join(a.out, "ref_text_cond.bin"), cond[0].numpy())
+        uncond = encode(a.negative)[1] if a.guidance > 1 else None
+
+        lh = a.size // 8
+        g = torch.Generator().manual_seed(a.seed)
+        noise = torch.randn((1, unet.config.in_channels, lh, lh), generator=g)
+        save(os.path.join(a.out, "latents_in.bin"), noise[0].numpy())
+        sched.set_timesteps(a.steps)
+        x = noise * sched.init_noise_sigma
+        print("timesteps", sched.timesteps.tolist(), "init sigma", float(sched.init_noise_sigma))
+        for i, t in enumerate(sched.timesteps):
+            xin = sched.scale_model_input(x, t)
+            out = unet(xin, t, encoder_hidden_states=cond).sample
+            if uncond is not None:
+                un = unet(xin, t, encoder_hidden_states=uncond).sample
+                out = un + a.guidance * (out - un)
+            if i == 0:
+                save(os.path.join(a.out, "ref_unet_out0.bin"), out[0].numpy())
+            x = sched.step(out, t, x).prev_sample
+        save(os.path.join(a.out, "ref_latents_out.bin"), x[0].numpy())
+        img = vae.decode(x / vae.config.scaling_factor).sample
+        save(os.path.join(a.out, "ref_image.bin"), img[0].numpy())
+        try:
+            from PIL import Image
+            arr = ((img[0].permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
+            Image.fromarray((arr * 255).round().astype("uint8")).save(os.path.join(a.out, "ref.png"))
+        except ImportError:
+            pass
+    print("wrote reference to", a.out)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -45,6 +45,8 @@ oxideav-meta = { version = "0.0.3", default-features = false, features = ["png",
 oxideav-image = { version = "0.0.5", optional = true }
 anyhow = "1.0.104"
 half = "2.7.1"
+# CLIP tokenizer pre-tokenization (Unicode letter / number classes).
+regex = { version = "1.12", default-features = false, features = ["std", "unicode"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 rsurl = { version = "0.1.20", default-features = false, features = ["purecrypto-tls", "idn"], optional = true }

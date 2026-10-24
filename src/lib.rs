@@ -24,12 +24,14 @@ pub mod metal;
 pub mod mm_config;
 pub mod model;
 pub mod platform;
+pub mod png;
 pub mod pool;
 pub mod prof;
 pub mod quant;
 pub mod qwen;
 pub mod safetensors;
 pub mod sampler;
+pub mod sd;
 pub mod vision;
 #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
 pub mod web;
