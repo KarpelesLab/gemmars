@@ -103,8 +103,37 @@ __device__ __forceinline__ void load8(BfW w, unsigned int n_in, unsigned int row
     for (int i = 0; i < 8; i++) out[i] = bf16f(p[i]);
 }
 
-template <typename W>
-__device__ __forceinline__ void gemm_body(W w, const float* __restrict__ x, float* __restrict__ y, unsigned int n_out, unsigned int n_in) {
+// Activation loaders: 8 consecutive k values of one token row of block b.
+struct XDense {
+    const float* x; unsigned int n_in;
+    __device__ __forceinline__ void load8(unsigned int tok, unsigned int b, unsigned int k0, float* out) const {
+        const float4* p = (const float4*)(x + (size_t)tok * n_in + b * 32 + k0);
+        float4 a = p[0], c = p[1];
+        out[0] = a.x; out[1] = a.y; out[2] = a.z; out[3] = a.w; out[4] = c.x; out[5] = c.y; out[6] = c.z; out[7] = c.w;
+    }
+};
+// Convolution as an implicit GEMM: K runs over (ky, kx, ci) with cin % 32 == 0, so block b is one
+// tap's contiguous channel slice of the input pixel (zeros outside the image).
+struct ConvP { unsigned int h, w, cin, k, stride, ow, npix, pad; };
+struct XConv {
+    const float* x; ConvP p;
+    __device__ __forceinline__ void load8(unsigned int tok, unsigned int b, unsigned int k0, float* out) const {
+        unsigned int kk = b * 32, tap = kk / p.cin, ci0 = kk - tap * p.cin;
+        int ky = (int)(tap / p.k), kx = (int)(tap % p.k);
+        int oy = (int)(tok / p.ow), ox = (int)(tok % p.ow);
+        int iy = oy * (int)p.stride + ky - (int)p.pad, ix = ox * (int)p.stride + kx - (int)p.pad;
+        if (tok < p.npix && iy >= 0 && ix >= 0 && iy < (int)p.h && ix < (int)p.w) {
+            const float4* s = (const float4*)(x + ((size_t)iy * p.w + ix) * p.cin + ci0 + k0);
+            float4 a = s[0], c = s[1];
+            out[0] = a.x; out[1] = a.y; out[2] = a.z; out[3] = a.w; out[4] = c.x; out[5] = c.y; out[6] = c.z; out[7] = c.w;
+        } else {
+            for (int i = 0; i < 8; i++) out[i] = 0.f;
+        }
+    }
+};
+
+template <typename W, typename X>
+__device__ __forceinline__ void gemm_body(W w, X xl, float* __restrict__ y, unsigned int n_out, unsigned int n_in) {
     __shared__ __align__(16) float Ws[32][64];
     __shared__ __align__(16) float Xs[32][64];
     const unsigned int o0 = blockIdx.x * 64, t0 = blockIdx.y * 64;
@@ -112,15 +141,13 @@ __device__ __forceinline__ void gemm_body(W w, const float* __restrict__ x, floa
     const unsigned int lrow = tid / 4, lk = (tid % 4) * 8;
     float acc[4][4];
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) acc[i][j] = 0.f;
-    const float* xrow = x + (size_t)(t0 + lrow) * n_in + lk;
     for (unsigned int b = 0; b < n_in / 32; b++) {
         float wv[8];
         load8(w, n_in, o0 + lrow, b, lk, wv);
         for (int i = 0; i < 8; i++) Ws[lk + i][lrow] = wv[i];
-        const float4* xp = (const float4*)(xrow + b * 32);
-        float4 x0 = xp[0], x1 = xp[1];
-        Xs[lk + 0][lrow] = x0.x; Xs[lk + 1][lrow] = x0.y; Xs[lk + 2][lrow] = x0.z; Xs[lk + 3][lrow] = x0.w;
-        Xs[lk + 4][lrow] = x1.x; Xs[lk + 5][lrow] = x1.y; Xs[lk + 6][lrow] = x1.z; Xs[lk + 7][lrow] = x1.w;
+        float xv[8];
+        xl.load8(t0 + lrow, b, lk, xv);
+        for (int i = 0; i < 8; i++) Xs[lk + i][lrow] = xv[i];
         __syncthreads();
 #pragma unroll
         for (int k = 0; k < 32; k++) {
@@ -139,13 +166,22 @@ __device__ __forceinline__ void gemm_body(W w, const float* __restrict__ x, floa
 }
 
 extern "C" __global__ void gemm_q4(const unsigned char* q, const unsigned short* s, const float* x, float* y, unsigned int n_out, unsigned int n_in) {
-    Q4W w = { q, s }; gemm_body(w, x, y, n_out, n_in);
+    Q4W w = { q, s }; XDense xl = { x, n_in }; gemm_body(w, xl, y, n_out, n_in);
 }
 extern "C" __global__ void gemm_q8(const signed char* q, const float* s, const float* x, float* y, unsigned int n_out, unsigned int n_in) {
-    Q8W w = { q, s }; gemm_body(w, x, y, n_out, n_in);
+    Q8W w = { q, s }; XDense xl = { x, n_in }; gemm_body(w, xl, y, n_out, n_in);
 }
 extern "C" __global__ void gemm_bf(const unsigned short* wp, const void* unused, const float* x, float* y, unsigned int n_out, unsigned int n_in) {
-    BfW w = { wp }; gemm_body(w, x, y, n_out, n_in);
+    BfW w = { wp }; XDense xl = { x, n_in }; gemm_body(w, xl, y, n_out, n_in);
+}
+extern "C" __global__ void conv_q4(const unsigned char* q, const unsigned short* s, const float* x, float* y, unsigned int n_out, unsigned int n_in, ConvP p) {
+    Q4W w = { q, s }; XConv xl = { x, p }; gemm_body(w, xl, y, n_out, n_in);
+}
+extern "C" __global__ void conv_q8(const signed char* q, const float* s, const float* x, float* y, unsigned int n_out, unsigned int n_in, ConvP p) {
+    Q8W w = { q, s }; XConv xl = { x, p }; gemm_body(w, xl, y, n_out, n_in);
+}
+extern "C" __global__ void conv_bf(const unsigned short* wp, const void* unused, const float* x, float* y, unsigned int n_out, unsigned int n_in, ConvP p) {
+    BfW w = { wp }; XConv xl = { x, p }; gemm_body(w, xl, y, n_out, n_in);
 }
 "#;
 
@@ -174,6 +210,8 @@ pub struct CudaBackend {
     _module: *mut c_void,
     /// bf16, q8, q4
     funcs: [*mut c_void; 3],
+    /// Implicit-GEMM convolutions, same order.
+    conv_funcs: [*mut c_void; 3],
     staging: Mutex<Staging>,
     stats: Stats,
     name: String,
@@ -255,10 +293,19 @@ impl CudaBackend {
                 "cuModuleGetFunction",
             )?;
         }
+        let mut conv_funcs = [std::ptr::null_mut(); 3];
+        for (i, fname) in [c"conv_bf", c"conv_q8", c"conv_q4"].iter().enumerate() {
+            check(
+                &cu,
+                unsafe { cu.cuModuleGetFunction(&mut conv_funcs[i], module, fname.as_ptr()) },
+                "cuModuleGetFunction",
+            )?;
+        }
         Ok(Self {
             cu,
             _module: module,
             funcs,
+            conv_funcs,
             staging: Mutex::new(Staging {
                 x: 0,
                 x_cap: 0,
@@ -380,6 +427,96 @@ impl Backend for CudaBackend {
             }
         };
         Some(Box::new(CudaWeightBox(cw)))
+    }
+
+    fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, job: &mut Job) -> bool {
+        let n_in = g.k * g.k * g.cin;
+        let t = g.oh * g.ow;
+        if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(TILE) || x.len() < g.h * g.w * g.cin || job.y.len() < t * job.n_out {
+            return false;
+        }
+        let Some(cw) = job.dev.downcast_ref::<CudaWeightBox>() else {
+            return false;
+        };
+        let cw = &cw.0;
+        let t_pad = t.div_ceil(TILE) * TILE;
+        let mut st = self.staging.lock().unwrap();
+        if !self.ensure_staging(&mut st, g.h * g.w * g.cin * 4, t_pad * job.n_out * 4) {
+            return false;
+        }
+        let t0 = Instant::now();
+        if unsafe { self.cu.cuMemcpyHtoD_v2(st.x, x.as_ptr() as *const c_void, g.h * g.w * g.cin * 4) } != 0 {
+            return false;
+        }
+        let t1 = Instant::now();
+        let fi = match job.w {
+            WeightRef::Bf16(_) => 0,
+            WeightRef::Q8(_) => 1,
+            WeightRef::Q4(_) => 2,
+        };
+        #[repr(C)]
+        struct ConvP {
+            h: u32,
+            w: u32,
+            cin: u32,
+            k: u32,
+            stride: u32,
+            ow: u32,
+            npix: u32,
+            pad: u32,
+        }
+        let mut p = ConvP {
+            h: g.h as u32,
+            w: g.w as u32,
+            cin: g.cin as u32,
+            k: g.k as u32,
+            stride: g.stride as u32,
+            ow: g.ow as u32,
+            npix: t as u32,
+            pad: (g.k / 2) as u32,
+        };
+        let (mut p_w, mut p_s, mut p_x, mut p_y) = (cw.data, cw.scales, st.x, st.y);
+        let (mut n_out, mut n_in_u) = (job.n_out as u32, n_in as u32);
+        let mut params: [*mut c_void; 7] = [
+            &mut p_w as *mut u64 as *mut c_void,
+            &mut p_s as *mut u64 as *mut c_void,
+            &mut p_x as *mut u64 as *mut c_void,
+            &mut p_y as *mut u64 as *mut c_void,
+            &mut n_out as *mut u32 as *mut c_void,
+            &mut n_in_u as *mut u32 as *mut c_void,
+            &mut p as *mut ConvP as *mut c_void,
+        ];
+        let rc = unsafe {
+            self.cu.cuLaunchKernel(
+                self.conv_funcs[fi],
+                (job.n_out / TILE) as u32,
+                (t_pad / TILE) as u32,
+                1,
+                256,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            let _ = self.check(rc, "cuLaunchKernel").map_err(|e| eprintln!("[cuda: {e}]"));
+            return false;
+        }
+        if unsafe { self.cu.cuCtxSynchronize() } != 0 {
+            return false;
+        }
+        let t2 = Instant::now();
+        if unsafe { self.cu.cuMemcpyDtoH_v2(job.y.as_mut_ptr() as *mut c_void, st.y, t * job.n_out * 4) } != 0 {
+            return false;
+        }
+        self.stats.calls.fetch_add(1, Ordering::Relaxed);
+        self.stats.copy_in_ns.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+        self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+        self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        true
     }
 
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool {
