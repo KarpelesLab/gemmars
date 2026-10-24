@@ -199,17 +199,26 @@ pub unsafe fn block_tc<W: Load8>(
 ) {
     // 16 ymm registers: keep accumulators + weight vectors under that.
     macro_rules! go {
-        ($TC:expr, $G:expr, $A:expr) => {{
+        ($TC:expr, $G:expr, $A:expr, $c:expr) => {{
             let m = r0 + (r1 - r0) / 2 * 2;
-            run_tiles::<W, 2, $TC, $G, $A>(w, n_in, x, y, n_out, r0, m, c0);
-            run_tiles::<W, 1, $TC, $G, $A>(w, n_in, x, y, n_out, m, r1, c0);
+            run_tiles::<W, 2, $TC, $G, $A>(w, n_in, x, y, n_out, r0, m, $c);
+            run_tiles::<W, 1, $TC, $G, $A>(w, n_in, x, y, n_out, m, r1, $c);
         }};
     }
+    // One and two tokens share an accumulator layout (A = 2) and three or four tokens run as
+    // those, so each output is bit-identical whatever the token count: speculative verification
+    // over a few tokens then reproduces plain decoding exactly.
     match tc {
-        1 => go!(1, 4, 2),
-        2 => go!(2, 2, 2),
-        3 => go!(3, 2, 1),
-        4 => go!(4, 2, 1),
+        1 => go!(1, 4, 2, c0),
+        2 => go!(2, 2, 2, c0),
+        3 => {
+            go!(2, 2, 2, c0);
+            go!(1, 4, 2, c0 + 2)
+        }
+        4 => {
+            go!(2, 2, 2, c0);
+            go!(2, 2, 2, c0 + 2)
+        }
         _ => unreachable!("bad tc {tc}"),
     }
 }

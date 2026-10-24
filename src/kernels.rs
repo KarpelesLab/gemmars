@@ -779,11 +779,23 @@ pub mod simd {
                 run_tiles::<W, 1, $TC, $G, $A>(w, n_in, x, y, n_out, m, r1, c0);
             }};
         }
+        // Token pairs use the single-token accumulator layout (G=4, A=8; one row at a time to fit
+        // the registers), so each output is bit-identical whatever the token count: speculative
+        // verification over a few tokens then reproduces plain decoding exactly.
+        let pair = |c: usize| run_tiles::<W, 1, 2, 4, 8>(w, n_in, x, y, n_out, r0, r1, c);
         match tc {
             1 => go!(1, 4, 8),
-            2 => go!(2, 2, 2),
-            3 => go!(3, 2, 2),
-            4 => go!(4, 2, 2),
+            2 => pair(c0),
+            3 => {
+                pair(c0);
+                let m = r0 + (r1 - r0) / 2 * 2;
+                run_tiles::<W, 2, 1, 4, 8>(w, n_in, x, y, n_out, r0, m, c0 + 2);
+                run_tiles::<W, 1, 1, 4, 8>(w, n_in, x, y, n_out, m, r1, c0 + 2);
+            }
+            4 => {
+                pair(c0);
+                pair(c0 + 2)
+            }
             _ => unreachable!("bad tc {tc}"),
         }
     }
@@ -1170,7 +1182,10 @@ pub fn matmul_quant_multi<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: 
         let xa = xa.as_ref().unwrap();
         let mut c = 0;
         while c < t {
-            let tc = (t - c).min(4);
+            // Token pairs: the 3- and 4-token tiles keep 24-32 activation vectors live and
+            // spill; re-reading a row block from cache per pair is cheaper (27B Q4, 4 tokens:
+            // 1.7x faster). The row block stays in L2 between pairs.
+            let tc = (t - c).min(2);
             unsafe {
                 if tc == 1 {
                     job.m.rows_t1(xa, c, job.y.get().add(c * job.m.n_out()), r0, r1)
