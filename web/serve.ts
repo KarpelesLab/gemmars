@@ -4,6 +4,7 @@
 const models = Deno.args[0] ? Deno.args[0].replace(/\/$/, '') : null;
 const port = Number(Deno.args[1] || 8080);
 const root = new URL('.', import.meta.url).pathname.replace(/\/$/, '');
+const wasm = new URL('../target/wasm32-unknown-unknown/release/oxinfer.wasm', import.meta.url).pathname;
 const types: Record<string, string> = { html: 'text/html', js: 'text/javascript', mjs: 'text/javascript', wasm: 'application/wasm', json: 'application/json', css: 'text/css' };
 Deno.serve({ port, onListen: ({ port }) => console.error(`serving ${root} on http://localhost:${port}/${models ? ` (models from ${models})` : ''}`) }, async (req) => {
   const url = new URL(req.url);
@@ -11,11 +12,13 @@ Deno.serve({ port, onListen: ({ port }) => console.error(`serving ${root} on htt
   if (req.method === 'POST' && url.pathname === '/exit') { setTimeout(() => Deno.exit(0), 100); return new Response('ok'); }
   let path = url.pathname === '/' ? '/index.html' : url.pathname;
   let file = root + path;
+  // The module is built at the repository root (`cargo build-web`).
+  if (path === '/oxinfer.wasm') file = wasm;
   if (path.startsWith('/models/')) {
     if (!models) return new Response('no model directory configured', { status: 404 });
     file = models + path.slice('/models'.length);
   }
-  if (file.includes('/../')) return new Response('bad path', { status: 400 });
+  if (path.includes('..')) return new Response('bad path', { status: 400 });
   try {
     const stat = await Deno.stat(file);
     const headers: Record<string, string> = { 'content-type': types[file.split('.').pop() || ''] || 'application/octet-stream', 'content-length': String(stat.size), 'cache-control': 'no-cache' };

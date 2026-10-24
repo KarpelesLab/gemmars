@@ -1,6 +1,6 @@
 // Host side of the oxinfer WebAssembly module (browser and Deno, ES module, no build step).
 //
-// The module is plain C-ABI wasm (see src/lib.rs). This file provides its imports: a log sink, a
+// The module is plain C-ABI wasm (see src/web/mod.rs, built with `cargo build-web`). This file provides its imports: a log sink, a
 // clock, randomness, and the WebGPU backend (`gpu_upload` / `gpu_matmul`). GPU readback is
 // asynchronous while the module's call is synchronous, so `gpu_matmul` is wrapped with
 // `WebAssembly.Suspending` and the exports that can reach it with `WebAssembly.promising` (JSPI).

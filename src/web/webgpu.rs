@@ -3,7 +3,7 @@
 //! in JavaScript (see `web/oxinfer.js`, which also holds the WGSL shaders). The host suspends the
 //! module during the asynchronous readback (JSPI), so from here the calls look synchronous.
 
-use oxinfer::gpu::{Backend, DeviceWeight, Job, WeightRef};
+use crate::gpu::{Backend, DeviceWeight, Job, WeightRef};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[link(wasm_import_module = "env")]
@@ -41,9 +41,9 @@ const MIN_FLOPS: f64 = 1e8;
 
 pub fn install() {
     if unsafe { gpu_available() } != 0 {
-        oxinfer::gpu::install(Some(Box::new(WebGpuBackend { calls: AtomicU64::new(0), flops: AtomicU64::new(0), micros: AtomicU64::new(0) })));
+        crate::gpu::install(Some(Box::new(WebGpuBackend { calls: AtomicU64::new(0), flops: AtomicU64::new(0), micros: AtomicU64::new(0) })));
     } else {
-        crate::log("[webgpu: not available on this host (no adapter or no JSPI); using CPU]");
+        super::log("[webgpu: not available on this host (no adapter or no JSPI); using CPU]");
     }
 }
 
@@ -68,7 +68,7 @@ impl Backend for WebGpuBackend {
         Some(Box::new(Handle(h)))
     }
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool {
-        let t0 = oxinfer::clock::Instant::now();
+        let t0 = crate::clock::Instant::now();
         let descs: Vec<JobDesc> = jobs
             .iter_mut()
             .map(|j| JobDesc { handle: j.dev.downcast_ref::<Handle>().map(|h| h.0 as u32).unwrap_or(u32::MAX), n_out: j.n_out as u32, y: j.y.as_mut_ptr() as u32, _pad: 0 })
@@ -78,7 +78,7 @@ impl Backend for WebGpuBackend {
         }
         let rc = unsafe { gpu_matmul(x.as_ptr(), t as u32, n_in as u32, descs.as_ptr(), descs.len() as u32) };
         if rc != 0 {
-            crate::log(&format!("[webgpu: matmul failed ({rc}); falling back to CPU]"));
+            super::log(&format!("[webgpu: matmul failed ({rc}); falling back to CPU]"));
             return false;
         }
         let flops: f64 = jobs.iter().map(|j| 2.0 * t as f64 * j.n_out as f64 * n_in as f64).sum();

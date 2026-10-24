@@ -812,6 +812,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dlsym",
+ "getrandom",
  "half",
  "memmap2",
  "oxideav-core",

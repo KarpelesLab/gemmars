@@ -14,7 +14,7 @@ const maxTokens = Number(opt('--max-tokens', '128'));
 const chunk = Number(opt('--chunk', '0'));
 const log = (s) => console.error(s);
 
-const wasmPath = new URL('./target/wasm32-unknown-unknown/release/oxinfer_web.wasm', import.meta.url);
+const wasmPath = new URL('../target/wasm32-unknown-unknown/release/oxinfer.wasm', import.meta.url);
 const gpu = has('--cpu') ? null : await WebGpuHost.create(log);
 log(`[host: deno ${Deno.version.deno}, jspi ${hasJspi}, gpu ${gpu ? 'yes' : 'no'}]`);
 const g = await Oxinfer.create(Deno.readFileSync(wasmPath), { gpu, log, jspi: !has('--no-jspi') });

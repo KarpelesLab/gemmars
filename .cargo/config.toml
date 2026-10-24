@@ -12,6 +12,11 @@ rustflags = ["-C", "target-feature=+simd128"]
 [target.wasm32-wasip1-threads]
 rustflags = ["-C", "target-feature=+simd128", "-C", "link-arg=--max-memory=4294967296"]
 
-# getrandom: the host provides randomness (web/src/lib.rs) instead of the wasm-bindgen glue.
+# getrandom: the host provides randomness (src/web/mod.rs) instead of the wasm-bindgen glue.
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "target-feature=+simd128", "--cfg", 'getrandom_backend="custom"']
+
+# `cargo build-web`: the browser module, target/wasm32-unknown-unknown/release/oxinfer.wasm.
+# The library is emitted as a cdylib only here, so native builds never link one.
+[alias]
+build-web = ["rustc", "--release", "--lib", "--target", "wasm32-unknown-unknown", "--no-default-features", "--features", "web", "--crate-type", "cdylib", "--", "-C", "debuginfo=0", "-C", "strip=debuginfo"]

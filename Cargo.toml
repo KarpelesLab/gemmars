@@ -23,6 +23,9 @@ media = ["dep:oxideav-core", "dep:oxideav-pipeline", "dep:oxideav-meta", "dep:ox
 hf = ["dep:rsurl"]
 # Runtime-loaded GPU backends (CUDA, Metal, Vulkan detection); all optional at run time.
 gpu = ["dep:dlsym"]
+# The browser module (wasm32-unknown-unknown only): C-ABI exports for web/oxinfer.js and the
+# WebGPU backend. Build with `cargo build-web` (see .cargo/config.toml).
+web = ["dep:getrandom"]
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
@@ -35,6 +38,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 rsurl = { version = "0.1.20", default-features = false, features = ["purecrypto-tls", "idn"], optional = true }
 dlsym = { version = "0.0.2", optional = true }
+getrandom = { version = "0.3", default-features = false, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = "0.9.11"

@@ -187,7 +187,7 @@ async function load() {
     const gpu = wantGpu ? await WebGpuHost.create(log) : null;
     if (wantGpu && !gpu) log('[webgpu: no adapter; using CPU]');
     if (wantGpu && !hasJspi) log('[webgpu: this browser has no JSPI (WebAssembly.Suspending); GPU disabled]');
-    g = await Oxinfer.create('./target/wasm32-unknown-unknown/release/oxinfer_web.wasm', { gpu, log });
+    g = await Oxinfer.create('./oxinfer.wasm', { gpu, log });
     const url = $('url').value.trim();
     const folder = $('folder').files;
     if (folder.length) await loadFromFiles(g, folder);
