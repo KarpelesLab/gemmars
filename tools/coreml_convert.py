@@ -388,7 +388,6 @@ class GatedDeltaNet(nn.Module):
         c = chunk
         i = torch.arange(c)
         lower = (i[:, None] >= i[None, :]).to(DTYPE)  # j <= i
-        self.register_buffer("lower", lower)
         self.register_buffer("upper_neg", (1.0 - lower) * -30000.0)
         self.levels = int(math.log2(c))
         for lvl in range(self.levels):
@@ -408,7 +407,6 @@ class GatedDeltaNet(nn.Module):
     def forward(self, x, gdn_state, conv_state):
         sp = self.sp
         nk, nv, dk, dv, kd = sp.lin_nk, sp.lin_nv, sp.lin_dk, sp.lin_dv, sp.lin_nk * sp.lin_dk
-        cd, kk = sp.conv_dim, sp.conv_k
         t = x.shape[1]
         hs = x.permute(0, 2, 1).unsqueeze(2)  # [1, H, 1, T]
         qkv = self.in_qkv(hs)  # [1, conv_dim, 1, T]
@@ -926,7 +924,7 @@ def compress(mlmodel, q: Quant, workers: int, op_type: str = "conv"):
     return cto.coreml.linear_quantize_weights(mlmodel, cto.coreml.OptimizationConfig(op_type_configs={op_type: op}))
 
 
-def convert(module, example, inputs, outputs, states, enumerate_input=None):
+def convert(module, example, inputs, outputs, states):
     import coremltools as ct
 
     module.eval()
