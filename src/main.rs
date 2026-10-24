@@ -740,10 +740,10 @@ fn resolve_model(spec: &str, cache_dir: Option<&std::path::Path>) -> Result<Path
     {
         let _ = cache_dir;
         let p = PathBuf::from(spec);
-        if p.is_dir() {
+        if p.is_dir() || oxinfer::gguf::is_gguf(&p) {
             Ok(p)
         } else {
-            bail!("{spec}: not a directory (built without the `hf` feature, so repo ids cannot be fetched)")
+            bail!("{spec}: not a directory or GGUF file (built without the `hf` feature, so repo ids cannot be fetched)")
         }
     }
 }
@@ -1182,7 +1182,7 @@ fn run_qwen(args: Args) -> Result<()> {
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let model = qwen::QwenModel::load(cfg, &files, args.quant)?;
-    let tok = Tokenizer::from_file(args.model.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let tok = load_tokenizer(&args.model)?;
     let fmt = chat::QwenChat::for_model(&args.model);
     let eos = chat::with_turn_end(fmt, &tok, eos);
     eprintln!(
@@ -1200,6 +1200,14 @@ fn run_qwen(args: Args) -> Result<()> {
         return save_quantized(&args.model, out, &files, model.quant);
     }
     run_text(&args, &model, &tok, &eos, fmt)
+}
+
+/// The model's tokenizer: `tokenizer.json`, or rebuilt from a GGUF file's vocabulary.
+fn load_tokenizer(model: &Path) -> Result<Tokenizer> {
+    if oxinfer::gguf::is_gguf(model) {
+        return oxinfer::gguf::header(model)?.tokenizer();
+    }
+    Tokenizer::from_file(model.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))
 }
 
 fn run_gemma(args: Args) -> Result<()> {

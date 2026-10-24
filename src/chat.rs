@@ -185,6 +185,9 @@ impl QwenChat {
     /// The format matching the model's own chat template (`chat_template.jinja`, or the template
     /// embedded in `tokenizer_config.json`).
     pub fn for_model(dir: &std::path::Path) -> &'static QwenChat {
+        if crate::gguf::is_gguf(dir) {
+            return Self::for_template(crate::gguf::header(dir).ok().as_deref().and_then(|h| h.chat_template()));
+        }
         let jinja = crate::fsx::read(&dir.join("chat_template.jinja"))
             .ok()
             .map(|b| String::from_utf8_lossy(&b).into_owned());
@@ -192,6 +195,11 @@ impl QwenChat {
             let cfg: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("tokenizer_config.json")).ok()?).ok()?;
             cfg["chat_template"].as_str().map(str::to_string)
         });
+        Self::for_template(template.as_deref())
+    }
+
+    /// The format matching a chat template's source (None: plain Qwen).
+    pub fn for_template(template: Option<&str>) -> &'static QwenChat {
         match template {
             Some(t) if t.contains("reasoning_effort") => &QWEN_EFFORT,
             Some(t) if t.contains("<function-name>") => &QWEN3,

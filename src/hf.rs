@@ -26,8 +26,13 @@ pub fn cache_root() -> PathBuf {
 /// fetched into the cache (if needed) and its directory returned.
 pub fn resolve(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     let p = Path::new(spec);
-    if p.is_dir() {
+    if p.is_dir() || crate::gguf::is_gguf(p) {
         return Ok(p.to_path_buf());
+    }
+    if let Some((repo, quant)) = spec.split_once(':')
+        && repo.split('/').count() == 2
+    {
+        return resolve_gguf(repo, quant, cache_dir);
     }
     let parts: Vec<&str> = spec.split('/').collect();
     if parts.len() != 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
@@ -47,6 +52,11 @@ pub fn resolve_file(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     let p = Path::new(spec);
     if p.is_file() {
         return Ok(p.to_path_buf());
+    }
+    if let Some((repo, quant)) = spec.split_once(':')
+        && repo.split('/').count() == 2
+    {
+        return resolve_gguf(repo, quant, cache_dir);
     }
     let parts: Vec<&str> = spec.split('/').collect();
     if parts.len() < 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
@@ -72,6 +82,51 @@ pub fn resolve_file(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
     let dir = root.join(repo.replace('/', "--"));
     fetch_file(&repo, &dir, &name, *size, src, 1, 1)?;
+    Ok(dir.join(name))
+}
+
+/// The GGUF files of a listing that hold a model (not vision projectors), sorted.
+fn gguf_models(list: &Listing) -> Vec<&String> {
+    let mut v: Vec<&String> = list
+        .keys()
+        .filter(|k| k.ends_with(".gguf") && !k.rsplit('/').next().unwrap_or(k).starts_with("mmproj"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// `org/name:QUANT` for a repository of GGUF files (as llama.cpp's `-hf`): the file whose name
+/// ends in `QUANT.gguf` (case-insensitive, e.g. `Q4_K_M` or `FastMTP-32K`), fetched alone.
+pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let list = listing(repo)?;
+    let ggufs = gguf_models(&list);
+    let want = format!("{}.gguf", quant.to_ascii_lowercase());
+    let hits: Vec<&&String> = ggufs
+        .iter()
+        .filter(|f| {
+            let f = f.to_ascii_lowercase();
+            f.ends_with(&want) && f[..f.len() - want.len()].ends_with(['-', '.', '_', '/'])
+        })
+        .collect();
+    let name = match hits.as_slice() {
+        [one] => one.to_string(),
+        [] => bail!(
+            "{repo}: no GGUF file for {quant}; available: {}",
+            ggufs.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+        many => bail!(
+            "{repo}: several GGUF files match {quant}: {}",
+            many.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    if name.contains("-of-") {
+        bail!("{name}: split GGUF files are not supported yet");
+    }
+    let (size, src) = &list[&name];
+    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
+    let dir = root.join(repo.replace('/', "--"));
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    fetch_file(repo, &dir, &name, *size, src, 1, 1)?;
     Ok(dir.join(name))
 }
 
@@ -348,6 +403,11 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         files.extend(shards);
     } else if list.contains_key("pytorch_model.bin") {
         files.push("pytorch_model.bin".into());
+    } else if !gguf_models(&list).is_empty() {
+        bail!(
+            "{repo} holds GGUF files; pick one as {repo}:QUANT (e.g. {repo}:Q4_K_M): {}",
+            gguf_models(&list).iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ")
+        );
     } else {
         bail!("{repo}: no safetensors or pytorch_model.bin weights found");
     }

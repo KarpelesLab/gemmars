@@ -132,9 +132,9 @@ pub struct QwenSession {
     pub pos: usize,
 }
 
-fn norm_weight(w: &[u16], zero_centered: bool) -> Vec<f32> {
+fn norm_weight(w: Vec<f32>, zero_centered: bool) -> Vec<f32> {
     let o = if zero_centered { 1.0 } else { 0.0 };
-    w.iter().map(|&v| o + bf16_to_f32(v)).collect()
+    w.into_iter().map(|v| o + v).collect()
 }
 
 impl<'a> QwenModel<'a> {
@@ -151,28 +151,17 @@ impl<'a> QwenModel<'a> {
             bail!("cannot find embed_tokens in checkpoint");
         };
         let h = cfg.hidden_size;
-        let get = |full: &str, shape: &[usize]| -> Result<&'a [u16]> {
-            let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
-            if info.shape != shape {
-                bail!("tensor {full} has shape {:?}, expected {:?}", info.shape, shape);
-            }
-            files.bf16(full)
-        };
         // Small parameter vectors are stored as BF16 in some checkpoints and F32 in others.
         let getf = |full: &str, shape: &[usize]| -> Result<Vec<f32>> {
             let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
             if info.shape != shape {
                 bail!("tensor {full} has shape {:?}, expected {:?}", info.shape, shape);
             }
-            let b = files.bytes(full)?;
-            Ok(match info.dtype.as_str() {
-                "BF16" => b.as_chunks::<2>().0.iter().map(|c| bf16_to_f32(u16::from_le_bytes(*c))).collect(),
-                "F32" => b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect(),
-                other => bail!("tensor {full} has dtype {other}, expected BF16 or F32"),
-            })
+            files.f32(full)
         };
         let lin = |full: &str, n_out: usize, n_in: usize| load_lin(files, full, n_out, n_in, quant);
-        let one_plus = |w: &[u16]| norm_weight(w, cfg.zero_centered_norm);
+        // Norm weights in f32 (GGUF stores them as f32 with the 1 folded in).
+        let one_plus = |w: Vec<f32>| norm_weight(w, cfg.zero_centered_norm);
 
         let tied = cfg.tie_word_embeddings || !has("lm_head.weight");
         // Lookups use the head's precision when tied (one copy in a pre-quantized file), else bf16.
@@ -188,7 +177,7 @@ impl<'a> QwenModel<'a> {
         } else {
             lin("lm_head.weight", cfg.vocab_size, h)?
         };
-        let final_norm = one_plus(get(&format!("{prefix}norm.weight"), &[h])?);
+        let final_norm = one_plus(getf(&format!("{prefix}norm.weight"), &[h])?);
 
         let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
         let (nk, nv, hdk, hdv) = (
@@ -220,20 +209,24 @@ impl<'a> QwenModel<'a> {
                     k: lin(&format!("{ap}k_proj.weight"), nkv * hd, h)?,
                     v: lin(&format!("{ap}v_proj.weight"), nkv * hd, h)?,
                     o: lin(&format!("{ap}o_proj.weight"), h, nh * hd)?,
-                    q_norm: one_plus(get(&format!("{ap}q_norm.weight"), &[hd])?),
-                    k_norm: one_plus(get(&format!("{ap}k_norm.weight"), &[hd])?),
+                    q_norm: one_plus(getf(&format!("{ap}q_norm.weight"), &[hd])?),
+                    k_norm: one_plus(getf(&format!("{ap}k_norm.weight"), &[hd])?),
                 })
             } else {
                 let gp = format!("{lp}linear_attn.");
                 let conv_w = getf(&format!("{gp}conv1d.weight"), &[conv_dim, 1, kc])?;
-                let a_log = getf(&format!("{gp}A_log"), &[nv])?;
+                // GGUF stores -exp(A_log) directly.
+                let decay_coef = match getf(&format!("{gp}A_log"), &[nv]) {
+                    Ok(a_log) => a_log.iter().map(|&v| -v.exp()).collect(),
+                    Err(_) => getf(&format!("{gp}ssm_a"), &[nv])?,
+                };
                 Mixer::Gdn(Gdn {
                     qkv: lin(&format!("{gp}in_proj_qkv.weight"), conv_dim, h)?,
                     z: lin(&format!("{gp}in_proj_z.weight"), value_dim, h)?,
                     b: lin(&format!("{gp}in_proj_b.weight"), nv, h)?,
                     a: lin(&format!("{gp}in_proj_a.weight"), nv, h)?,
                     conv_w,
-                    decay_coef: a_log.iter().map(|&v| -v.exp()).collect(),
+                    decay_coef,
                     dt_bias: getf(&format!("{gp}dt_bias"), &[nv])?,
                     norm_w: getf(&format!("{gp}norm.weight"), &[hdv])?,
                     out: lin(&format!("{gp}out_proj.weight"), h, value_dim)?,
@@ -254,6 +247,12 @@ impl<'a> QwenModel<'a> {
                                 .collect(),
                             load_lin_experts(files, &format!("{mp}experts.down_proj"), n_exp, h, mi, quant)?,
                         )
+                    } else if has(&format!("{mp}experts.gate_proj")) {
+                        // Separate 3D gate and up tensors (GGUF).
+                        let g = load_lin_experts(files, &format!("{mp}experts.gate_proj"), n_exp, mi, h, quant)?;
+                        let u = load_lin_experts(files, &format!("{mp}experts.up_proj"), n_exp, mi, h, quant)?;
+                        let d = load_lin_experts(files, &format!("{mp}experts.down_proj"), n_exp, h, mi, quant)?;
+                        (g.into_iter().zip(u).map(|(g, u)| GateUp::Split(g, u)).collect(), d)
                     } else {
                         let (mut gu, mut d) = (Vec::with_capacity(n_exp), Vec::with_capacity(n_exp));
                         for e in 0..n_exp {
@@ -280,8 +279,8 @@ impl<'a> QwenModel<'a> {
             };
             layers.push(QLayer {
                 mixer,
-                ln_in: one_plus(get(&format!("{lp}input_layernorm.weight"), &[h])?),
-                ln_post: one_plus(get(&format!("{lp}post_attention_layernorm.weight"), &[h])?),
+                ln_in: one_plus(getf(&format!("{lp}input_layernorm.weight"), &[h])?),
+                ln_post: one_plus(getf(&format!("{lp}post_attention_layernorm.weight"), &[h])?),
                 ffn,
             });
         }
@@ -554,7 +553,7 @@ impl<'a> QwenModel<'a> {
         let sp = SendPtrF(st.s.as_mut_ptr());
         let qscale = (hdk as f32).powf(-0.5);
         pool::run(nv, &|hv| {
-            let hk = hv / rep;
+            let hk = if cfg.v_heads_tiled { hv % nk } else { hv / rep };
             // SAFETY: each head owns its own state slab and output columns.
             let s = unsafe { std::slice::from_raw_parts_mut(sp.get().add(hv * hdk * hdv), hdk * hdv) };
             let mut qn = vec![0f32; hdk];

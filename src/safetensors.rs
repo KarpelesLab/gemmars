@@ -22,6 +22,8 @@ pub struct TensorInfo {
     /// An MLX affine-quantized matrix: `dtype`/`shape` then describe the logical bf16 matrix,
     /// while the packed values sit at `start..end` (scales and biases are sibling tensors).
     pub mlx: Option<MlxQuant>,
+    /// A ggml-quantized tensor (GGUF): its ggml type id; `dtype` is then "GGML".
+    pub ggml: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,7 +182,8 @@ impl SafeTensors {
             file.read_exact(&mut n8)
                 .with_context(|| format!("{}: file too small", path.display()))?;
             let data_start = 8usize.saturating_add(u64::from_le_bytes(n8) as usize);
-            let pad = (16 - data_start % 16) % 16;
+            // GGUF data is aligned within the file already (and its offsets are absolute).
+            let pad = if &n8[..4] == b"GGUF" { 0 } else { (16 - data_start % 16) % 16 };
             Storage::Heap(read_file_parallel(&file, len, pad)?, len, pad)
         } else {
             let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -195,6 +198,9 @@ impl SafeTensors {
         if mmap.len() < 8 {
             bail!("{}: file too small", path.display());
         }
+        if mmap.len() >= 4 && &mmap[..4] == b"GGUF" {
+            return Self::from_gguf(path, mmap);
+        }
         if crate::torch::is_torch_zip(&mmap) {
             let tensors = crate::torch::read_tensors(&mmap)
                 .with_context(|| format!("{}: read PyTorch checkpoint", path.display()))?
@@ -206,6 +212,7 @@ impl SafeTensors {
                         start: t.start,
                         end: t.end,
                         mlx: None,
+                        ggml: None,
                     };
                     (name, info)
                 })
@@ -223,6 +230,41 @@ impl SafeTensors {
         let len = mmap.len();
         let head = mmap[8..8 + n].to_vec();
         Self::from_header(path, mmap, &head, 8 + n, len)
+    }
+
+    fn from_gguf(path: &Path, mmap: Storage) -> Result<Self> {
+        let h = crate::gguf::parse_header(&mmap[..], mmap.len()).with_context(|| format!("{}", path.display()))?;
+        let mut tensors = HashMap::new();
+        for crate::gguf::HfTensor {
+            name,
+            shape,
+            ggml_type: t,
+            start,
+            end,
+        } in crate::gguf::hf_tensors(&h)?
+        {
+            let dtype = match t {
+                0 => "F32",
+                1 => "F16",
+                30 => "BF16",
+                26 => "I32",
+                _ => "GGML",
+            };
+            let info = TensorInfo {
+                dtype: dtype.to_string(),
+                shape,
+                start,
+                end,
+                mlx: None,
+                ggml: (dtype == "GGML").then_some(t),
+            };
+            tensors.insert(name, info);
+        }
+        Ok(Self {
+            mmap,
+            tensors,
+            metadata: crate::gguf::scalar_metadata(&h).into_iter().collect(),
+        })
     }
 
     fn from_header(path: &Path, mmap: Storage, head: &[u8], data_start: usize, file_len: usize) -> Result<Self> {
@@ -262,6 +304,7 @@ impl SafeTensors {
                     start,
                     end,
                     mlx: None,
+                    ggml: None,
                 },
             );
         }
@@ -410,7 +453,21 @@ pub enum Stored {
 }
 
 impl ModelFiles {
+    /// Opens the checkpoint in directory `dir` (safetensors, sharded or not, or
+    /// `pytorch_model.bin`), or a single GGUF file.
     pub fn open(dir: &Path, in_memory: bool) -> Result<Self> {
+        if crate::gguf::is_gguf(dir) {
+            let shard = SafeTensors::open(dir, in_memory)?;
+            let index = shard.names().map(|n| (n.clone(), 0)).collect();
+            return Ok(Self {
+                shards: vec![shard],
+                index,
+                touched: Mutex::new(BTreeMap::new()),
+                uses: Mutex::new(HashMap::new()),
+                dequantized: Mutex::new(HashMap::new()),
+                copies: Mutex::new(HashMap::new()),
+            });
+        }
         let single = dir.join("model.safetensors");
         let idx = dir.join("model.safetensors.index.json");
         let mut files: Vec<PathBuf> = Vec::new();

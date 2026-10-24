@@ -320,6 +320,9 @@ impl TextConfig {
 /// `text_config`), else Gemma's `<eos>` and `<turn|>`. Callers add the chat format's end-of-turn
 /// token on top (`chat::with_turn_end`), since some checkpoints only list the base model's EOS.
 pub fn load_eos_ids(dir: &Path) -> Vec<u32> {
+    if crate::gguf::is_gguf(dir) {
+        return crate::gguf::header(dir).map(|h| h.eos_ids()).unwrap_or_default();
+    }
     fn ids(v: &serde_json::Value) -> Option<Vec<u32>> {
         match v {
             serde_json::Value::Number(n) => n.as_u64().map(|x| vec![x as u32]),
@@ -345,6 +348,9 @@ pub fn load_eos_ids(dir: &Path) -> Vec<u32> {
 
 /// `model_type` from the root of config.json (e.g. "gemma4", "qwen3_5").
 pub fn model_type(dir: &Path) -> Result<String> {
+    if crate::gguf::is_gguf(dir) {
+        return Ok(crate::gguf::header(dir)?.model_type()?.to_string());
+    }
     let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
     raw.get("model_type")
         .and_then(|v| v.as_str())
@@ -432,14 +438,24 @@ pub struct QwenConfig {
     /// Qwen3 keeps the RoPE base at the top level.
     #[serde(default)]
     pub rope_theta: Option<f64>,
-    /// RMSNorm scales by `1 + weight` (Qwen3.5) rather than `weight` (Qwen3).
+    /// RMSNorm scales by `1 + weight` (Qwen3.5) rather than `weight` (Qwen3, and GGUF files,
+    /// whose norm weights already include the 1).
     #[serde(skip, default = "d_true")]
     pub zero_centered_norm: bool,
+    /// Gated DeltaNet value heads in tiled order (GGUF): value head `h` uses key head `h % n_k`
+    /// rather than `h / (n_v / n_k)`.
+    #[serde(skip)]
+    pub v_heads_tiled: bool,
 }
 
 impl QwenConfig {
     pub fn load(dir: &Path) -> Result<Self> {
-        let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
+        let gguf = crate::gguf::is_gguf(dir);
+        let raw: serde_json::Value = if gguf {
+            crate::gguf::header(dir)?.config_json()?
+        } else {
+            serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?
+        };
         let dense = raw.get("model_type").and_then(|v| v.as_str()) == Some("qwen3");
         let text = raw.get("text_config").cloned().unwrap_or(raw);
         let mut cfg: QwenConfig = serde_json::from_value(text).context("parse qwen text config")?;
@@ -455,6 +471,10 @@ impl QwenConfig {
                     .map(|i| if (i + 1) % k == 0 { "full_attention" } else { "linear_attention" }.to_string())
                     .collect(),
             );
+        }
+        if gguf {
+            cfg.zero_centered_norm = false;
+            cfg.v_heads_tiled = cfg.linear_num_key_heads != cfg.linear_num_value_heads;
         }
         if cfg.layer_types.as_ref().unwrap().len() != cfg.num_hidden_layers {
             bail!("layer_types length mismatch");
