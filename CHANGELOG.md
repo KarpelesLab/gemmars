@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/KarpelesLab/oxinfer/compare/v0.0.1...v0.0.2) - 2026-10-24
+
+### Other
+
+- reasoning-effort instruction only for templates that have it
+- attention and fused group/layer norms; GPU check summary
+- attention and fused group/layer norms
+- Diffusion on the GPU: attention, and group/layer norms fused into their consumers (Metal)
+
 ## [0.0.1](https://github.com/KarpelesLab/oxinfer/compare/v0.0.0...v0.0.1) - 2026-10-24
 
 ### Other
