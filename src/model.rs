@@ -2,6 +2,7 @@
 //! attention with KV sharing, gated-GELU MLP, tied softcapped LM head.
 
 use crate::config::TextConfig;
+use crate::ggml::{GgmlType, GgufMatrix};
 use crate::kernels::*;
 use crate::prof::{self, Cat};
 use crate::quant::{Q4Matrix, QKind, QMatrix, quantize_bf16, quantize_q4};
@@ -66,6 +67,8 @@ pub enum Table<'a> {
     Bf16(&'a [u16]),
     Q8(QMatrix),
     Q4(Q4Matrix),
+    /// A GGUF table in any `GgmlType`, dequantized row by row.
+    Gguf(GgufMatrix),
     /// Pre-quantized rows kept by the browser host, fetched one row per lookup.
     /// Values and scales can sit in different shards, hence two files.
     Host {
@@ -84,6 +87,18 @@ pub enum Table<'a> {
 }
 
 impl<'a> Table<'a> {
+    /// A GGUF table's raw bytes (`rows` rows of `cols` elements of `kind`), borrowed for 'a.
+    pub fn from_gguf(kind: GgmlType, bytes: &'a [u8], rows: usize, cols: usize) -> Result<Self> {
+        if kind == GgmlType::BF16 && bytes.len() == rows * cols * 2 && (bytes.as_ptr() as usize).is_multiple_of(2) {
+            // SAFETY: length and alignment checked; any bit pattern is a valid u16.
+            return Ok(Table::Bf16(unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr() as *const u16, rows * cols)
+            }));
+        }
+        // SAFETY: Table<'a> cannot outlive `bytes`.
+        Ok(Table::Gguf(unsafe { GgufMatrix::borrowed(kind, bytes, rows, cols)? }))
+    }
+
     /// Row `r` (of length `out.len()`) as f32.
     pub fn row(&self, r: usize, out: &mut [f32]) {
         let n = out.len();
@@ -95,6 +110,7 @@ impl<'a> Table<'a> {
             }
             Table::Q8(m) => crate::quant::dequantize_rows(m, r, r + 1, out),
             Table::Q4(m) => crate::quant::dequantize_rows_q4(m, r, r + 1, out),
+            Table::Gguf(m) => m.dequantize_rows(r, r + 1, out),
             Table::Mlx { parts, q } => {
                 let (wb, gb) = (n * q.bits / 8, n / q.group * 2);
                 let mut w = vec![0u32; wb / 4];
@@ -170,6 +186,7 @@ impl<'a> Table<'a> {
             Table::Bf16(w) => w.len() * 2,
             Table::Q8(m) => m.bytes(),
             Table::Q4(m) => m.bytes(),
+            Table::Gguf(m) => m.bytes(),
             Table::Host { .. } => 0,
             Table::Mlx { parts, .. } => parts
                 .iter()
@@ -330,6 +347,8 @@ pub enum Weight<'a> {
     Bf16(crate::quant::QBuf<u16>, std::marker::PhantomData<&'a [u16]>),
     Q8(QMatrix),
     Q4(Q4Matrix),
+    /// A llama.cpp block format (GGUF checkpoints), any `GgmlType`.
+    Gguf(GgufMatrix),
 }
 
 impl<'a> Lin<'a> {
@@ -359,6 +378,25 @@ impl<'a> Lin<'a> {
             dev: std::sync::OnceLock::new(),
         }
     }
+    /// A GGUF weight (`GgufMatrix::borrowed` keeps it zero-copy over a mapped file).
+    pub fn gguf(m: GgufMatrix) -> Self {
+        Self {
+            w: Weight::Gguf(m),
+            dev: std::sync::OnceLock::new(),
+        }
+    }
+    /// A GGUF tensor's raw bytes (`n_out` rows of `n_in` elements of `kind`), borrowed for 'a.
+    /// BF16 becomes a plain bf16 weight (GPU-capable, bf16 kernels); everything else a `GgufMatrix`.
+    pub fn from_gguf(kind: GgmlType, bytes: &'a [u8], n_out: usize, n_in: usize) -> Result<Self> {
+        if kind == GgmlType::BF16 && bytes.len() == n_out * n_in * 2 && (bytes.as_ptr() as usize).is_multiple_of(2) {
+            // SAFETY: length and alignment checked; any bit pattern is a valid u16.
+            return Ok(Self::bf16(unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr() as *const u16, n_out * n_in)
+            }));
+        }
+        // SAFETY: Lin<'a> cannot outlive `bytes`.
+        Ok(Self::gguf(unsafe { GgufMatrix::borrowed(kind, bytes, n_out, n_in)? }))
+    }
     pub fn bytes(&self) -> usize {
         self.as_ref().bytes()
     }
@@ -367,6 +405,7 @@ impl<'a> Lin<'a> {
             Weight::Bf16(w, _) => crate::gpu::WeightRef::Bf16(w),
             Weight::Q8(m) => crate::gpu::WeightRef::Q8(m),
             Weight::Q4(m) => crate::gpu::WeightRef::Q4(m),
+            Weight::Gguf(m) => crate::gpu::WeightRef::Gguf(m),
         }
     }
     /// Device-side state for this layer on the active accelerator, whatever the op size (callers
@@ -385,7 +424,7 @@ impl<'a> Lin<'a> {
     }
 }
 
-/// Fused matmuls over one shared input: all jobs must have the same precision.
+/// Fused matmuls over one shared input (any mix of storage formats).
 pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {
     if jobs.is_empty() {
         return;
@@ -418,45 +457,72 @@ pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, 
             }
         }
     }
-    if rest.is_empty() {
+    if !rest.is_empty() {
+        linear_multi_cpu(&mut rest, n_in, x, t);
+    }
+}
+
+/// The CPU part of [`linear_multi`]: one fused region per storage format (GGUF checkpoints mix
+/// formats freely, so mixed batches are split; GGUF matrices of different types share one).
+fn linear_multi_cpu(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {
+    let fmt = |l: &Lin| match l.w {
+        Weight::Bf16(..) => 0,
+        Weight::Q8(_) => 1,
+        Weight::Q4(_) => 2,
+        Weight::Gguf(_) => 3,
+    };
+    let f0 = fmt(jobs[0].0);
+    if jobs.iter().any(|(l, _, _)| fmt(l) != f0) {
+        for f in 0..4 {
+            let mut sub: Vec<(&Lin, usize, &mut [f32])> = jobs
+                .iter_mut()
+                .filter(|(l, _, _)| fmt(l) == f)
+                .map(|(l, n, y)| (*l, *n, &mut **y))
+                .collect();
+            if !sub.is_empty() {
+                linear_multi_cpu(&mut sub, n_in, x, t);
+            }
+        }
         return;
     }
-    let jobs = &mut rest[..];
-    if jobs.iter().all(|(l, _, _)| matches!(l.w, Weight::Bf16(..))) {
-        let mut v: Vec<(&[u16], usize, &mut [f32])> = jobs
-            .iter_mut()
-            .map(|(l, n, y)| match &l.w {
-                Weight::Bf16(w, _) => (&w[..], *n, &mut **y),
+    fn mats<'m, M>(jobs: &'m mut [(&Lin, usize, &mut [f32])], get: impl Fn(&'m Weight) -> &'m M) -> Vec<(&'m M, &'m mut [f32])> {
+        jobs.iter_mut().map(|(l, _, y)| (get(&l.w), &mut **y)).collect()
+    }
+    match f0 {
+        0 => {
+            let mut v: Vec<(&[u16], usize, &mut [f32])> = jobs
+                .iter_mut()
+                .map(|(l, n, y)| match &l.w {
+                    Weight::Bf16(w, _) => (&w[..], *n, &mut **y),
+                    _ => unreachable!(),
+                })
+                .collect();
+            matmul_multi(&mut v, n_in, x, t);
+        }
+        1 => matmul_quant_multi(
+            &mut mats(jobs, |w| match w {
+                Weight::Q8(m) => m,
                 _ => unreachable!(),
-            })
-            .collect();
-        matmul_multi(&mut v, n_in, x, t);
-    } else if jobs.iter().all(|(l, _, _)| matches!(l.w, Weight::Q8(_))) {
-        let mut v: Vec<(&QMatrix, &mut [f32])> = jobs
-            .iter_mut()
-            .map(|(l, n, y)| match &l.w {
-                Weight::Q8(m) => {
-                    debug_assert_eq!(m.n_out, *n);
-                    (m, &mut **y)
-                }
+            }),
+            x,
+            t,
+        ),
+        2 => matmul_quant_multi(
+            &mut mats(jobs, |w| match w {
+                Weight::Q4(m) => m,
                 _ => unreachable!(),
-            })
-            .collect();
-        matmul_quant_multi(&mut v, x, t);
-    } else if jobs.iter().all(|(l, _, _)| matches!(l.w, Weight::Q4(_))) {
-        let mut v: Vec<(&Q4Matrix, &mut [f32])> = jobs
-            .iter_mut()
-            .map(|(l, n, y)| match &l.w {
-                Weight::Q4(m) => {
-                    debug_assert_eq!(m.n_out, *n);
-                    (m, &mut **y)
-                }
+            }),
+            x,
+            t,
+        ),
+        _ => matmul_quant_multi(
+            &mut mats(jobs, |w| match w {
+                Weight::Gguf(m) => m,
                 _ => unreachable!(),
-            })
-            .collect();
-        matmul_quant_multi(&mut v, x, t);
-    } else {
-        panic!("mixed precision in fused matmul");
+            }),
+            x,
+            t,
+        ),
     }
 }
 
@@ -489,6 +555,16 @@ pub(crate) fn linear_grouped(ls: &[&Lin], segs: &[(usize, usize)], n_out: usize,
                 .iter()
                 .map(|l| match &l.w {
                     Weight::Q4(m) => m,
+                    _ => panic!("mixed precision in grouped matmul"),
+                })
+                .collect();
+            matmul_quant_grouped(&ms, segs, x, y);
+        }
+        Weight::Gguf(_) => {
+            let ms: Vec<&GgufMatrix> = ls
+                .iter()
+                .map(|l| match &l.w {
+                    Weight::Gguf(m) => m,
                     _ => panic!("mixed precision in grouped matmul"),
                 })
                 .collect();

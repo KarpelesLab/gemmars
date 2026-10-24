@@ -121,6 +121,7 @@ impl Backend for WebGpuBackend {
         };
         let h = unsafe {
             match w {
+                WeightRef::Gguf(_) => return None,
                 WeightRef::Bf16(w) => gpu_upload(
                     0,
                     w.as_ptr() as *const u8,

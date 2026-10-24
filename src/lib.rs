@@ -15,6 +15,7 @@ pub mod cuda;
 pub mod drafter;
 pub mod embed;
 pub mod fsx;
+pub mod ggml;
 pub mod gguf;
 pub mod gpu;
 #[cfg(feature = "hf")]

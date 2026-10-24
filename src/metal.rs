@@ -624,6 +624,7 @@ fn format_index(w: &WeightRef) -> (usize, usize, usize) {
         WeightRef::Bf16(_) => (0, 2, 1),
         WeightRef::Q8(_) => (1, 1, 4),
         WeightRef::Q4(_) => (2, 1, 2),
+        WeightRef::Gguf(_) => unreachable!("GGUF weights are never uploaded"),
     }
 }
 
@@ -652,6 +653,7 @@ impl Backend for MetalBackend {
 
     fn upload(&self, w: &WeightRef, _n_out: usize, _n_in: usize) -> Option<DeviceWeight> {
         let mw = match w {
+            WeightRef::Gguf(_) => return None,
             WeightRef::Bf16(w) => MetalWeight {
                 data: self.wrap(w.as_ptr() as *const u8, w.len() * 2)?,
                 scales: None,
@@ -680,6 +682,9 @@ impl Backend for MetalBackend {
 
     fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {
         use crate::gpu::NormKind;
+        if matches!(job.w, WeightRef::Gguf(_)) {
+            return false;
+        }
         let n_in = g.k * g.k * g.cin;
         let t = g.oh * g.ow;
         let npx = g.h * g.w;
@@ -1051,7 +1056,7 @@ impl Backend for MetalBackend {
     }
 
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool {
-        if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in {
+        if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in || jobs.iter().any(|j| matches!(j.w, WeightRef::Gguf(_))) {
             return false;
         }
         let t_pad = t.div_ceil(TILE) * TILE;

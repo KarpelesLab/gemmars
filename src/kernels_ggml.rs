@@ -1,0 +1,729 @@
+//! NEON decode kernels for the hot GGUF formats: each unpacks a block's weights to int8 vectors in
+//! registers once, then runs SDOT against TC int8 activation rows. Integer sums are formed per
+//! 32-element activation block (sub-blocks of 16 are scaled in int32 first) and scaled in f32.
+//! Formats with mins subtract `min * sum(x)` using the exact activation sums.
+#![allow(unsafe_op_in_unsafe_fn)]
+
+use super::{Act, GgmlType, GgufMatrix, QK_K, q3k_scales, tables::KVALUES_IQ4NL};
+use crate::kernels::simd::{f16x4_to_f32, sdot};
+use crate::quant::f16_to_f32;
+use std::arch::aarch64::*;
+
+/// `for $i in 0..8 { $body }`, unrolled (keeps the unpacked vectors in registers).
+macro_rules! unroll8 {
+    ($i:ident, $body:block) => {
+        unroll8!(@ $i $body 0 1 2 3 4 5 6 7)
+    };
+    (@ $i:ident $body:block $($n:literal)*) => {
+        $({
+            let $i: usize = $n;
+            $body
+        })*
+    };
+}
+
+type RowFn<const TC: usize> = unsafe fn(*const u8, usize, &Act) -> [f32; TC];
+
+/// Rows `r0..r1` of `m` against TC activation rows into `y[c * ys + r]`; false if `m.kind` has
+/// no NEON kernel (the caller then uses the portable path).
+pub(super) unsafe fn rows<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32, ys: usize, r0: usize, r1: usize) -> bool {
+    let f: RowFn<TC> = match m.kind {
+        GgmlType::Q4_K => q4k::<TC, false>,
+        GgmlType::Q5_K => q4k::<TC, true>,
+        GgmlType::Q6_K => sb16::<TC, Q6K>,
+        GgmlType::Q3_K => sb16::<TC, Q3K>,
+        GgmlType::IQ2_XXS => sb16::<TC, Iq2Xxs>,
+        GgmlType::IQ2_XS => sb16::<TC, Iq2Xs>,
+        GgmlType::IQ2_S => sb16::<TC, Iq2S>,
+        GgmlType::IQ3_XXS => sb16::<TC, Iq3Xxs>,
+        GgmlType::IQ3_S => sb16::<TC, Iq3S>,
+        GgmlType::IQ1_S => sb16::<TC, Iq1S>,
+        GgmlType::IQ1_M => sb16::<TC, Iq1M>,
+        GgmlType::Q2_K => q2k::<TC>,
+        GgmlType::IQ4_XS => iq4xs::<TC>,
+        GgmlType::Q8_0 => q8_0::<TC>,
+        GgmlType::Q4_0 => q32::<TC, Q4_0>,
+        GgmlType::IQ4_NL => q32::<TC, IQ4_NL>,
+        GgmlType::Q4_1 => q32::<TC, Q4_1>,
+        GgmlType::Q5_0 => q32::<TC, Q5_0>,
+        GgmlType::Q5_1 => q32::<TC, Q5_1>,
+        _ => return false,
+    };
+    let rb = m.row_bytes();
+    let base = m.data.as_ptr();
+    for r in r0..r1 {
+        let o = f(base.add(r * rb), m.n_in, x);
+        for c in 0..TC {
+            *y.add(c * ys + r) = o[c];
+        }
+    }
+    true
+}
+
+#[inline(always)]
+unsafe fn f16p(p: *const u8) -> f32 {
+    f16_to_f32(std::ptr::read_unaligned(p as *const u16))
+}
+
+/// u8 lanes 0..4 / 4..8 of `v` as f32.
+#[inline(always)]
+unsafe fn u8x8_to_f32(v: uint8x8_t) -> (float32x4_t, float32x4_t) {
+    let w = vmovl_u8(v);
+    (vcvtq_f32_u32(vmovl_u16(vget_low_u16(w))), vcvtq_f32_u32(vmovl_high_u16(w)))
+}
+
+/// 16 signed bytes widened to four int32x4.
+#[inline(always)]
+unsafe fn s8x16_to_s32(v: int8x16_t) -> [int32x4_t; 4] {
+    let lo = vmovl_s8(vget_low_s8(v));
+    let hi = vmovl_high_s8(v);
+    [
+        vmovl_s16(vget_low_s16(lo)),
+        vmovl_high_s16(lo),
+        vmovl_s16(vget_low_s16(hi)),
+        vmovl_high_s16(hi),
+    ]
+}
+
+/// Sums of `acc` lanes per token.
+#[inline(always)]
+unsafe fn finish<const TC: usize>(acc: [float32x4_t; TC]) -> [f32; TC] {
+    let mut out = [0f32; TC];
+    for c in 0..TC {
+        out[c] = vaddvq_f32(acc[c]);
+    }
+    out
+}
+
+/// Per-32 integer sums of eight sub-blocks of 32 (`w[2k], w[2k+1]` against x at `32k`), as two
+/// vectors of four.
+#[inline(always)]
+unsafe fn sums32(w: &[int8x16_t; 16], xq: *const i8) -> (int32x4_t, int32x4_t) {
+    let zero = vdupq_n_s32(0);
+    let mut a = [zero; 8];
+    for k in 0..8 {
+        a[k] = sdot(
+            sdot(zero, w[2 * k], vld1q_s8(xq.add(32 * k))),
+            w[2 * k + 1],
+            vld1q_s8(xq.add(32 * k + 16)),
+        );
+    }
+    (
+        vpaddq_s32(vpaddq_s32(a[0], a[1]), vpaddq_s32(a[2], a[3])),
+        vpaddq_s32(vpaddq_s32(a[4], a[5]), vpaddq_s32(a[6], a[7])),
+    )
+}
+
+/// Per-32 integer sums of sixteen sub-blocks of 16 (`w[k]` against x at `16k`), each sub-block
+/// weighted by its integer scale `sc[k]` (`sc` as four int32x4).
+#[inline(always)]
+unsafe fn sums16(w: &[int8x16_t; 16], sc: &[int32x4_t; 4], xq: *const i8) -> (int32x4_t, int32x4_t) {
+    let zero = vdupq_n_s32(0);
+    let mut m = [zero; 4];
+    for g in 0..4 {
+        let p0 = sdot(zero, w[4 * g], vld1q_s8(xq.add(64 * g)));
+        let p1 = sdot(zero, w[4 * g + 1], vld1q_s8(xq.add(64 * g + 16)));
+        let p2 = sdot(zero, w[4 * g + 2], vld1q_s8(xq.add(64 * g + 32)));
+        let p3 = sdot(zero, w[4 * g + 3], vld1q_s8(xq.add(64 * g + 48)));
+        m[g] = vmulq_s32(vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3)), sc[g]);
+    }
+    (vpaddq_s32(m[0], m[1]), vpaddq_s32(m[2], m[3]))
+}
+
+/// Q4_K (and Q5_K with `FIVE`): 8 sub-blocks of 32 with 6-bit scales and mins.
+unsafe fn q4k<const TC: usize, const FIVE: bool>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    let bpr = n_in / 32;
+    let tsz = if FIVE { 176 } else { 144 };
+    let m4 = vdupq_n_u8(0x0F);
+    let mut acc = [vdupq_n_f32(0.0); TC];
+    for sb in 0..n_in / QK_K {
+        let b = row.add(sb * tsz);
+        let (d, dmin) = (f16p(b), f16p(b.add(2)));
+        // Scales and mins (get_scale_min_k4), unpacked four at a time.
+        const KM1: u32 = 0x3f3f_3f3f;
+        const KM2: u32 = 0x0f0f_0f0f;
+        const KM3: u32 = 0x0303_0303;
+        let u = [
+            std::ptr::read_unaligned(b.add(4) as *const u32),
+            std::ptr::read_unaligned(b.add(8) as *const u32),
+            std::ptr::read_unaligned(b.add(12) as *const u32),
+        ];
+        let sc = (u[0] & KM1) as u64 | ((((u[2] & KM2) | (((u[0] >> 6) & KM3) << 4)) as u64) << 32);
+        let mn = (u[1] & KM1) as u64 | (((((u[2] >> 4) & KM2) | (((u[1] >> 6) & KM3) << 4)) as u64) << 32);
+        let (s0, s1) = u8x8_to_f32(vcreate_u8(sc));
+        let (n0, n1) = u8x8_to_f32(vcreate_u8(mn));
+        let (ds0, ds1) = (vmulq_n_f32(s0, d), vmulq_n_f32(s1, d));
+        let (dm0, dm1) = (vmulq_n_f32(n0, dmin), vmulq_n_f32(n1, dmin));
+        let qs = b.add(if FIVE { 48 } else { 16 });
+        let mut w = [vdupq_n_s8(0); 16];
+        let (h0, h1) = if FIVE {
+            (vld1q_u8(b.add(16)), vld1q_u8(b.add(32)))
+        } else {
+            (vdupq_n_u8(0), vdupq_n_u8(0))
+        };
+        let b16 = vdupq_n_u8(16);
+        for j in 0..4 {
+            let v0 = vld1q_u8(qs.add(32 * j));
+            let v1 = vld1q_u8(qs.add(32 * j + 16));
+            let mut q = [vandq_u8(v0, m4), vandq_u8(v1, m4), vshrq_n_u8::<4>(v0), vshrq_n_u8::<4>(v1)];
+            if FIVE {
+                let (u1, u2) = (vdupq_n_u8(1 << (2 * j)), vdupq_n_u8(2 << (2 * j)));
+                q[0] = vorrq_u8(q[0], vandq_u8(vtstq_u8(h0, u1), b16));
+                q[1] = vorrq_u8(q[1], vandq_u8(vtstq_u8(h1, u1), b16));
+                q[2] = vorrq_u8(q[2], vandq_u8(vtstq_u8(h0, u2), b16));
+                q[3] = vorrq_u8(q[3], vandq_u8(vtstq_u8(h1, u2), b16));
+            }
+            for i in 0..4 {
+                w[4 * j + i] = vreinterpretq_s8_u8(q[i]);
+            }
+        }
+        for c in 0..TC {
+            let (a0, a1) = sums32(&w, x.q.add(c * n_in + sb * QK_K));
+            let xs = x.s.add(c * bpr + sb * 8);
+            let xf = x.f.add(c * bpr + sb * 8);
+            let mut v = vfmaq_f32(acc[c], vcvtq_f32_s32(a0), vmulq_f32(ds0, vld1q_f32(xs)));
+            v = vfmaq_f32(v, vcvtq_f32_s32(a1), vmulq_f32(ds1, vld1q_f32(xs.add(4))));
+            v = vfmsq_f32(v, dm0, vld1q_f32(xf));
+            acc[c] = vfmsq_f32(v, dm1, vld1q_f32(xf.add(4)));
+        }
+    }
+    finish(acc)
+}
+
+/// A super-block format unpacked to 16 vectors of 16 int8 values (vector k = elements 16k..16k+16),
+/// one integer scale per vector and a float factor: element = factor * sc[k] * w[k][i].
+trait Sb16 {
+    const TSZ: usize;
+    unsafe fn unpack(b: *const u8, w: &mut [int8x16_t; 16], sc: &mut [i8; 16]) -> f32;
+}
+
+unsafe fn sb16<const TC: usize, U: Sb16>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    let bpr = n_in / 32;
+    let mut acc = [vdupq_n_f32(0.0); TC];
+    for sb in 0..n_in / QK_K {
+        let mut w = [vdupq_n_s8(0); 16];
+        let mut scb = [0i8; 16];
+        let d = vdupq_n_f32(U::unpack(row.add(sb * U::TSZ), &mut w, &mut scb));
+        let sc = s8x16_to_s32(vld1q_s8(scb.as_ptr()));
+        for c in 0..TC {
+            let (a0, a1) = sums16(&w, &sc, x.q.add(c * n_in + sb * QK_K));
+            let xs = x.s.add(c * bpr + sb * 8);
+            let v = vfmaq_f32(acc[c], vcvtq_f32_s32(a0), vmulq_f32(d, vld1q_f32(xs)));
+            acc[c] = vfmaq_f32(v, vcvtq_f32_s32(a1), vmulq_f32(d, vld1q_f32(xs.add(4))));
+        }
+    }
+    finish(acc)
+}
+
+#[inline(always)]
+unsafe fn rd32(p: *const u8) -> u32 {
+    std::ptr::read_unaligned(p as *const u32)
+}
+#[inline(always)]
+unsafe fn rd64(p: *const u8) -> u64 {
+    std::ptr::read_unaligned(p as *const u64)
+}
+#[inline(always)]
+unsafe fn rd16(p: *const u8) -> u16 {
+    std::ptr::read_unaligned(p as *const u16)
+}
+
+/// Two 8-byte grid entries as one vector.
+#[inline(always)]
+unsafe fn grid2(a: u64, b: u64) -> uint8x16_t {
+    vcombine_u8(vcreate_u8(a), vcreate_u8(b))
+}
+/// Four 4-byte grid entries as one vector.
+#[inline(always)]
+unsafe fn grid4(a: u32, b: u32, c: u32, d: u32) -> uint8x16_t {
+    grid2(a as u64 | (b as u64) << 32, c as u64 | (d as u64) << 32)
+}
+/// `v` negated where `m` is all ones (`m` lanes are 0 or 0xFF).
+#[inline(always)]
+unsafe fn apply_signs(v: uint8x16_t, m: uint8x16_t) -> int8x16_t {
+    vreinterpretq_s8_u8(vsubq_u8(veorq_u8(v, m), m))
+}
+/// Sign masks for 32 elements from four sign bytes (bit j of byte l: element 8l + j negative).
+#[inline(always)]
+unsafe fn sign_masks(bytes: u32) -> (uint8x16_t, uint8x16_t) {
+    const IDX: [u8; 32] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    ];
+    const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    let v = vreinterpretq_u8_u32(vdupq_n_u32(bytes));
+    let bits = vld1q_u8(BITS.as_ptr());
+    (
+        vtstq_u8(vqtbl1q_u8(v, vld1q_u8(IDX.as_ptr())), bits),
+        vtstq_u8(vqtbl1q_u8(v, vld1q_u8(IDX.as_ptr().add(16))), bits),
+    )
+}
+
+/// `KSIGNS_IQ2XS` expanded to byte masks (entry i: 7 sign bits plus an even-parity eighth).
+static KSIGNS64: [u64; 128] = {
+    let mut t = [0u64; 128];
+    let mut i = 0usize;
+    while i < 128 {
+        let s = i | ((i.count_ones() as usize & 1) << 7);
+        let mut j = 0;
+        while j < 8 {
+            if s & (1 << j) != 0 {
+                t[i] |= 0xFF << (8 * j);
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    t
+};
+
+/// Q6_K: 16 sub-blocks of 16 with int8 scales; 4 low bits in `ql`, 2 high bits in `qh`.
+struct Q6K;
+impl Sb16 for Q6K {
+    const TSZ: usize = 210;
+    #[inline(always)]
+    unsafe fn unpack(b: *const u8, w: &mut [int8x16_t; 16], sc: &mut [i8; 16]) -> f32 {
+        let m4 = vdupq_n_u8(0x0F);
+        let m30 = vdupq_n_u8(0x30);
+        let b32 = vdupq_n_s8(32);
+        std::ptr::copy_nonoverlapping(b.add(192) as *const i8, sc.as_mut_ptr(), 16);
+        for n in 0..2 {
+            let ql = b.add(64 * n);
+            let qh = b.add(128 + 32 * n);
+            let (l0, l1, l2, l3) = (vld1q_u8(ql), vld1q_u8(ql.add(16)), vld1q_u8(ql.add(32)), vld1q_u8(ql.add(48)));
+            let (h0, h1) = (vld1q_u8(qh), vld1q_u8(qh.add(16)));
+            let q = [
+                vorrq_u8(vandq_u8(l0, m4), vandq_u8(vshlq_n_u8::<4>(h0), m30)),
+                vorrq_u8(vandq_u8(l1, m4), vandq_u8(vshlq_n_u8::<4>(h1), m30)),
+                vorrq_u8(vandq_u8(l2, m4), vandq_u8(vshlq_n_u8::<2>(h0), m30)),
+                vorrq_u8(vandq_u8(l3, m4), vandq_u8(vshlq_n_u8::<2>(h1), m30)),
+                vorrq_u8(vshrq_n_u8::<4>(l0), vandq_u8(h0, m30)),
+                vorrq_u8(vshrq_n_u8::<4>(l1), vandq_u8(h1, m30)),
+                vorrq_u8(vshrq_n_u8::<4>(l2), vandq_u8(vshrq_n_u8::<2>(h0), m30)),
+                vorrq_u8(vshrq_n_u8::<4>(l3), vandq_u8(vshrq_n_u8::<2>(h1), m30)),
+            ];
+            for i in 0..8 {
+                w[8 * n + i] = vsubq_s8(vreinterpretq_s8_u8(q[i]), b32);
+            }
+        }
+        f16p(b.add(208))
+    }
+}
+
+/// Q3_K: 16 sub-blocks of 16 with 6-bit scales; 2 low bits in `qs`, the third in `hmask`
+/// (clear = subtract 4).
+struct Q3K;
+impl Sb16 for Q3K {
+    const TSZ: usize = 110;
+    #[inline(always)]
+    unsafe fn unpack(b: *const u8, w: &mut [int8x16_t; 16], sc: &mut [i8; 16]) -> f32 {
+        let m3 = vdupq_n_u8(3);
+        let b4 = vdupq_n_u8(4);
+        let s4 = vdupq_n_s8(4);
+        let scb = q3k_scales(std::slice::from_raw_parts(b.add(96), 12));
+        vst1q_s8(sc.as_mut_ptr(), vsubq_s8(vld1q_s8(scb.as_ptr()), vdupq_n_s8(32)));
+        let (hm0, hm1) = (vld1q_u8(b), vld1q_u8(b.add(16)));
+        for n in 0..2 {
+            let (q0, q1) = (vld1q_u8(b.add(32 + 32 * n)), vld1q_u8(b.add(48 + 32 * n)));
+            for j in 0..4 {
+                let sh = vdupq_n_s8(-2 * j as i8);
+                let bit = vdupq_n_u8(1 << (4 * n + j));
+                let wa = vorrq_u8(vandq_u8(vshlq_u8(q0, sh), m3), vandq_u8(vtstq_u8(hm0, bit), b4));
+                let wb = vorrq_u8(vandq_u8(vshlq_u8(q1, sh), m3), vandq_u8(vtstq_u8(hm1, bit), b4));
+                w[8 * n + 2 * j] = vsubq_s8(vreinterpretq_s8_u8(wa), s4);
+                w[8 * n + 2 * j + 1] = vsubq_s8(vreinterpretq_s8_u8(wb), s4);
+            }
+        }
+        f16p(b.add(108))
+    }
+}
+
+/// IQ2_XXS: 8-value grid entries (256) with 7-bit sign patterns, a 4-bit scale per 32.
+struct Iq2Xxs;
+impl Sb16 for Iq2Xxs {
+    const TSZ: usize = 66;
+    #[inline(always)]
+    unsafe fn unpack(b: *const u8, w: &mut [int8x16_t; 16], sc: &mut [i8; 16]) -> f32 {
+        use super::tables::IQ2XXS_GRID as G;
+        unroll8!(ib, {
+            let (a0, a1) = (rd32(b.add(2 + 8 * ib)), rd32(b.add(6 + 8 * ib)));
+            let s = (2 * (a1 >> 28) + 1) as i8;
+            sc[2 * ib] = s;
+            sc[2 * ib + 1] = s;
+            for h in 0..2 {
+                let g = grid2(
+                    *G.get_unchecked(((a0 >> (16 * h)) & 255) as usize),
+                    *G.get_unchecked(((a0 >> (16 * h + 8)) & 255) as usize),
+                );
+                let m = grid2(
+                    *KSIGNS64.get_unchecked(((a1 >> (14 * h)) & 127) as usize),
+                    *KSIGNS64.get_unchecked(((a1 >> (14 * h + 7)) & 127) as usize),
+                );
+                w[2 * ib + h] = apply_signs(g, m);
+            }
+        });
+        f16p(b) * 0.125
+    }
+}
+
+/// IQ2_XS: 9-bit grid indices (512 entries) with 7-bit sign patterns, 4-bit scales per 16.
+struct Iq2Xs;
+impl Sb16 for Iq2Xs {
+    const TSZ: usize = 74;
+    #[inline(always)]
+    unsafe fn unpack(b: *const u8, w: &mut [int8x16_t; 16], sc: &mut [i8; 16]) -> f32 {
+        use super::tables::IQ2XS_GRID as G;
+        unroll8!(ib, {
+            let s = *b.add(66 + ib);
+            sc[2 * ib] = (2 * (s & 0xF) + 1) as i8;
+            sc[2 * ib + 1] = (2 * (s >> 4) + 1) as i8;
+            for h in 0..2 {
+                let q0 = rd16(b.add(2 + 2 * (4 * ib + 2 * h)));
+                let q1 = rd16(b.add(4 + 2 * (4 * ib + 2 * h)));
+                let g = grid2(*G.get_unchecked((q0 & 511) as usize), *G.get_unchecked((q1 & 511) as usize));
+                let m = grid2(
+                    *KSIGNS64.get_unchecked((q0 >> 9) as usize),
+                    *KSIGNS64.get_unchecked((q1 >> 9) as usize),
+                );
+                w[2 * ib + h] = apply_signs(g, m);
+            }
+        });
+        f16p(b) * 0.125
+    }
+}
+
+/// IQ2_S: 10-bit grid indices (1024 entries), explicit sign bytes, 4-bit scales per 16.
+struct Iq2S;
+impl Sb16 for Iq2S {
+    const TSZ: usize = 82;
+    #[inline(always)]
+    unsafe fn unpack(b: *const u8, w: &mut [int8x16_t; 16], sc: &mut [i8; 16]) -> f32 {
+        use super::tables::IQ2S_GRID as G;
+        unroll8!(ib, {
+            let s = *b.add(74 + ib);
+            sc[2 * ib] = (2 * (s & 0xF) + 1) as i8;
+            sc[2 * ib + 1] = (2 * (s >> 4) + 1) as i8;
+            let qh = *b.add(66 + ib) as usize;
+            let q4 = rd32(b.add(2 + 4 * ib)) as usize;
+            let idx = |l: usize| ((q4 >> (8 * l)) & 255) | ((qh << (8 - 2 * l)) & 0x300);
+            let (m0, m1) = sign_masks(rd32(b.add(34 + 4 * ib)));
+            w[2 * ib] = apply_signs(grid2(*G.get_unchecked(idx(0)), *G.get_unchecked(idx(1))), m0);
+            w[2 * ib + 1] = apply_signs(grid2(*G.get_unchecked(idx(2)), *G.get_unchecked(idx(3))), m1);
+        });
+        f16p(b) * 0.125
+    }
+}
+
+/// IQ3_XXS: 4-value grid entries (256) with 7-bit sign patterns, a 4-bit scale per 32.
+struct Iq3Xxs;
+impl Sb16 for Iq3Xxs {
+    const TSZ: usize = 98;
+    #[inline(always)]
+    unsafe fn unpack(b: *const u8, w: &mut [int8x16_t; 16], sc: &mut [i8; 16]) -> f32 {
+        use super::tables::IQ3XXS_GRID as G;
+        unroll8!(ib, {
+            let aux = rd32(b.add(66 + 4 * ib));
+            let s = (2 * (aux >> 28) + 1) as i8;
+            sc[2 * ib] = s;
+            sc[2 * ib + 1] = s;
+            let q8 = rd64(b.add(2 + 8 * ib)) as usize;
+            let g = |i: usize| *G.get_unchecked((q8 >> (8 * i)) & 255);
+            for h in 0..2 {
+                let v = grid4(g(4 * h), g(4 * h + 1), g(4 * h + 2), g(4 * h + 3));
+                let m = grid2(
+                    *KSIGNS64.get_unchecked(((aux >> (14 * h)) & 127) as usize),
+                    *KSIGNS64.get_unchecked(((aux >> (14 * h + 7)) & 127) as usize),
+                );
+                w[2 * ib + h] = apply_signs(v, m);
+            }
+        });
+        f16p(b) * 0.25
+    }
+}
+
+/// IQ3_S: 9-bit indices into 4-value grid entries (512), explicit sign bytes, 4-bit scales per 32.
+struct Iq3S;
+impl Sb16 for Iq3S {
+    const TSZ: usize = 110;
+    #[inline(always)]
+    unsafe fn unpack(b: *const u8, w: &mut [int8x16_t; 16], sc: &mut [i8; 16]) -> f32 {
+        use super::tables::IQ3S_GRID as G;
+        unroll8!(ib, {
+            let s = (1 + 2 * ((*b.add(106 + ib / 2) >> (4 * (ib % 2))) & 0xF)) as i8;
+            sc[2 * ib] = s;
+            sc[2 * ib + 1] = s;
+            let qh = *b.add(66 + ib) as usize;
+            let q8 = rd64(b.add(2 + 8 * ib)) as usize;
+            let g = |l: usize, k: usize| *G.get_unchecked(((q8 >> (16 * l + 8 * k)) & 255) | ((qh << (8 - 2 * l - k)) & 256));
+            let (m0, m1) = sign_masks(rd32(b.add(74 + 4 * ib)));
+            w[2 * ib] = apply_signs(grid4(g(0, 0), g(0, 1), g(1, 0), g(1, 1)), m0);
+            w[2 * ib + 1] = apply_signs(grid4(g(2, 0), g(2, 1), g(3, 0), g(3, 1)), m1);
+        });
+        f16p(b)
+    }
+}
+
+/// IQ1_S: 11-bit indices into ternary grid entries, `q = 8 * grid +- 1` (the +-1/8 delta), 3-bit
+/// scales per 32.
+struct Iq1S;
+impl Sb16 for Iq1S {
+    const TSZ: usize = 50;
+    #[inline(always)]
+    unsafe fn unpack(b: *const u8, w: &mut [int8x16_t; 16], sc: &mut [i8; 16]) -> f32 {
+        use super::tables::IQ1S_GRID as G;
+        unroll8!(ib, {
+            let qh = rd16(b.add(34 + 2 * ib)) as usize;
+            let s = (2 * ((qh >> 12) & 7) + 1) as i8;
+            sc[2 * ib] = s;
+            sc[2 * ib + 1] = s;
+            let delta = vdupq_n_s8(if qh & 0x8000 != 0 { -1 } else { 1 });
+            let q4 = rd32(b.add(2 + 4 * ib)) as usize;
+            let g = |l: usize| *G.get_unchecked(((q4 >> (8 * l)) & 255) | (((qh >> (3 * l)) & 7) << 8));
+            for h in 0..2 {
+                let v = vreinterpretq_s8_u8(grid2(g(2 * h), g(2 * h + 1)));
+                w[2 * ib + h] = vaddq_s8(vshlq_n_s8::<3>(v), delta);
+            }
+        });
+        f16p(b) * 0.125
+    }
+}
+
+/// IQ1_M: like IQ1_S with the delta sign per 8 values, 3-bit scales per 16 and the f16 super-block
+/// scale spread over the top nibbles of the scale words.
+struct Iq1M;
+impl Sb16 for Iq1M {
+    const TSZ: usize = 56;
+    #[inline(always)]
+    unsafe fn unpack(b: *const u8, w: &mut [int8x16_t; 16], sc: &mut [i8; 16]) -> f32 {
+        use super::tables::IQ1S_GRID as G;
+        let s = [rd16(b.add(48)), rd16(b.add(50)), rd16(b.add(52)), rd16(b.add(54))];
+        let d = f16_to_f32((s[0] >> 12) | ((s[1] >> 8) & 0x00f0) | ((s[2] >> 4) & 0x0f00) | (s[3] & 0xf000));
+        unroll8!(ib, {
+            let sv = s[ib / 2] >> (6 * (ib % 2));
+            sc[2 * ib] = (2 * (sv & 7) + 1) as i8;
+            sc[2 * ib + 1] = (2 * ((sv >> 3) & 7) + 1) as i8;
+            for h in 0..2 {
+                let qh = *b.add(32 + 2 * ib + h) as usize;
+                let q = b.add(4 * ib + 2 * h);
+                let v = vreinterpretq_s8_u8(grid2(
+                    *G.get_unchecked(*q as usize | ((qh << 8) & 0x700)),
+                    *G.get_unchecked(*q.add(1) as usize | ((qh << 4) & 0x700)),
+                ));
+                let dl = |bit: usize| if qh & bit != 0 { -1 } else { 1 };
+                let delta = vcombine_s8(vdup_n_s8(dl(0x08)), vdup_n_s8(dl(0x80)));
+                w[2 * ib + h] = vaddq_s8(vshlq_n_s8::<3>(v), delta);
+            }
+        });
+        d * 0.125
+    }
+}
+
+/// Q2_K: 16 sub-blocks of 16 with 4-bit scales and 4-bit mins.
+unsafe fn q2k<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    let bpr = n_in / 32;
+    let m3 = vdupq_n_u8(3);
+    let mut acc = [vdupq_n_f32(0.0); TC];
+    for sb in 0..n_in / QK_K {
+        let b = row.add(sb * 84);
+        let d = vdupq_n_f32(f16p(b.add(80)));
+        let dmin = vdupq_n_f32(f16p(b.add(82)));
+        let sm = vld1q_u8(b);
+        let sc = s8x16_to_s32(vreinterpretq_s8_u8(vandq_u8(sm, vdupq_n_u8(0x0F))));
+        let mn = s8x16_to_s32(vreinterpretq_s8_u8(vshrq_n_u8::<4>(sm)));
+        let mnf = [
+            vcvtq_f32_s32(mn[0]),
+            vcvtq_f32_s32(mn[1]),
+            vcvtq_f32_s32(mn[2]),
+            vcvtq_f32_s32(mn[3]),
+        ];
+        let mut w = [vdupq_n_s8(0); 16];
+        for n in 0..2 {
+            let (q0, q1) = (vld1q_u8(b.add(16 + 32 * n)), vld1q_u8(b.add(32 + 32 * n)));
+            for j in 0..4 {
+                let sh = vdupq_n_s8(-2 * j as i8);
+                w[8 * n + 2 * j] = vreinterpretq_s8_u8(vandq_u8(vshlq_u8(q0, sh), m3));
+                w[8 * n + 2 * j + 1] = vreinterpretq_s8_u8(vandq_u8(vshlq_u8(q1, sh), m3));
+            }
+        }
+        for c in 0..TC {
+            let (a0, a1) = sums16(&w, &sc, x.q.add(c * n_in + sb * QK_K));
+            let xs = x.s.add(c * bpr + sb * 8);
+            let xh = x.h.add(c * bpr * 2 + sb * 16);
+            let mut v = vfmaq_f32(acc[c], vcvtq_f32_s32(a0), vmulq_f32(d, vld1q_f32(xs)));
+            v = vfmaq_f32(v, vcvtq_f32_s32(a1), vmulq_f32(d, vld1q_f32(xs.add(4))));
+            let mut t = vmulq_f32(mnf[0], vld1q_f32(xh));
+            t = vfmaq_f32(t, mnf[1], vld1q_f32(xh.add(4)));
+            t = vfmaq_f32(t, mnf[2], vld1q_f32(xh.add(8)));
+            t = vfmaq_f32(t, mnf[3], vld1q_f32(xh.add(12)));
+            acc[c] = vfmsq_f32(v, t, dmin);
+        }
+    }
+    finish(acc)
+}
+
+/// IQ4_XS: 8 sub-blocks of 32, non-linear 4-bit values (table lookup), 6-bit scales.
+unsafe fn iq4xs<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    let bpr = n_in / 32;
+    let m4 = vdupq_n_u8(0x0F);
+    let kv = vld1q_s8(KVALUES_IQ4NL.as_ptr());
+    let mut acc = [vdupq_n_f32(0.0); TC];
+    for sb in 0..n_in / QK_K {
+        let b = row.add(sb * 136);
+        let d = f16p(b);
+        let sh = std::ptr::read_unaligned(b.add(2) as *const u16) as u32;
+        let mut ls = [0f32; 8];
+        unroll8!(ib, {
+            let l = ((*b.add(4 + ib / 2) >> (4 * (ib % 2))) & 0xF) as u32 | (((sh >> (2 * ib)) & 3) << 4);
+            ls[ib] = l as f32 - 32.0;
+        });
+        let ds0 = vmulq_n_f32(vld1q_f32(ls.as_ptr()), d);
+        let ds1 = vmulq_n_f32(vld1q_f32(ls.as_ptr().add(4)), d);
+        let mut w = [vdupq_n_s8(0); 16];
+        unroll8!(ib, {
+            let v = vld1q_u8(b.add(8 + 16 * ib));
+            w[2 * ib] = vqtbl1q_s8(kv, vandq_u8(v, m4));
+            w[2 * ib + 1] = vqtbl1q_s8(kv, vshrq_n_u8::<4>(v));
+        });
+        for c in 0..TC {
+            let (a0, a1) = sums32(&w, x.q.add(c * n_in + sb * QK_K));
+            let xs = x.s.add(c * bpr + sb * 8);
+            let v = vfmaq_f32(acc[c], vcvtq_f32_s32(a0), vmulq_f32(ds0, vld1q_f32(xs)));
+            acc[c] = vfmaq_f32(v, vcvtq_f32_s32(a1), vmulq_f32(ds1, vld1q_f32(xs.add(4))));
+        }
+    }
+    finish(acc)
+}
+
+/// Q8_0: blocks of 32 int8 with an f16 scale, four blocks per step.
+unsafe fn q8_0<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    let bpr = n_in / 32;
+    let zero = vdupq_n_s32(0);
+    let mut acc = [vdupq_n_f32(0.0); TC];
+    let mut blk = 0;
+    while blk + 4 <= bpr {
+        let b = row.add(blk * 34);
+        let mut dh = [0u16; 4];
+        let mut w = [vdupq_n_s8(0); 8];
+        for k in 0..4 {
+            dh[k] = std::ptr::read_unaligned(b.add(34 * k) as *const u16);
+            w[2 * k] = vld1q_s8(b.add(34 * k + 2) as *const i8);
+            w[2 * k + 1] = vld1q_s8(b.add(34 * k + 18) as *const i8);
+        }
+        let dv = f16x4_to_f32(dh.as_ptr());
+        for c in 0..TC {
+            let xq = x.q.add(c * n_in + blk * 32);
+            let mut a = [zero; 4];
+            for k in 0..4 {
+                a[k] = sdot(
+                    sdot(zero, w[2 * k], vld1q_s8(xq.add(32 * k))),
+                    w[2 * k + 1],
+                    vld1q_s8(xq.add(32 * k + 16)),
+                );
+            }
+            let s = vpaddq_s32(vpaddq_s32(a[0], a[1]), vpaddq_s32(a[2], a[3]));
+            acc[c] = vfmaq_f32(acc[c], vcvtq_f32_s32(s), vmulq_f32(dv, vld1q_f32(x.s.add(c * bpr + blk))));
+        }
+        blk += 4;
+    }
+    let mut out = finish(acc);
+    while blk < bpr {
+        let b = row.add(blk * 34);
+        let (w0, w1) = (vld1q_s8(b.add(2) as *const i8), vld1q_s8(b.add(18) as *const i8));
+        let d = f16p(b);
+        for c in 0..TC {
+            let xq = x.q.add(c * n_in + blk * 32);
+            let s = vaddvq_s32(sdot(sdot(zero, w0, vld1q_s8(xq)), w1, vld1q_s8(xq.add(16))));
+            out[c] += s as f32 * d * *x.s.add(c * bpr + blk);
+        }
+        blk += 1;
+    }
+    out
+}
+
+/// The blocks-of-32 nibble formats (`q32` kernel parameter).
+const Q4_0: u8 = 0;
+const IQ4_NL: u8 = 1;
+const Q4_1: u8 = 2;
+const Q5_0: u8 = 3;
+const Q5_1: u8 = 4;
+
+/// Q4_0, IQ4_NL, Q4_1, Q5_0 and Q5_1 (`K`): blocks of 32 with an f16 scale (and an f16 min for
+/// Q4_1 / Q5_1), nibbles plus, for Q5, a fifth bit per element in a 32-bit word; four blocks per step.
+unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    let (tsz, qs) = match K {
+        Q4_0 | IQ4_NL => (18, 2),
+        Q4_1 => (20, 4),
+        Q5_0 => (22, 6),
+        _ => (24, 8),
+    };
+    let has_min = K == Q4_1 || K == Q5_1;
+    let bpr = n_in / 32;
+    let zero = vdupq_n_s32(0);
+    let m4 = vdupq_n_u8(0x0F);
+    let kv = vld1q_s8(KVALUES_IQ4NL.as_ptr());
+    // The 32 weights of the block at `b` as two vectors (elements 0..16, 16..32).
+    let unpack = |b: *const u8| -> (int8x16_t, int8x16_t) {
+        let v = vld1q_u8(b.add(qs));
+        let (mut lo, mut hi) = (vandq_u8(v, m4), vshrq_n_u8::<4>(v));
+        if K == Q5_0 || K == Q5_1 {
+            let (h0, h1) = sign_masks(rd32(b.add(qs - 4)));
+            let b16 = vdupq_n_u8(16);
+            lo = vorrq_u8(lo, vandq_u8(h0, b16));
+            hi = vorrq_u8(hi, vandq_u8(h1, b16));
+        }
+        let (lo, hi) = (vreinterpretq_s8_u8(lo), vreinterpretq_s8_u8(hi));
+        match K {
+            IQ4_NL => (vqtbl1q_s8(kv, vreinterpretq_u8_s8(lo)), vqtbl1q_s8(kv, vreinterpretq_u8_s8(hi))),
+            Q4_0 => (vsubq_s8(lo, vdupq_n_s8(8)), vsubq_s8(hi, vdupq_n_s8(8))),
+            Q5_0 => (vsubq_s8(lo, vdupq_n_s8(16)), vsubq_s8(hi, vdupq_n_s8(16))),
+            _ => (lo, hi),
+        }
+    };
+    let mut acc = [vdupq_n_f32(0.0); TC];
+    let mut blk = 0;
+    while blk + 4 <= bpr {
+        let b = row.add(blk * tsz);
+        let (mut dh, mut mh) = ([0u16; 4], [0u16; 4]);
+        let mut w = [vdupq_n_s8(0); 8];
+        for k in 0..4 {
+            dh[k] = rd16(b.add(tsz * k));
+            mh[k] = rd16(b.add(tsz * k + 2));
+            (w[2 * k], w[2 * k + 1]) = unpack(b.add(tsz * k));
+        }
+        let dv = f16x4_to_f32(dh.as_ptr());
+        let mv = if has_min { f16x4_to_f32(mh.as_ptr()) } else { vdupq_n_f32(0.0) };
+        for c in 0..TC {
+            let xq = x.q.add(c * n_in + blk * 32);
+            let mut a = [zero; 4];
+            for k in 0..4 {
+                a[k] = sdot(
+                    sdot(zero, w[2 * k], vld1q_s8(xq.add(32 * k))),
+                    w[2 * k + 1],
+                    vld1q_s8(xq.add(32 * k + 16)),
+                );
+            }
+            let s = vpaddq_s32(vpaddq_s32(a[0], a[1]), vpaddq_s32(a[2], a[3]));
+            let mut v = vfmaq_f32(acc[c], vcvtq_f32_s32(s), vmulq_f32(dv, vld1q_f32(x.s.add(c * bpr + blk))));
+            if has_min {
+                v = vfmaq_f32(v, mv, vld1q_f32(x.f.add(c * bpr + blk)));
+            }
+            acc[c] = v;
+        }
+        blk += 4;
+    }
+    let mut out = finish(acc);
+    while blk < bpr {
+        let b = row.add(blk * tsz);
+        let (w0, w1) = unpack(b);
+        let d = f16p(b);
+        for c in 0..TC {
+            let xq = x.q.add(c * n_in + blk * 32);
+            let s = vaddvq_s32(sdot(sdot(zero, w0, vld1q_s8(xq)), w1, vld1q_s8(xq.add(16))));
+            out[c] += s as f32 * d * *x.s.add(c * bpr + blk);
+            if has_min {
+                out[c] += f16p(b.add(2)) * *x.f.add(c * bpr + blk);
+            }
+        }
+        blk += 1;
+    }
+    out
+}

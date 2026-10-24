@@ -3,7 +3,6 @@
 // The tile macros expand `r + $R <= rows` with `$R` = 1 in one instance.
 #![allow(clippy::int_plus_one)]
 
-#[cfg(any(feature = "gpu", target_arch = "aarch64"))]
 use oxinfer::quant;
 use oxinfer::{kernels, pool};
 use std::time::Instant;
@@ -79,6 +78,7 @@ fn bench_gpu(n_out: usize, n_in: usize) {
                 WeightRef::Bf16(w) => kernels::matmul(w, n_out, n_in, &x, t, &mut y_ref),
                 WeightRef::Q8(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y_ref[..])], &x, t),
                 WeightRef::Q4(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y_ref[..])], &x, t),
+                WeightRef::Gguf(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y_ref[..])], &x, t),
             }
             let mut y = vec![0f32; t * n_out];
             let mut best_gpu = f64::MAX;
@@ -93,6 +93,7 @@ fn bench_gpu(n_out: usize, n_in: usize) {
                     WeightRef::Bf16(w) => WeightRef::Bf16(w),
                     WeightRef::Q8(m) => WeightRef::Q8(m),
                     WeightRef::Q4(m) => WeightRef::Q4(m),
+                    WeightRef::Gguf(m) => WeightRef::Gguf(m),
                 };
                 let mut jobs = [gpu::Job {
                     w: wr2,
@@ -113,6 +114,7 @@ fn bench_gpu(n_out: usize, n_in: usize) {
                     WeightRef::Bf16(w) => kernels::matmul(w, n_out, n_in, &x, t, &mut y_ref),
                     WeightRef::Q8(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y_ref[..])], &x, t),
                     WeightRef::Q4(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y_ref[..])], &x, t),
+                    WeightRef::Gguf(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y_ref[..])], &x, t),
                 }
                 best_cpu = best_cpu.min(ti.elapsed().as_secs_f64());
             }
@@ -138,7 +140,84 @@ fn bench_gpu(n_out: usize, n_in: usize) {
     }
 }
 
+/// `membench gguf [n_out n_in [threads]]`: decode matmul throughput of the GGUF formats against
+/// oxinfer's Q4 / Q8, over enough copies of the matrix (>= 1.5 GB) that the caches do not help.
+fn bench_gguf(n_out: usize, n_in: usize, threads: usize) {
+    use oxinfer::ggml::{GgmlType, GgufMatrix};
+    use oxinfer::kernels::QMat;
+    pool::init(threads);
+    let mut seed = 1u64;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as u32
+    };
+    fn run<M: QMat>(name: &str, ms: &[M], n_in: usize, rnd: &mut dyn FnMut() -> u32) {
+        let n_out = ms[0].n_out();
+        let mut line = format!("  {name:<8} {:>6.1} MB", ms[0].bytes() as f64 / 1e6);
+        for t in [1usize, 2, 4] {
+            let x: Vec<f32> = (0..t * n_in).map(|_| (rnd() % 2001) as f32 / 1000.0 - 1.0).collect();
+            let mut y = vec![0f32; t * n_out];
+            let mut best = 0f64;
+            // REPEAT=n: n passes per timing (for cache-resident runs with COPIES=1).
+            let repeat: usize = std::env::var("REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+            for _ in 0..if repeat > 1 { 20 } else { 5 } {
+                let t0 = Instant::now();
+                for _ in 0..repeat {
+                    for m in ms {
+                        kernels::matmul_quant_multi(&mut [(m, &mut y[..])], &x, t);
+                    }
+                }
+                best = best.max((ms[0].bytes() * ms.len() * repeat) as f64 / t0.elapsed().as_secs_f64() / 1e9);
+            }
+            std::hint::black_box(&y);
+            line += &format!(" | t={t} {best:>6.1} GB/s {:>6.2} ms", ms[0].bytes() as f64 / best / 1e6);
+        }
+        println!("{line}");
+    }
+    let copies = |bytes: usize| match std::env::var("COPIES").ok().and_then(|v| v.parse().ok()) {
+        Some(n) => n,
+        None => (1_500_000_000 / bytes).max(2),
+    };
+    println!("decode matmul [{n_out} x {n_in}], {threads} threads (GB/s of weight bytes, ms per matrix):");
+    {
+        let wb: Vec<u16> = (0..n_out * n_in)
+            .map(|_| (0x3c00 + rnd() % 0x800) as u16 ^ ((rnd() & 1) << 15) as u16)
+            .collect();
+        let q4 = quant::quantize_q4(&wb, n_out, n_in);
+        let n = copies(q4.bytes());
+        let q4s: Vec<_> = (0..n).map(|_| quant::quantize_q4(&wb, n_out, n_in)).collect();
+        run("Q4", &q4s, n_in, &mut rnd);
+        drop(q4s);
+        let q8 = quant::quantize_bf16(&wb, n_out, n_in);
+        let q8s: Vec<_> = (0..copies(q8.bytes())).map(|_| quant::quantize_bf16(&wb, n_out, n_in)).collect();
+        run("Q8", &q8s, n_in, &mut rnd);
+    }
+    let kinds: Vec<GgmlType> = match std::env::var("KINDS") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|k| GgmlType::ALL.into_iter().find(|t| t.name() == k))
+            .collect(),
+        Err(_) => GgmlType::ALL.into_iter().filter(|k| !k.is_float()).collect(),
+    };
+    for kind in kinds {
+        if !n_in.is_multiple_of(kind.block_size()) {
+            continue;
+        }
+        let bytes = n_out * kind.row_bytes(n_in);
+        let raw: Vec<u8> = (0..bytes).map(|_| rnd() as u8).collect();
+        let ms: Vec<_> = (0..copies(bytes))
+            .map(|_| GgufMatrix::from_bytes(kind, &raw, n_out, n_in).unwrap())
+            .collect();
+        run(kind.name(), &ms, n_in, &mut rnd);
+    }
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("gguf") {
+        let arg = |i: usize, d: usize| std::env::args().nth(i).and_then(|s| s.parse().ok()).unwrap_or(d);
+        bench_gguf(arg(2, 17408), arg(3, 5120), arg(4, 12));
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("gpu") {
         #[cfg(feature = "gpu")]
         {

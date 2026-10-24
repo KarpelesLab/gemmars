@@ -2,6 +2,7 @@
 //! registry chosen at start-up from the platform detection. Every backend is optional at run time;
 //! the CPU kernels remain the reference path and the fallback.
 
+use crate::ggml::GgufMatrix;
 use crate::quant::{Q4Matrix, QMatrix};
 use std::any::Any;
 use std::sync::OnceLock;
@@ -11,6 +12,8 @@ pub enum WeightRef<'a> {
     Bf16(&'a [u16]),
     Q8(&'a QMatrix),
     Q4(&'a Q4Matrix),
+    /// llama.cpp block formats: no device kernels yet, every backend declines them (CPU path).
+    Gguf(&'a GgufMatrix),
 }
 
 impl WeightRef<'_> {
@@ -19,6 +22,7 @@ impl WeightRef<'_> {
             WeightRef::Bf16(w) => w.len() * 2,
             WeightRef::Q8(m) => m.bytes(),
             WeightRef::Q4(m) => m.bytes(),
+            WeightRef::Gguf(m) => m.bytes(),
         }
     }
 }

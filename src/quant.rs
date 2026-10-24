@@ -197,6 +197,8 @@ pub struct QAct {
     pub sums: Vec<i32>,
     /// Exact f32 sum of each block (for the per-group offsets of affine Q4 matrices).
     pub fsums: Vec<f32>,
+    /// Exact f32 sum of each half block of 16 (for the per-16 mins of GGUF Q2_K weights).
+    pub hsums: Vec<f32>,
     pub t: usize,
     pub n_in: usize,
 }
@@ -209,6 +211,7 @@ pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
     let mut scales = vec![0f32; t * bpr];
     let mut sums = vec![0i32; t * bpr];
     let mut fsums = vec![0f32; t * bpr];
+    let mut hsums = vec![0f32; t * bpr * 2];
     for ti in 0..t {
         let row = &x[ti * n_in..(ti + 1) * n_in];
         for b in 0..bpr {
@@ -223,6 +226,9 @@ pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
                 s += qi as i32;
             }
             sums[ti * bpr + b] = s;
+            let (h0, h1): (f32, f32) = (blk[..16].iter().sum(), blk[16..].iter().sum());
+            hsums[(ti * bpr + b) * 2] = h0;
+            hsums[(ti * bpr + b) * 2 + 1] = h1;
             fsums[ti * bpr + b] = blk.iter().sum();
         }
     }
@@ -231,6 +237,7 @@ pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
         scales,
         sums,
         fsums,
+        hsums,
         t,
         n_in,
     }

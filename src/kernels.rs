@@ -876,6 +876,11 @@ pub trait QMat: Sync {
     fn n_in(&self) -> usize;
     fn bytes(&self) -> usize;
     fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]);
+    /// Float storage (GGUF F32/F16/BF16): decode also takes the dequantize + f32 GEMM path, so
+    /// the activations are not rounded to int8.
+    fn dense(&self) -> bool {
+        false
+    }
     /// Decode: rows `r0..r1` against quantized activation row `c` of `xa`, into `y[r]`.
     unsafe fn rows_t1(&self, xa: &QAct, c: usize, y: *mut f32, r0: usize, r1: usize);
     /// Decode: rows `r0..r1` against activation rows `c0..c0+tc` (tc in 2..=4), into `y[(c0+c)*n_out + r]`.
@@ -1142,50 +1147,40 @@ pub fn matmul_quant_multi<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: 
             r = r1;
         }
     }
-    if t >= 8 {
-        let xt = pack_xt(x, t, n_in);
-        let (tchunks, tc) = token_split(blocks.len(), t, nthreads);
-        pool::run(blocks.len() * tchunks, &|b| {
-            let (j, r0, r1) = blocks[b / tchunks];
+    // Prefill (and float-stored weights at any t): dequantize + f32 GEMM. Decode: int8 dot products.
+    let dense = |m: &M| t >= 8 || m.dense();
+    let xt = refs.iter().any(|j| dense(j.m)).then(|| pack_xt(x, t, n_in));
+    let xa = refs.iter().any(|j| !dense(j.m)).then(|| quantize_act(x, t, n_in));
+    let (tchunks, tc) = if t >= 8 { token_split(blocks.len(), t, nthreads) } else { (1, t) };
+    pool::run(blocks.len() * tchunks, &|b| {
+        let (j, r0, r1) = blocks[b / tchunks];
+        let job = refs[j as usize];
+        let (r0, r1) = (r0 as usize, r1 as usize);
+        if dense(job.m) {
             let c0 = (b % tchunks) * tc;
             if c0 >= t {
                 return;
             }
             let c1 = (c0 + tc).min(t);
-            let job = refs[j as usize];
             let xs = &x[c0 * n_in..c1 * n_in];
-            let xts = &xt[c0 / TN * n_in * TN..];
+            let xts = &xt.as_deref().unwrap()[c0 / TN * n_in * TN..];
+            unsafe { matmul_quant_block_prefill(job.m, xs, xts, c1 - c0, r0, r1, job.y.get().add(c0 * job.m.n_out())) }
+            return;
+        }
+        let xa = xa.as_ref().unwrap();
+        let mut c = 0;
+        while c < t {
+            let tc = (t - c).min(4);
             unsafe {
-                matmul_quant_block_prefill(
-                    job.m,
-                    xs,
-                    xts,
-                    c1 - c0,
-                    r0 as usize,
-                    r1 as usize,
-                    job.y.get().add(c0 * job.m.n_out()),
-                )
-            }
-        });
-    } else {
-        let xa = quantize_act(x, t, n_in);
-        pool::run(blocks.len(), &|b| {
-            let (j, r0, r1) = blocks[b];
-            let job = refs[j as usize];
-            let mut c = 0;
-            while c < t {
-                let tc = (t - c).min(4);
-                unsafe {
-                    if tc == 1 {
-                        job.m.rows_t1(&xa, c, job.y.get().add(c * job.m.n_out()), r0 as usize, r1 as usize)
-                    } else {
-                        job.m.rows_tc(&xa, c, tc, job.y.get(), r0 as usize, r1 as usize)
-                    }
+                if tc == 1 {
+                    job.m.rows_t1(xa, c, job.y.get().add(c * job.m.n_out()), r0, r1)
+                } else {
+                    job.m.rows_tc(xa, c, tc, job.y.get(), r0, r1)
                 }
-                c += tc;
             }
-        });
-    }
+            c += tc;
+        }
+    });
 }
 
 /// Prefill with quantized weights: dequantize 8 rows at a time into a thread-local f32 scratch
