@@ -543,6 +543,12 @@ impl Backend for CudaBackend {
     }
 
     fn upload(&self, w: &WeightRef, _n_out: usize, _n_in: usize) -> Option<DeviceWeight> {
+        // Affine Q4 (MLX) has no device kernel yet; those layers run on the CPU.
+        if let WeightRef::Q4(m) = w
+            && m.offsets.is_some()
+        {
+            return None;
+        }
         let cw = match w {
             WeightRef::Bf16(w) => CudaWeight {
                 data: self.upload_bytes(w.as_ptr() as *const u8, w.len() * 2)?,

@@ -936,12 +936,33 @@ impl Q4Matrix {
                 _ => unreachable!("bad tc {tc}"),
             }
         }
+        #[cfg(has_simd)]
+        for c in c0..c0 + tc {
+            self.add_offsets(xa, c, y.add(c * self.n_out), r0, r1);
+        }
         #[cfg(not(has_simd))]
         {
             let _ = (xq, xs, xsums);
             for c in 0..tc {
                 self.rows_t1(xa, c0 + c, y.add((c0 + c) * self.n_out), r0, r1);
             }
+        }
+    }
+
+    /// Adds the per-group offsets of an affine matrix: `y[r] += sum_g offset[r][g] * sum(x in g)`
+    /// for activation row `c` (the SIMD dot products cover only the `d * (q - 8)` part).
+    #[cfg(has_simd)]
+    unsafe fn add_offsets(&self, xa: &QAct, c: usize, y: *mut f32, r0: usize, r1: usize) {
+        let Some(o) = &self.offsets else { return };
+        let bpr = self.n_in / QBLOCK;
+        let k = o.group / QBLOCK;
+        let gpr = self.n_in / o.group;
+        let fs = &xa.fsums[c * bpr..(c + 1) * bpr];
+        let gs: Vec<f32> = fs.chunks(k).map(|ch| ch.iter().sum()).collect();
+        for r in r0..r1 {
+            let orow = &o.v[r * gpr..(r + 1) * gpr];
+            let acc: f32 = orow.iter().zip(&gs).map(|(&m, &g)| bf16_to_f32(m) * g).sum();
+            *y.add(r) += acc;
         }
     }
 }
@@ -967,6 +988,7 @@ impl QMat for Q4Matrix {
         #[cfg(has_simd)]
         {
             simd::q4_rows_t1(self, xq, xs, xsums, y, r0, r1);
+            self.add_offsets(xa, c, y, r0, r1);
         }
         #[cfg(not(has_simd))]
         {
@@ -1247,6 +1269,21 @@ pub fn rmsnorm_f32w_rows(x: &[f32], n: usize, w: &[f32], eps: f32, out: &mut [f3
     for_chunks(out, n, par, |i, o| rmsnorm_f32w(&x[i * n..(i + 1) * n], w, eps, o));
 }
 
+pub fn rmsnorm_f32w_inplace(x: &mut [f32], w: &[f32], eps: f32) {
+    let n = x.len();
+    let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32 + eps;
+    let r = ss.powf(-0.5);
+    for i in 0..n {
+        x[i] *= r * w[i];
+    }
+}
+
+pub fn rmsnorm_f32w_rows_inplace(x: &mut [f32], n: usize, w: &[f32], eps: f32) {
+    let _timer = prof::start(Cat::Norm);
+    let par = x.len() > 4 * n;
+    for_chunks(x, n, par, |_, xi| rmsnorm_f32w_inplace(xi, w, eps));
+}
+
 /// a[i] = silu(a[i]) * b[i]
 pub fn silu_mul(a: &mut [f32], b: &[f32]) {
     let _timer = prof::start(Cat::Elementwise);
@@ -1435,6 +1472,52 @@ mod tests {
             scale = scale.max(b.abs());
         }
         assert!(max <= 1e-4 * scale.max(1.0), "{name}: max abs diff {max} (scale {scale})");
+    }
+
+    #[test]
+    fn mlx_affine_q4_matches_reference() {
+        crate::pool::init(2);
+        let (n_out, n_in, group) = (37usize, 4096 + 64, 64usize);
+        let gpr = n_in / group;
+        let mut seed = 7u64;
+        let words: Vec<u32> = (0..n_out * n_in / 8)
+            .map(|_| lcg(&mut seed).to_bits() ^ (lcg(&mut seed).to_bits() << 7))
+            .collect();
+        let bf = |v: f32| half::bf16::from_f32(v).to_bits();
+        let scales: Vec<u16> = (0..n_out * gpr).map(|_| bf(0.002 + 0.01 * lcg(&mut seed).abs())).collect();
+        let biases: Vec<u16> = (0..n_out * gpr)
+            .map(|i| bf(-8.0 * crate::kernels::bf16_to_f32(scales[i]) + 0.01 * lcg(&mut seed)))
+            .collect();
+        // Exact MLX values.
+        let mut exact = vec![0f32; n_out * n_in];
+        for r in 0..n_out {
+            crate::quant::mlx_dequant_row(
+                &words[r * n_in / 8..(r + 1) * n_in / 8],
+                &scales[r * gpr..(r + 1) * gpr],
+                &biases[r * gpr..(r + 1) * gpr],
+                4,
+                group,
+                &mut exact[r * n_in..(r + 1) * n_in],
+            );
+        }
+        let m = crate::quant::from_mlx_q4(&words, &scales, &biases, n_out, n_in, group);
+        let mut conv = vec![0f32; n_out * n_in];
+        dequantize_rows_q4(&m, 0, n_out, &mut conv);
+        let err = exact.iter().zip(&conv).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(err < 2e-4, "repacked values differ by {err}");
+        for t in [1usize, 2, 3, 5, 9] {
+            let x: Vec<f32> = (0..t * n_in).map(|_| lcg(&mut seed)).collect();
+            let yr = reference(&exact, n_out, n_in, &x, t);
+            let mut y = vec![0f32; t * n_out];
+            matmul_quant_multi(&mut [(&m, &mut y[..])], &x, t);
+            let (mut max, mut scale) = (0f32, 0f32);
+            for (a, b) in y.iter().zip(&yr) {
+                max = max.max((a - b).abs());
+                scale = scale.max(b.abs());
+            }
+            // int8 activations: ~1% of the output range.
+            assert!(max <= 1e-2 * scale.max(1.0), "t={t}: max abs diff {max} (scale {scale})");
+        }
     }
 
     #[test]

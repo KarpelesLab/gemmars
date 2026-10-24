@@ -46,8 +46,8 @@ pub(crate) fn log(s: &str) {
 }
 
 enum Lm {
-    Gemma(Model<'static>, Session),
-    Qwen(QwenModel<'static>, QwenSession, &'static QwenChat),
+    Gemma(Box<Model<'static>>, Session),
+    Qwen(Box<QwenModel<'static>>, QwenSession, &'static QwenChat),
 }
 
 impl Lm {
@@ -65,6 +65,7 @@ impl Lm {
     }
     fn fmt(&self) -> &'static dyn ChatFormat {
         match self {
+            Lm::Gemma(m, _) if m.cfg.gemma3 => &crate::chat::Gemma3Chat,
             Lm::Gemma(..) => &GemmaChat,
             Lm::Qwen(.., f) => *f,
         }
@@ -190,12 +191,12 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
         let cfg = config::QwenConfig::load(dir)?;
         let m = QwenModel::load(cfg, files, quant)?;
         let s = m.new_session();
-        Lm::Qwen(m, s, QwenChat::for_model(dir))
+        Lm::Qwen(Box::new(m), s, QwenChat::for_model(dir))
     } else {
         let cfg = config::TextConfig::load(dir)?;
         let m = Model::load(cfg, files, quant)?;
         let s = m.new_session();
-        Lm::Gemma(m, s)
+        Lm::Gemma(Box::new(m), s)
     };
     let (layers, hidden, streamed, stored) = match &lm {
         Lm::Gemma(m, _) => (m.cfg.num_hidden_layers, m.cfg.hidden_size, m.streamed_bytes(), m.quant),
@@ -294,14 +295,14 @@ pub unsafe extern "C" fn web_chat_turn(
 impl Engine {
     fn chat_turn(&mut self, user: &str, system: Option<&str>, think: bool, max_tokens: usize) -> Result<usize> {
         let fmt = self.lm.fmt();
-        let mut text = String::new();
-        if self.turns == 0 {
-            text.push_str(&fmt.conversation_start_tools(system, think, &self.tools));
+        let text = if self.turns == 0 {
+            fmt.first_turn(system, think, &self.tools, user)
         } else if !self.out.is_empty() {
             // The previous reply ended (with or without its stop token); close the model turn.
-            text.push_str(&fmt.end_of_model_turn());
-        }
-        text.push_str(&fmt.user_turn(user, think));
+            fmt.end_of_model_turn() + &fmt.user_turn(user, think)
+        } else {
+            fmt.user_turn(user, think)
+        };
         let ids = self
             .tok
             .encode(text.as_str(), false)

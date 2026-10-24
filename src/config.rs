@@ -1,4 +1,4 @@
-//! Gemma 4 text-model configuration, parsed from HuggingFace `config.json`.
+//! Gemma 4 / Gemma 3 text-model configuration, parsed from HuggingFace `config.json`.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -76,6 +76,19 @@ pub struct TextConfig {
     pub moe_intermediate_size: Option<usize>,
     #[serde(default = "d_maxpos")]
     pub max_position_embeddings: usize,
+    /// Gemma 3: the attention scale is `query_pre_attn_scalar^-0.5` (Gemma 4 uses 1.0).
+    #[serde(default)]
+    pub query_pre_attn_scalar: Option<f64>,
+    #[serde(default)]
+    pub rope_theta: Option<f64>,
+    #[serde(default)]
+    pub rope_local_base_freq: Option<f64>,
+    #[serde(default)]
+    pub rope_scaling: Option<serde_json::Value>,
+    /// Gemma 3 (set from `model_type`): RMSNorm scales by `1 + weight`, V is not normed, every
+    /// layer has the same head dim, and the layer pattern does not force a global last layer.
+    #[serde(skip)]
+    pub gemma3: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -83,16 +96,71 @@ pub struct RopeSpec {
     pub theta: f64,
     /// Fraction of the head dim that is rotated (1.0 = full RoPE).
     pub proportion: f64,
+    /// Linear position scaling: frequencies are divided by this.
+    pub factor: f64,
 }
+
+/// Gemma 3 configs (notably multimodal ones) omit fields that equal the transformers defaults.
+const GEMMA3_DEFAULTS: [(&str, f64); 13] = [
+    ("vocab_size", 262_208.0),
+    ("hidden_size", 2304.0),
+    ("intermediate_size", 9216.0),
+    ("num_hidden_layers", 26.0),
+    ("num_attention_heads", 8.0),
+    ("num_key_value_heads", 4.0),
+    ("head_dim", 256.0),
+    ("query_pre_attn_scalar", 256.0),
+    ("sliding_window", 4096.0),
+    ("rope_theta", 1_000_000.0),
+    ("rope_local_base_freq", 10_000.0),
+    ("rms_norm_eps", 1e-6),
+    ("max_position_embeddings", 131_072.0),
+];
 
 impl TextConfig {
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("config.json");
         let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&path)?)?;
-        let text = raw.get("text_config").cloned().unwrap_or(raw);
+        let mt = raw.get("model_type").and_then(|v| v.as_str()).unwrap_or_default();
+        let gemma3 = mt == "gemma3" || mt == "gemma3_text";
+        let mut text = raw.get("text_config").cloned().unwrap_or(raw);
+        if gemma3 && let Some(o) = text.as_object_mut() {
+            for (k, v) in GEMMA3_DEFAULTS {
+                if o.get(k).is_none_or(|x| x.is_null()) {
+                    let n = if v.fract() == 0.0 && v > 1.0 {
+                        serde_json::Value::from(v as u64)
+                    } else {
+                        serde_json::Value::from(v)
+                    };
+                    o.insert(k.to_string(), n);
+                }
+            }
+            let hd = o["head_dim"].clone();
+            o.insert("global_head_dim".into(), hd);
+            o.insert("hidden_size_per_layer_input".into(), 0.into());
+            if o.get("layer_types").is_none_or(|x| x.is_null()) {
+                let k = o.get("sliding_window_pattern").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
+                let n = o["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
+                let lt: Vec<&str> = (0..n)
+                    .map(|i| if (i + 1) % k == 0 { "full_attention" } else { "sliding_attention" })
+                    .collect();
+                o.insert("layer_types".into(), lt.into());
+            }
+        }
         let mut cfg: TextConfig = serde_json::from_value(text).context("parse text config")?;
+        cfg.gemma3 = gemma3;
         cfg.finalize()?;
         Ok(cfg)
+    }
+
+    /// Attention scale applied to the queries.
+    pub fn query_scale(&self) -> f32 {
+        self.query_pre_attn_scalar.map_or(1.0, |s| s.powf(-0.5) as f32)
+    }
+
+    /// RMSNorm weight offset: Gemma 3 scales by `1 + weight`.
+    pub fn norm_offset(&self) -> f32 {
+        if self.gemma3 { 1.0 } else { 0.0 }
     }
 
     fn finalize(&mut self) -> Result<()> {
@@ -108,7 +176,9 @@ impl TextConfig {
         if lt.len() != self.num_hidden_layers {
             bail!("layer_types has {} entries, expected {}", lt.len(), self.num_hidden_layers);
         }
-        if let Some(last) = lt.last_mut() {
+        if !self.gemma3
+            && let Some(last) = lt.last_mut()
+        {
             *last = "full_attention".to_string();
         }
         if self.enable_moe_block {
@@ -183,6 +253,22 @@ impl TextConfig {
     }
 
     pub fn rope_spec(&self, sliding: bool) -> RopeSpec {
+        if self.gemma3 {
+            // Local layers: base 10k, unscaled; global layers: rope_theta with `rope_scaling`.
+            let factor = match &self.rope_scaling {
+                Some(r) if !sliding && r["rope_type"].as_str().unwrap_or("linear") == "linear" => r["factor"].as_f64().unwrap_or(1.0),
+                _ => 1.0,
+            };
+            return RopeSpec {
+                theta: if sliding {
+                    self.rope_local_base_freq.unwrap_or(10_000.0)
+                } else {
+                    self.rope_theta.unwrap_or(1_000_000.0)
+                },
+                proportion: 1.0,
+                factor,
+            };
+        }
         let key = if sliding { "sliding_attention" } else { "full_attention" };
         match self.rope_parameters.as_ref().and_then(|m| m.get(key)) {
             Some(p) => RopeSpec {
@@ -192,17 +278,20 @@ impl TextConfig {
                 } else {
                     1.0
                 },
+                factor: 1.0,
             },
             None => {
                 if sliding {
                     RopeSpec {
                         theta: 10_000.0,
                         proportion: 1.0,
+                        factor: 1.0,
                     }
                 } else {
                     RopeSpec {
                         theta: 1_000_000.0,
                         proportion: 0.25,
+                        factor: 1.0,
                     }
                 }
             }
@@ -279,7 +368,8 @@ pub struct QwenRope {
     pub partial_rotary_factor: Option<f64>,
 }
 
-/// Qwen3.5 / Qwen3.8 dense hybrid text config (Gated DeltaNet + gated full attention).
+/// Qwen3.5 / Qwen3.8 dense hybrid text config (Gated DeltaNet + gated full attention), or a
+/// plain Qwen3 transformer (`model_type` "qwen3": full attention only, ungated, plain RMSNorm).
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct QwenConfig {
@@ -315,13 +405,25 @@ pub struct QwenConfig {
     pub tie_word_embeddings: bool,
     #[serde(default = "d_true")]
     pub attn_output_gate: bool,
+    /// Qwen3 keeps the RoPE base at the top level.
+    #[serde(default)]
+    pub rope_theta: Option<f64>,
+    /// RMSNorm scales by `1 + weight` (Qwen3.5) rather than `weight` (Qwen3).
+    #[serde(skip, default = "d_true")]
+    pub zero_centered_norm: bool,
 }
 
 impl QwenConfig {
     pub fn load(dir: &Path) -> Result<Self> {
         let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
+        let dense = raw.get("model_type").and_then(|v| v.as_str()) == Some("qwen3");
         let text = raw.get("text_config").cloned().unwrap_or(raw);
         let mut cfg: QwenConfig = serde_json::from_value(text).context("parse qwen text config")?;
+        if dense {
+            cfg.layer_types = Some(vec!["full_attention".to_string(); cfg.num_hidden_layers]);
+            cfg.attn_output_gate = false;
+            cfg.zero_centered_norm = false;
+        }
         if cfg.layer_types.is_none() {
             let k = cfg.full_attention_interval.max(1);
             cfg.layer_types = Some(
@@ -339,7 +441,11 @@ impl QwenConfig {
         self.layer_types.as_ref().unwrap()[l] == "full_attention"
     }
     pub fn rope_theta(&self) -> f64 {
-        self.rope_parameters.as_ref().map(|r| r.rope_theta).unwrap_or(10_000_000.0)
+        self.rope_parameters
+            .as_ref()
+            .map(|r| r.rope_theta)
+            .or(self.rope_theta)
+            .unwrap_or(10_000_000.0)
     }
     /// Number of rotated dimensions per head (partial RoPE).
     pub fn rotary_dim(&self) -> usize {

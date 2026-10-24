@@ -1,6 +1,7 @@
 //! Qwen3.5 / Qwen3.8 dense hybrid text model: Gated DeltaNet (linear attention with a causal
 //! short conv and a delta-rule recurrent state) interleaved with gated full attention, SiLU MLPs
-//! and zero-centered RMSNorm. Text only (the vision encoder and MTP head are not loaded).
+//! and zero-centered RMSNorm; plain Qwen3 (full attention only) runs on the same code. Text only
+//! (the vision encoder and MTP head are not loaded).
 
 use crate::config::QwenConfig;
 use crate::kernels::*;
@@ -27,10 +28,12 @@ struct Attn<'a> {
     k: Lin<'a>,
     v: Lin<'a>,
     o: Lin<'a>,
-    q_norm: Vec<f32>, // 1 + w
+    q_norm: Vec<f32>, // 1 + w (or w, see `zero_centered_norm`)
     k_norm: Vec<f32>,
 }
 
+// One per layer, built once: the size difference is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum Mixer<'a> {
     Gdn(Gdn<'a>),
     Attn(Attn<'a>),
@@ -67,8 +70,9 @@ pub struct QwenSession {
     pub pos: usize,
 }
 
-fn one_plus(w: &[u16]) -> Vec<f32> {
-    w.iter().map(|&v| 1.0 + bf16_to_f32(v)).collect()
+fn norm_weight(w: &[u16], zero_centered: bool) -> Vec<f32> {
+    let o = if zero_centered { 1.0 } else { 0.0 };
+    w.iter().map(|&v| o + bf16_to_f32(v)).collect()
 }
 
 impl<'a> QwenModel<'a> {
@@ -104,6 +108,7 @@ impl<'a> QwenModel<'a> {
             })
         };
         let lin = |full: &str, n_out: usize, n_in: usize| load_lin(files, full, n_out, n_in, quant);
+        let one_plus = |w: &[u16]| norm_weight(w, cfg.zero_centered_norm);
 
         let tied = cfg.tie_word_embeddings || !has("lm_head.weight");
         // Lookups use the head's precision when tied (one copy in a pre-quantized file), else bf16.

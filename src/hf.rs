@@ -3,6 +3,9 @@
 //! `--model google/gemma-4-E4B-it` resolves to `$OXINFER_CACHE/google--gemma-4-E4B-it` (default
 //! `~/.cache/oxinfer/hub`), downloading the config, tokenizer, template and safetensors files that
 //! are missing or incomplete. Downloads are resumable. Gated repos need `HF_TOKEN`.
+//!
+//! Files come from the ATOnline mirror when it carries the repo (`AI/Model:get`, which lists
+//! every file with a download URL), otherwise from huggingface.co; `OXINFER_HUB` overrides.
 
 use anyhow::{Context, Result, anyhow, bail};
 use rsurl::{DownloadOptions, Request};
@@ -44,7 +47,8 @@ fn token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-fn request(url: &str) -> Result<Request> {
+/// A GET request; `auth` adds the HuggingFace token (never sent to other hosts).
+fn request(url: &str, auth: bool) -> Result<Request> {
     let mut r = Request::get(url)
         .map_err(|e| anyhow!("{url}: {e}"))?
         .follow_redirects(true)
@@ -52,7 +56,7 @@ fn request(url: &str) -> Result<Request> {
         .header("User-Agent", "oxinfer/0.1")
         // The resumable downloader stores raw bytes; refuse compressed transfer encodings.
         .header("Accept-Encoding", "identity");
-    if let Some(t) = token() {
+    if auth && let Some(t) = token() {
         r = r.header("Authorization", &format!("Bearer {t}"));
     }
     Ok(r)
@@ -82,9 +86,71 @@ const SMALL_FILES: [&str; 8] = [
     "preprocessor_config.json",
 ];
 
-fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
+/// Where a repository file comes from.
+enum Source {
+    Url(String),
+    /// Small files the mirror inlines as `data:` URLs.
+    Inline(Vec<u8>),
+}
+
+/// A repository's file listing: name -> (size, source).
+type Listing = HashMap<String, (Option<u64>, Source)>;
+
+/// The ATOnline model mirror: `AI/Model:get` lists a repo's files with download URLs.
+pub const MIRROR_API: &str = "https://ws.atonline.com/_special/rest/AI/Model:get";
+
+#[derive(Deserialize)]
+struct MirrorFile {
+    #[serde(rename = "Filename")]
+    filename: String,
+    #[serde(rename = "Size")]
+    size: String,
+    #[serde(rename = "Url")]
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct MirrorModel {
+    #[serde(rename = "Files")]
+    files: Vec<MirrorFile>,
+}
+
+#[derive(Deserialize)]
+struct MirrorReply {
+    data: MirrorModel,
+}
+
+/// Lists `repo` on the mirror; Ok(None) when the mirror does not carry it.
+fn list_mirror(repo: &str) -> Result<Option<Listing>> {
+    let api = format!("{MIRROR_API}?key={repo}");
+    let resp = request(&api, false)?.send().map_err(|e| anyhow!("{api}: {e}"))?;
+    match resp.status {
+        200 => {}
+        404 => return Ok(None),
+        s => bail!("{api}: HTTP {s}"),
+    }
+    let reply: MirrorReply = serde_json::from_slice(&resp.body).with_context(|| format!("parse {api}"))?;
+    let mut out = Listing::new();
+    for f in reply.data.files {
+        let src = match f.url.strip_prefix("data:") {
+            Some(d) => {
+                let b64 = d
+                    .split_once(";base64,")
+                    .map(|(_, b)| b)
+                    .with_context(|| format!("{}: unsupported data URL", f.filename))?;
+                Source::Inline(base64_decode(b64).with_context(|| format!("{}: bad base64", f.filename))?)
+            }
+            None => Source::Url(f.url),
+        };
+        out.insert(f.filename, (f.size.parse().ok(), src));
+    }
+    Ok(Some(out))
+}
+
+/// Lists `repo` on huggingface.co.
+fn list_hf(repo: &str) -> Result<Listing> {
     let api = format!("https://huggingface.co/api/models/{repo}?blobs=true");
-    let resp = request(&api)?.send().map_err(|e| anyhow!("{api}: {e}"))?;
+    let resp = request(&api, true)?.send().map_err(|e| anyhow!("{api}: {e}"))?;
     match resp.status {
         200 => {}
         401 | 403 => bail!(
@@ -95,24 +161,76 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         s => bail!("{api}: HTTP {s}"),
     }
     let info: RepoInfo = serde_json::from_slice(&resp.body).with_context(|| format!("parse {api}"))?;
-    let sizes: HashMap<String, Option<u64>> = info.siblings.into_iter().map(|s| (s.rfilename, s.size)).collect();
+    Ok(info
+        .siblings
+        .into_iter()
+        .map(|s| {
+            let url = format!("https://huggingface.co/{repo}/resolve/main/{}", s.rfilename);
+            (s.rfilename, (s.size, Source::Url(url)))
+        })
+        .collect())
+}
 
+/// Which hub to fetch from: `OXINFER_HUB=auto` (default: the mirror, then huggingface.co for
+/// repos it does not carry), `mirror` or `hf`.
+fn listing(repo: &str) -> Result<Listing> {
+    let hub = std::env::var("OXINFER_HUB").unwrap_or_default();
+    match hub.as_str() {
+        "hf" => list_hf(repo),
+        "mirror" => list_mirror(repo)?.with_context(|| format!("{repo}: not on the mirror ({MIRROR_API})")),
+        "" | "auto" => match list_mirror(repo) {
+            Ok(Some(l)) => Ok(l),
+            Ok(None) => list_hf(repo),
+            Err(e) => {
+                eprintln!("[mirror unavailable ({e:#}); trying huggingface.co]");
+                list_hf(repo)
+            }
+        },
+        h => bail!("OXINFER_HUB={h}: expected auto, mirror or hf"),
+    }
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let digits: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').collect();
+    let mut out = Vec::with_capacity(digits.len() * 3 / 4);
+    for chunk in digits.chunks(4) {
+        let mut acc = 0u32;
+        for &c in chunk {
+            acc = acc << 6 | val(c)?;
+        }
+        acc <<= 6 * (4 - chunk.len() as u32);
+        let n = match chunk.len() {
+            4 => 3,
+            3 => 2,
+            2 => 1,
+            _ => return None,
+        };
+        out.extend_from_slice(&acc.to_be_bytes()[1..1 + n]);
+    }
+    Some(out)
+}
+
+fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
+    let list = listing(repo)?;
     let mut files: Vec<String> = SMALL_FILES
         .iter()
-        .filter(|f| sizes.contains_key(**f))
+        .filter(|f| list.contains_key(**f))
         .map(|f| f.to_string())
         .collect();
-    if sizes.contains_key("model.safetensors") {
+    if list.contains_key("model.safetensors") {
         files.push("model.safetensors".into());
-    } else if sizes.contains_key("model.safetensors.index.json") {
-        fetch_file(
-            repo,
-            dir,
-            "model.safetensors.index.json",
-            sizes["model.safetensors.index.json"],
-            0,
-            0,
-        )?;
+    } else if let Some((size, src)) = list.get("model.safetensors.index.json") {
+        fetch_file(repo, dir, "model.safetensors.index.json", *size, src, 0, 0)?;
         let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json"))?)?;
         let mut shards: Vec<String> = idx["weight_map"]
             .as_object()
@@ -128,7 +246,8 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     }
     let count = files.len();
     for (i, f) in files.iter().enumerate() {
-        fetch_file(repo, dir, f, sizes.get(f).copied().flatten(), i + 1, count)?;
+        let (size, src) = list.get(f).with_context(|| format!("{repo}: {f} is not in the listing"))?;
+        fetch_file(repo, dir, f, *size, src, i + 1, count)?;
     }
     Ok(())
 }
@@ -183,7 +302,7 @@ fn progress_line(label: &str, done: u64, total: Option<u64>, secs: f64) -> Strin
     }
 }
 
-fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, index: usize, count: usize) -> Result<()> {
+fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, src: &Source, index: usize, count: usize) -> Result<()> {
     use std::io::IsTerminal;
     let path = dir.join(name);
     if let Ok(md) = std::fs::metadata(&path)
@@ -192,7 +311,13 @@ fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, index: 
     {
         return Ok(());
     }
-    let url = format!("https://huggingface.co/{repo}/resolve/main/{name}");
+    let url = match src {
+        Source::Inline(b) => {
+            std::fs::write(&path, b).with_context(|| format!("write {}", path.display()))?;
+            return Ok(());
+        }
+        Source::Url(u) => u.as_str(),
+    };
     let t0 = Instant::now();
     let label = format!("[{index}/{count}] {name}");
     let tty = std::io::stderr().is_terminal();
@@ -227,9 +352,9 @@ fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, index: 
         "[fetching {repo}/{name}{}]",
         expected.map(|s| format!(" ({})", human_gb(s))).unwrap_or_default()
     );
-    let out = request(&url)?
+    let out = request(url, url.starts_with("https://huggingface.co/"))?
         .download_resumable(&path, opts)
-        .map_err(|e| anyhow!("download {url}: {e}"))?;
+        .map_err(|e| anyhow!("download {repo}/{name}: {e}"))?;
     let secs = t0.elapsed().as_secs_f64().max(1e-3);
     if tty {
         eprint!("\r\x1b[K");

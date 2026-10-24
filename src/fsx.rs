@@ -27,7 +27,7 @@ mod imp {
     pub fn read_pages(path: &Path) -> Result<(PageVec<u64>, usize)> {
         let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         let len = file.metadata()?.len() as usize;
-        Ok((crate::safetensors::read_file_parallel(&file, len)?, len))
+        Ok((crate::safetensors::read_file_parallel(&file, len, 0)?, len))
     }
     pub fn host_file(_path: &Path) -> Option<HostFile> {
         None

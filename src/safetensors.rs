@@ -19,13 +19,65 @@ pub struct TensorInfo {
     /// Absolute byte range inside the file.
     pub start: usize,
     pub end: usize,
+    /// An MLX affine-quantized matrix: `dtype`/`shape` then describe the logical bf16 matrix,
+    /// while the packed values sit at `start..end` (scales and biases are sibling tensors).
+    pub mlx: Option<MlxQuant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MlxQuant {
+    pub bits: usize,
+    pub group: usize,
+}
+
+/// MLX checkpoints (mlx-lm / mlx-vlm) name multimodal weights `language_model.model.*`,
+/// `vision_tower.*`, ...; the loaders use the transformers names `model.language_model.*`, ...
+fn mlx_canonical(n: &str) -> String {
+    if let Some(r) = n.strip_prefix("language_model.model.") {
+        return format!("model.language_model.{r}");
+    }
+    if let Some(r) = n.strip_prefix("language_model.lm_head.") {
+        return format!("lm_head.{r}");
+    }
+    for p in [
+        "vision_tower.",
+        "embed_vision.",
+        "audio_tower.",
+        "embed_audio.",
+        "multi_modal_projector.",
+    ] {
+        if n.starts_with(p) {
+            return format!("model.{n}");
+        }
+    }
+    n.to_string()
+}
+
+/// Reinterprets little-endian bytes as `T` words, borrowing when aligned.
+fn words<T: Copy>(b: &[u8]) -> std::borrow::Cow<'_, [T]>
+where
+    [T]: ToOwned<Owned = Vec<T>>,
+{
+    let n = b.len() / std::mem::size_of::<T>();
+    if (b.as_ptr() as usize).is_multiple_of(std::mem::align_of::<T>()) {
+        std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(b.as_ptr() as *const T, n) })
+    } else {
+        let mut v = Vec::<T>::with_capacity(n);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b.as_ptr(), v.as_mut_ptr() as *mut u8, n * std::mem::size_of::<T>());
+            v.set_len(n);
+        }
+        std::borrow::Cow::Owned(v)
+    }
 }
 
 enum Storage {
     #[cfg(not(target_arch = "wasm32"))]
     Mmap(Mmap),
-    /// Heap copy in a page-aligned, page-multiple allocation (so accelerators can map it in place).
-    Heap(PageVec<u64>, usize),
+    /// Heap copy in a page-aligned, page-multiple allocation (so accelerators can map it in place):
+    /// (buffer, file length, padding before the file's first byte). The padding puts the tensor
+    /// data on a 16-byte boundary when the header length leaves it unaligned (as MLX writes it).
+    Heap(PageVec<u64>, usize, usize),
     /// Kept by the host (browser), read by range; tensors in it are only usable as row tables.
     Host(crate::fsx::HostFile),
 }
@@ -35,7 +87,7 @@ impl Storage {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             Storage::Mmap(m) => &m[..],
-            Storage::Heap(v, n) => unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, *n) },
+            Storage::Heap(v, n, pad) => unsafe { std::slice::from_raw_parts((v.as_ptr() as *const u8).add(*pad), *n) },
             Storage::Host(_) => &[],
         }
     }
@@ -57,9 +109,9 @@ pub struct SafeTensors {
 /// Reads a whole file into memory using parallel positional reads (sequential where the
 /// platform has no positional read).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn read_file_parallel(file: &File, len: usize) -> Result<PageVec<u64>> {
-    let mut buf = PageVec::<u64>::zeroed(len.div_ceil(8));
-    let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, len) };
+pub(crate) fn read_file_parallel(file: &File, len: usize, pad: usize) -> Result<PageVec<u64>> {
+    let mut buf = PageVec::<u64>::zeroed((pad + len).div_ceil(8));
+    let bytes = unsafe { std::slice::from_raw_parts_mut((buf.as_mut_ptr() as *mut u8).add(pad), len) };
     #[cfg(unix)]
     const CHUNK: usize = 32 << 20;
     #[cfg(unix)]
@@ -121,8 +173,15 @@ impl SafeTensors {
         }
         #[cfg(not(target_arch = "wasm32"))]
         let mmap = if in_memory {
-            let (v, len) = crate::fsx::read_pages(path)?;
-            Storage::Heap(v, len)
+            use std::io::Read;
+            let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            let len = file.metadata()?.len() as usize;
+            let mut n8 = [0u8; 8];
+            file.read_exact(&mut n8)
+                .with_context(|| format!("{}: file too small", path.display()))?;
+            let data_start = 8usize.saturating_add(u64::from_le_bytes(n8) as usize);
+            let pad = (16 - data_start % 16) % 16;
+            Storage::Heap(read_file_parallel(&file, len, pad)?, len, pad)
         } else {
             let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
             Storage::Mmap(unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?)
@@ -131,7 +190,7 @@ impl SafeTensors {
         let mmap = {
             let _ = in_memory;
             let (v, len) = crate::fsx::read_pages(path)?;
-            Storage::Heap(v, len)
+            Storage::Heap(v, len, 0)
         };
         if mmap.len() < 8 {
             bail!("{}: file too small", path.display());
@@ -174,7 +233,19 @@ impl SafeTensors {
             if end > file_len || start > end {
                 bail!("tensor {name} out of bounds");
             }
-            tensors.insert(name.clone(), TensorInfo { dtype, shape, start, end });
+            tensors.insert(
+                name.clone(),
+                TensorInfo {
+                    dtype,
+                    shape,
+                    start,
+                    end,
+                    mlx: None,
+                },
+            );
+        }
+        if metadata.get("format").map(String::as_str) == Some("mlx") {
+            tensors = tensors.into_iter().map(|(k, v)| (mlx_canonical(&k), v)).collect();
         }
         Ok(Self { mmap, tensors, metadata })
     }
@@ -265,6 +336,8 @@ pub struct ModelFiles {
     touched: Mutex<BTreeMap<String, Option<QKind>>>,
     /// How each tensor was used: (as a matmul weight, as a lookup table).
     uses: Mutex<HashMap<String, (bool, bool)>>,
+    /// bf16 copies of MLX-quantized tensors that were read as plain bf16 (never freed).
+    dequantized: Mutex<HashMap<String, PageVec<u16>>>,
 }
 
 /// Maximum shard size written by `write_quantized`.
@@ -280,6 +353,26 @@ struct Planned {
     bytes: usize,
     /// (source tensor, quantization, scales part); None for padding.
     src: Option<(String, Option<QKind>, bool)>,
+}
+
+/// Where a row table's bytes live: in module memory, or in a host-kept file at an offset.
+#[derive(Clone, Copy)]
+pub enum TablePart<'a> {
+    Mem(&'a [u8]),
+    Host(crate::fsx::HostFile, u64),
+}
+
+impl TablePart<'_> {
+    /// Copies `out.len()` bytes starting at byte `off` of the tensor.
+    pub fn read(&self, off: usize, out: &mut [u8]) -> Result<()> {
+        match *self {
+            TablePart::Mem(b) => {
+                out.copy_from_slice(&b[off..off + out.len()]);
+                Ok(())
+            }
+            TablePart::Host(h, start) => crate::fsx::read_host(h, start + off as u64, out),
+        }
+    }
 }
 
 /// A weight matrix stored pre-quantized in the checkpoint, borrowed in place.
@@ -315,12 +408,158 @@ impl ModelFiles {
                 index.insert(n.clone(), i);
             }
         }
-        Ok(Self {
+        let mut files = Self {
             shards,
             index,
             touched: Mutex::new(BTreeMap::new()),
             uses: Mutex::new(HashMap::new()),
-        })
+            dequantized: Mutex::new(HashMap::new()),
+        };
+        if files.is_mlx() {
+            let cfg = crate::fsx::read(&dir.join("config.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .unwrap_or_default();
+            files.annotate_mlx(&cfg)?;
+        }
+        Ok(files)
+    }
+
+    /// Whether this is an MLX checkpoint (affine-quantized `{name}.weight` + `.scales` + `.biases`).
+    pub fn is_mlx(&self) -> bool {
+        self.metadata("format") == Some("mlx")
+    }
+
+    /// Marks every quantized matrix with its bit width and group size (from config.json's
+    /// `quantization`, which may override them per module) and its logical bf16 shape.
+    fn annotate_mlx(&mut self, cfg: &serde_json::Value) -> Result<()> {
+        let q = cfg.get("quantization").or_else(|| cfg.get("quantization_config"));
+        let get = |v: Option<&serde_json::Value>, k: &str, d: usize| v.and_then(|v| v[k].as_u64()).map_or(d, |x| x as usize);
+        let (bits, group) = (get(q, "bits", 4), get(q, "group_size", 64));
+        // Per-module overrides are keyed by MLX module path, so compare canonical forms.
+        let overrides: HashMap<String, (usize, usize)> = q
+            .and_then(|q| q.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter(|(_, v)| v.is_object())
+                    .map(|(k, v)| (mlx_canonical(k), (get(Some(v), "bits", bits), get(Some(v), "group_size", group))))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for sh in &mut self.shards {
+            let names: Vec<String> = sh.tensors.keys().filter(|n| n.ends_with(".scales")).cloned().collect();
+            for sn in names {
+                let base = &sn[..sn.len() - ".scales".len()];
+                let wn = format!("{base}.weight");
+                let (bits, group) = overrides.get(base).copied().unwrap_or((bits, group));
+                let s_cols = *sh.tensors[&sn].shape.last().unwrap_or(&0);
+                let Some(w) = sh.tensors.get_mut(&wn) else { continue };
+                if w.dtype != "U32" || w.shape.len() != 2 {
+                    continue;
+                }
+                let n_in = w.shape[1] * 32 / bits;
+                if s_cols * group != n_in {
+                    bail!(
+                        "{wn}: {} packed columns at {bits} bits do not match {s_cols} groups of {group}",
+                        w.shape[1]
+                    );
+                }
+                w.shape[1] = n_in;
+                w.dtype = "BF16".into();
+                w.mlx = Some(MlxQuant { bits, group });
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw bytes of tensor `name`, copied out of a host-kept shard if need be.
+    fn bytes_cow(&self, name: &str) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
+        self.shards[i].bytes_cow(name)
+    }
+
+    /// The MLX quantization of tensor `name`, if it is an MLX-quantized matrix.
+    pub fn mlx(&self, name: &str) -> Option<MlxQuant> {
+        self.info(name).and_then(|i| i.mlx)
+    }
+
+    /// An MLX 4-bit matrix `name` (`[n_out, n_in]`) repacked as Q4 with offsets; None when `name`
+    /// is not stored that way.
+    pub fn mlx_q4(&self, name: &str, n_out: usize, n_in: usize) -> Result<Option<Q4Matrix>> {
+        let Some(info) = self.info(name) else { return Ok(None) };
+        let Some(m) = info.mlx else { return Ok(None) };
+        if m.bits != 4 || !m.group.is_multiple_of(crate::quant::QBLOCK) {
+            return Ok(None);
+        }
+        if info.shape != [n_out, n_in] {
+            bail!("tensor {name} has shape {:?}, expected [{n_out}, {n_in}]", info.shape);
+        }
+        self.touch(name);
+        let base = name.strip_suffix(".weight").unwrap_or(name);
+        let (w, s, b) = (
+            self.bytes_cow(name)?,
+            self.bytes_cow(&format!("{base}.scales"))?,
+            self.bytes_cow(&format!("{base}.biases"))?,
+        );
+        Ok(Some(crate::quant::from_mlx_q4(
+            &words::<u32>(&w),
+            &words::<u16>(&s),
+            &words::<u16>(&b),
+            n_out,
+            n_in,
+            m.group,
+        )))
+    }
+
+    /// Reads row-table parts of MLX matrix `name`: (packed values, scales, biases) as byte sources.
+    pub fn mlx_parts(&self, name: &str) -> Option<[TablePart<'_>; 3]> {
+        self.mlx(name)?;
+        let base = name.strip_suffix(".weight").unwrap_or(name);
+        let part = |n: &str| -> Option<TablePart<'_>> {
+            let i = *self.index.get(n)?;
+            let sh = &self.shards[i];
+            let t = sh.tensors.get(n)?;
+            Some(match &sh.mmap {
+                Storage::Host(h) => TablePart::Host(*h, t.start as u64),
+                m => TablePart::Mem(&m[t.start..t.end]),
+            })
+        };
+        Some([part(name)?, part(&format!("{base}.scales"))?, part(&format!("{base}.biases"))?])
+    }
+
+    /// An MLX-quantized matrix dequantized to bf16 (kept for the lifetime of `self`).
+    fn mlx_bf16(&self, name: &str, m: MlxQuant, rows: usize, cols: usize) -> Result<&[u16]> {
+        let mut cache = self.dequantized.lock().unwrap();
+        if !cache.contains_key(name) {
+            let base = name.strip_suffix(".weight").unwrap_or(name);
+            let (w, s, b) = (
+                self.bytes_cow(name)?,
+                self.bytes_cow(&format!("{base}.scales"))?,
+                self.bytes_cow(&format!("{base}.biases"))?,
+            );
+            let (w, s, b) = (words::<u32>(&w), words::<u16>(&s), words::<u16>(&b));
+            let (wpr, gpr) = (cols * m.bits / 32, cols / m.group);
+            let mut out = PageVec::<u16>::zeroed(rows * cols);
+            let mut row = vec![0f32; cols];
+            for r in 0..rows {
+                crate::quant::mlx_dequant_row(
+                    &w[r * wpr..(r + 1) * wpr],
+                    &s[r * gpr..(r + 1) * gpr],
+                    &b[r * gpr..(r + 1) * gpr],
+                    m.bits,
+                    m.group,
+                    &mut row,
+                );
+                for (o, &v) in out[r * cols..(r + 1) * cols].iter_mut().zip(&row) {
+                    *o = half::bf16::from_f32(v).to_bits();
+                }
+            }
+            cache.insert(name.to_string(), out);
+        }
+        let v = &cache[name];
+        // SAFETY: entries are never removed or replaced, and the PageVec's heap block does not
+        // move when the map rehashes, so the slice lives as long as `self`.
+        Ok(unsafe { std::slice::from_raw_parts(v.as_ptr(), v.len()) })
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -334,6 +573,27 @@ impl ModelFiles {
     pub fn bf16(&self, name: &str) -> Result<&[u16]> {
         let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
         self.touch(name);
+        let info = self.shards[i].info(name).unwrap();
+        if let Some(m) = info.mlx {
+            return self.mlx_bf16(name, m, info.shape[0], info.shape[1]);
+        }
+        let sh = &self.shards[i];
+        let misaligned = !matches!(sh.mmap, Storage::Host(_)) && !(sh.mmap.as_ptr() as usize + info.start).is_multiple_of(2);
+        if info.dtype == "BF16" && misaligned {
+            // Unaligned in a mapped file (MLX headers have any length): use an aligned copy.
+            let mut cache = self.dequantized.lock().unwrap();
+            if !cache.contains_key(name) {
+                let b = self.shards[i].bytes(name)?;
+                let mut v = PageVec::<u16>::zeroed(b.len() / 2);
+                for (o, c) in v.iter_mut().zip(b.as_chunks::<2>().0) {
+                    *o = u16::from_le_bytes(*c);
+                }
+                cache.insert(name.to_string(), v);
+            }
+            let v = &cache[name];
+            // SAFETY: as in `mlx_bf16`.
+            return Ok(unsafe { std::slice::from_raw_parts(v.as_ptr(), v.len()) });
+        }
         self.shards[i].bf16(name)
     }
 
@@ -433,6 +693,7 @@ impl ModelFiles {
                 scales: unsafe { QBuf::borrowed(sc) },
                 n_out,
                 n_in,
+                offsets: None,
             })));
         }
         Ok(None)
@@ -447,6 +708,9 @@ impl ModelFiles {
     #[allow(clippy::type_complexity)]
     pub fn write_quantized(&self, dir: &Path, metadata: &[(&str, &str)]) -> Result<Vec<(PathBuf, u64)>> {
         use crate::quant::QBLOCK;
+        if self.is_mlx() {
+            bail!("--save-quantized does not convert MLX checkpoints; load them directly instead");
+        }
         let touched = self.touched.lock().unwrap().clone();
         let uses = self.uses.lock().unwrap().clone();
         let mut weights: Vec<Planned> = Vec::new();

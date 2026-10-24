@@ -38,10 +38,17 @@ pub trait ChatFormat {
     fn end_of_model_turn(&self) -> String;
     /// The special token that closes a model turn (generation stops on it).
     fn end_of_turn_token(&self) -> &'static str;
-    /// Token ids that open / close a thinking block in generated text, and whether
+    /// Tokens that open / close a thinking block in generated text ("" if none), and whether
     /// generation starts inside one when thinking is enabled.
-    fn think_ids(&self) -> (u32, u32);
+    fn think_tokens(&self) -> (&'static str, &'static str);
     fn starts_in_thinking(&self, think: bool) -> bool;
+
+    /// The start of a conversation through its first user turn and the generation prompt.
+    fn first_turn(&self, system: Option<&str>, think: bool, tools: &[ToolSpec], content: &str) -> String {
+        let mut s = self.conversation_start_tools(system, think, tools);
+        s.push_str(&self.user_turn(content, think));
+        s
+    }
 
     /// Conversation start with tool declarations in the system turn (as the model's template).
     fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String;
@@ -68,8 +75,8 @@ impl ChatFormat for GemmaChat {
     fn end_of_turn_token(&self) -> &'static str {
         EOT
     }
-    fn think_ids(&self) -> (u32, u32) {
-        (100, 101)
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("<|channel>", "<channel|>")
     }
     fn starts_in_thinking(&self, _think: bool) -> bool {
         false
@@ -107,17 +114,72 @@ impl ChatFormat for GemmaChat {
     }
 }
 
-/// Qwen3.5 / 3.8 ChatML template: thinking is on by default in the model, so a non-thinking
-/// request closes the think block in the generation prompt. Templates differ in one respect:
-/// Qwen3.8's adds a reasoning-effort instruction to the system turn in thinking mode, Qwen3.5's
-/// does not (and a small model given that instruction anyway can deliberate about it endlessly).
-pub struct QwenChat {
-    pub reasoning_effort: bool,
+/// Gemma 3: `<start_of_turn>` turns, no system role (the system prompt opens the first user
+/// turn), no thinking and no tool tokens.
+pub struct Gemma3Chat;
+impl ChatFormat for Gemma3Chat {
+    fn conversation_start(&self, _system: Option<&str>, _think: bool) -> String {
+        "<bos>".into()
+    }
+    fn user_turn(&self, content: &str, _think: bool) -> String {
+        format!("<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n", content.trim())
+    }
+    fn first_turn(&self, system: Option<&str>, _think: bool, _tools: &[ToolSpec], content: &str) -> String {
+        let prefix = system.map(|s| format!("{s}\n\n")).unwrap_or_default();
+        format!(
+            "<bos><start_of_turn>user\n{prefix}{}<end_of_turn>\n<start_of_turn>model\n",
+            content.trim()
+        )
+    }
+    fn end_of_model_turn(&self) -> String {
+        "<end_of_turn>\n".into()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        "<end_of_turn>"
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("", "")
+    }
+    fn starts_in_thinking(&self, _think: bool) -> bool {
+        false
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, _tools: &[ToolSpec]) -> String {
+        self.conversation_start(system, think)
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        ""
+    }
+    fn parse_tool_calls(&self, _raw: &str) -> Vec<ToolCall> {
+        Vec::new()
+    }
+    fn tool_results(&self, _results: &[ToolResult], _think: bool) -> String {
+        String::new()
+    }
 }
 
-/// Qwen formats without and with the reasoning-effort instruction.
-pub static QWEN: QwenChat = QwenChat { reasoning_effort: false };
-pub static QWEN_EFFORT: QwenChat = QwenChat { reasoning_effort: true };
+/// Qwen ChatML templates. Qwen3.5 / 3.8: thinking is on by default in the model, so a non-thinking
+/// request closes the think block in the generation prompt, and a thinking one opens it; Qwen3.8's
+/// also adds a reasoning-effort instruction to the system turn in thinking mode (and a small model
+/// given that instruction anyway can deliberate about it endlessly). Qwen3: the model opens its
+/// own think block, and tools are declared and called in JSON.
+pub struct QwenChat {
+    pub reasoning_effort: bool,
+    pub qwen3: bool,
+}
+
+/// Qwen3.5, Qwen3.8 (with the reasoning-effort instruction) and Qwen3 formats.
+pub static QWEN: QwenChat = QwenChat {
+    reasoning_effort: false,
+    qwen3: false,
+};
+pub static QWEN_EFFORT: QwenChat = QwenChat {
+    reasoning_effort: true,
+    qwen3: false,
+};
+pub static QWEN3: QwenChat = QwenChat {
+    reasoning_effort: false,
+    qwen3: true,
+};
 
 impl QwenChat {
     /// The format matching the model's own chat template (`chat_template.jinja`, or the template
@@ -130,10 +192,10 @@ impl QwenChat {
             let cfg: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("tokenizer_config.json")).ok()?).ok()?;
             cfg["chat_template"].as_str().map(str::to_string)
         });
-        if template.is_some_and(|t| t.contains("reasoning_effort")) {
-            &QWEN_EFFORT
-        } else {
-            &QWEN
+        match template {
+            Some(t) if t.contains("reasoning_effort") => &QWEN_EFFORT,
+            Some(t) if t.contains("<function-name>") => &QWEN3,
+            _ => &QWEN,
         }
     }
 
@@ -149,14 +211,18 @@ impl ChatFormat for QwenChat {
         match (self.effort(think), system) {
             (Some(e), Some(sys)) => s.push_str(&format!("<|im_start|>system\n{e}\n\n{}<|im_end|>\n", sys.trim())),
             (Some(e), None) => s.push_str(&format!("<|im_start|>system\n{e}<|im_end|>\n")),
+            (None, Some(sys)) if self.qwen3 => s.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n")),
             (None, Some(sys)) => s.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", sys.trim())),
             (None, None) => {}
         }
         s
     }
     fn user_turn(&self, content: &str, think: bool) -> String {
-        let tail = if think { "<think>\n" } else { "<think>\n\n</think>\n\n" };
-        format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{tail}", content.trim())
+        let content = if self.qwen3 { content } else { content.trim() };
+        format!(
+            "<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n{}",
+            self.think_tail(think)
+        )
     }
     fn end_of_model_turn(&self) -> String {
         "<|im_end|>\n".to_string()
@@ -164,17 +230,26 @@ impl ChatFormat for QwenChat {
     fn end_of_turn_token(&self) -> &'static str {
         "<|im_end|>"
     }
-    fn think_ids(&self) -> (u32, u32) {
-        (248068, 248069)
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("<think>", "</think>")
     }
     fn starts_in_thinking(&self, think: bool) -> bool {
-        think
+        think && !self.qwen3
     }
     fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
         if tools.is_empty() {
             return self.conversation_start(system, think);
         }
         let mut s = String::from("<|im_start|>system\n");
+        if self.qwen3 {
+            if let Some(sys) = system {
+                s.push_str(sys);
+                s.push_str("\n\n");
+            }
+            s.push_str(&crate::tools::qwen::tools_block_json(tools));
+            s.push_str("<|im_end|>\n");
+            return s;
+        }
         if let Some(e) = self.effort(think) {
             s.push_str(e);
             s.push_str("\n\n");
@@ -202,8 +277,19 @@ impl ChatFormat for QwenChat {
             s.push_str("\n</tool_response>");
         }
         s.push_str("<|im_end|>\n<|im_start|>assistant\n");
-        s.push_str(if think { "<think>\n" } else { "<think>\n\n</think>\n\n" });
+        s.push_str(self.think_tail(think));
         s
+    }
+}
+
+impl QwenChat {
+    /// What follows the assistant header in the generation prompt.
+    fn think_tail(&self, think: bool) -> &'static str {
+        match (think, self.qwen3) {
+            (false, _) => "<think>\n\n</think>\n\n",
+            (true, false) => "<think>\n",
+            (true, true) => "",
+        }
     }
 }
 

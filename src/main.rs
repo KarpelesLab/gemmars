@@ -445,8 +445,10 @@ struct Printer {
 
 impl Printer {
     fn new(fmt: &dyn ChatFormat, think: bool, tok: &Tokenizer) -> Self {
-        let (soc, eoc) = fmt.think_ids();
-        let call = tok.token_to_id(fmt.tool_call_marker());
+        let (soc, eoc) = fmt.think_tokens();
+        let id = |t: &str| if t.is_empty() { None } else { tok.token_to_id(t) };
+        let (soc, eoc) = (id(soc).unwrap_or(u32::MAX), id(eoc).unwrap_or(u32::MAX));
+        let call = id(fmt.tool_call_marker());
         if fmt.starts_in_thinking(think) {
             let mut lock = std::io::stdout().lock();
             let _ = lock.write_all(b"\x1b[2m");
@@ -796,8 +798,8 @@ fn run(mut args: Args) -> Result<()> {
     }
     let model_type = config::model_type(&args.model)?;
     match model_type.as_str() {
-        "gemma4" | "gemma4_text" => run_gemma(args),
-        "qwen3_5" | "qwen3_5_text" | "qwen3_6" | "qwen3_8" => run_qwen(args),
+        "gemma4" | "gemma4_text" | "gemma3" | "gemma3_text" => run_gemma(args),
+        "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_6" | "qwen3_8" => run_qwen(args),
         other => bail!("unsupported model_type {other}"),
     }
 }
@@ -953,14 +955,12 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
             if line.trim().is_empty() {
                 continue;
             }
-            let mut text = String::new();
-            if first {
-                text.push_str(&fmt.conversation_start_tools(system_prompt(args).as_deref(), args.think, &tool_specs(args)));
+            let text = if first {
                 first = false;
+                fmt.first_turn(system_prompt(args).as_deref(), args.think, &tool_specs(args), line)
             } else {
-                text.push_str(&fmt.end_of_model_turn());
-            }
-            text.push_str(&fmt.user_turn(line, args.think));
+                fmt.end_of_model_turn() + &fmt.user_turn(line, args.think)
+            };
             let ids = encode(&text)?;
             if args.show_tokens {
                 eprintln!("[prompt ids: {ids:?}]");
@@ -993,9 +993,7 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
     let text = if args.raw {
         prompt
     } else {
-        let mut t = fmt.conversation_start_tools(system_prompt(args).as_deref(), args.think, &tool_specs(args));
-        t.push_str(&fmt.user_turn(&prompt, args.think));
-        t
+        fmt.first_turn(system_prompt(args).as_deref(), args.think, &tool_specs(args), &prompt)
     };
     if args.print_prompt {
         print!("{text}");
@@ -1080,6 +1078,16 @@ fn run_gemma(args: Args) -> Result<()> {
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let model = Model::load(cfg, &files, args.quant)?;
     let tok = Tokenizer::from_file(args.model.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    if model.cfg.gemma3 {
+        if args.draft.is_some() || !args.images.is_empty() || !args.audios.is_empty() {
+            bail!("speculative decoding and attachments are not supported for Gemma 3 yet");
+        }
+        if let Some(out) = &args.save_quantized {
+            return save_quantized(&args.model, out, &files, model.quant);
+        }
+        let eos = chat::with_turn_end(&chat::Gemma3Chat, &tok, eos);
+        return run_text(&args, &model, &tok, &eos, &chat::Gemma3Chat);
+    }
     let eos = chat::with_turn_end(&chat::GemmaChat, &tok, eos);
     eprintln!(
         "[loaded {} layers, hidden {}, {:.1} GB checkpoint ({}), {:?} weights streaming {:.2} GB/token, {} threads, {:.2}s]",

@@ -195,6 +195,8 @@ pub struct QAct {
     pub scales: Vec<f32>,
     /// Sum of the int8 values of each block (used by the Q4 kernel to fold the nibble offset).
     pub sums: Vec<i32>,
+    /// Exact f32 sum of each block (for the per-group offsets of affine Q4 matrices).
+    pub fsums: Vec<f32>,
     pub t: usize,
     pub n_in: usize,
 }
@@ -206,6 +208,7 @@ pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
     let mut q = vec![0i8; t * n_in];
     let mut scales = vec![0f32; t * bpr];
     let mut sums = vec![0i32; t * bpr];
+    let mut fsums = vec![0f32; t * bpr];
     for ti in 0..t {
         let row = &x[ti * n_in..(ti + 1) * n_in];
         for b in 0..bpr {
@@ -220,9 +223,17 @@ pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
                 s += qi as i32;
             }
             sums[ti * bpr + b] = s;
+            fsums[ti * bpr + b] = blk.iter().sum();
         }
     }
-    QAct { q, scales, sums, t, n_in }
+    QAct {
+        q,
+        scales,
+        sums,
+        fsums,
+        t,
+        n_in,
+    }
 }
 
 /// Dequantizes rows `r0..r1` of `m` into `out` (f32, row-major, `(r1-r0) * n_in`).
@@ -253,11 +264,19 @@ pub struct Q4Matrix {
     pub scales: QBuf<u16>, // f16, [n_out, n_in/32]
     pub n_out: usize,
     pub n_in: usize,
+    /// Affine form (MLX checkpoints): a bf16 term added to every element of a group,
+    /// `[n_out, n_in/group]`, with `group` a multiple of 32.
+    pub offsets: Option<Offsets>,
+}
+
+pub struct Offsets {
+    pub v: QBuf<u16>,
+    pub group: usize,
 }
 
 impl Q4Matrix {
     pub fn bytes(&self) -> usize {
-        self.q.len() + self.scales.len() * 2
+        self.q.len() + self.scales.len() * 2 + self.offsets.as_ref().map_or(0, |o| o.v.len() * 2)
     }
 }
 
@@ -315,7 +334,78 @@ pub fn quantize_q4(w: &[u16], n_out: usize, n_in: usize) -> Q4Matrix {
         scales: scales.into(),
         n_out,
         n_in,
+        offsets: None,
     }
+}
+
+/// Repacks an MLX affine 4-bit matrix (`w = scale * q + bias` per group of `group` elements, eight
+/// nibbles per little-endian u32, low nibble first) into Q4_0 layout plus per-group offsets:
+/// `scale * q + bias = scale * (q - 8) + (bias + 8 * scale)`. The nibbles carry over unchanged.
+pub fn from_mlx_q4(w: &[u32], scales: &[u16], biases: &[u16], n_out: usize, n_in: usize, group: usize) -> Q4Matrix {
+    assert!(group.is_multiple_of(QBLOCK) && n_in.is_multiple_of(group));
+    assert_eq!(w.len(), n_out * n_in / 8);
+    let gpr = n_in / group;
+    assert_eq!(scales.len(), n_out * gpr);
+    assert_eq!(biases.len(), n_out * gpr);
+    let bpr = n_in / QBLOCK;
+    let mut q = PageVec::<u8>::zeroed(n_out * n_in / 2);
+    let mut sc = PageVec::<u16>::zeroed(n_out * bpr);
+    let mut off = PageVec::<u16>::zeroed(n_out * gpr);
+    let (qp, sp, op) = (SendPtr(q.as_mut_ptr()), SendPtr(sc.as_mut_ptr()), SendPtr(off.as_mut_ptr()));
+    let rows_per_task = (256 * 1024 / n_in).max(1);
+    pool::run(n_out.div_ceil(rows_per_task), &|task| {
+        let r0 = task * rows_per_task;
+        for r in r0..(r0 + rows_per_task).min(n_out) {
+            // SAFETY: rows are disjoint between tasks.
+            let qrow = unsafe { std::slice::from_raw_parts_mut(qp.get().add(r * n_in / 2), n_in / 2) };
+            let srow = unsafe { std::slice::from_raw_parts_mut(sp.get().add(r * bpr), bpr) };
+            let orow = unsafe { std::slice::from_raw_parts_mut(op.get().add(r * gpr), gpr) };
+            let wrow = &w[r * n_in / 8..(r + 1) * n_in / 8];
+            for g in 0..gpr {
+                let s = bf16_to_f32(scales[r * gpr + g]);
+                let b = bf16_to_f32(biases[r * gpr + g]);
+                orow[g] = f32_to_bf16(b + 8.0 * s);
+                let d = f32_to_f16(s);
+                for blk in g * group / QBLOCK..(g + 1) * group / QBLOCK {
+                    srow[blk] = d;
+                }
+            }
+            for blk in 0..bpr {
+                let words = &wrow[blk * 4..blk * 4 + 4];
+                let nib = |e: usize| ((words[e / 8] >> (4 * (e % 8))) & 15) as u8;
+                for j in 0..16 {
+                    qrow[blk * 16 + j] = nib(j) | (nib(j + 16) << 4);
+                }
+            }
+        }
+    });
+    Q4Matrix {
+        q: q.into(),
+        scales: sc.into(),
+        n_out,
+        n_in,
+        offsets: Some(Offsets { v: off.into(), group }),
+    }
+}
+
+/// Dequantizes one row of an MLX affine matrix (any bit width dividing 32) into `out`.
+pub fn mlx_dequant_row(w: &[u32], scales: &[u16], biases: &[u16], bits: usize, group: usize, out: &mut [f32]) {
+    let per = 32 / bits;
+    let mask = (1u32 << bits) - 1;
+    for (g, chunk) in out.chunks_mut(group).enumerate() {
+        let s = bf16_to_f32(scales[g]);
+        let b = bf16_to_f32(biases[g]);
+        for (i, o) in chunk.iter_mut().enumerate() {
+            let e = g * group + i;
+            let q = (w[e / per] >> (bits * (e % per))) & mask;
+            *o = s * q as f32 + b;
+        }
+    }
+}
+
+#[inline]
+fn f32_to_bf16(x: f32) -> u16 {
+    half::bf16::from_f32(x).to_bits()
 }
 
 /// Dequantizes rows `r0..r1` of `m` into `out` (f32 row-major).
@@ -328,10 +418,14 @@ pub fn dequantize_rows_q4(m: &Q4Matrix, r0: usize, r1: usize, out: &mut [f32]) {
         let orow = &mut out[i * n_in..(i + 1) * n_in];
         for b in 0..bpr {
             let d = f16_to_f32(srow[b]);
+            let m = m
+                .offsets
+                .as_ref()
+                .map_or(0.0, |o| bf16_to_f32(o.v[r * (n_in / o.group) + b * QBLOCK / o.group]));
             for j in 0..16 {
                 let byte = qrow[b * 16 + j];
-                orow[b * QBLOCK + j] = ((byte & 0x0F) as i32 - 8) as f32 * d;
-                orow[b * QBLOCK + j + 16] = ((byte >> 4) as i32 - 8) as f32 * d;
+                orow[b * QBLOCK + j] = ((byte & 0x0F) as i32 - 8) as f32 * d + m;
+                orow[b * QBLOCK + j + 16] = ((byte >> 4) as i32 - 8) as f32 * d + m;
             }
         }
     }

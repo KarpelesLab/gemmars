@@ -104,6 +104,12 @@ impl Backend for WebGpuBackend {
         t >= MIN_T && n_out.is_multiple_of(64) && n_in.is_multiple_of(32) && 2.0 * t as f64 * n_out as f64 * n_in as f64 >= MIN_FLOPS
     }
     fn upload(&self, w: &WeightRef, n_out: usize, n_in: usize) -> Option<DeviceWeight> {
+        // Affine Q4 (MLX) has no device kernel yet; those layers run on the CPU.
+        if let WeightRef::Q4(m) = w
+            && m.offsets.is_some()
+        {
+            return None;
+        }
         let h = unsafe {
             match w {
                 WeightRef::Bf16(w) => gpu_upload(

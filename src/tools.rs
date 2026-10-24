@@ -298,7 +298,22 @@ pub mod qwen {
         s
     }
 
-    /// Every `<tool_call><function=NAME><parameter=K>V</parameter>...</function></tool_call>`.
+    /// Qwen3's tools block: JSON signatures, and calls answered as JSON objects.
+    pub fn tools_block_json(tools: &[ToolSpec]) -> String {
+        let mut s = String::from(
+            "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>",
+        );
+        for t in tools {
+            let v = json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } });
+            s.push('\n');
+            s.push_str(&py_json(&v));
+        }
+        s.push_str("\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
+        s
+    }
+
+    /// Every `<tool_call><function=NAME><parameter=K>V</parameter>...</function></tool_call>`, or
+    /// (Qwen3) `<tool_call>{"name": NAME, "arguments": {...}}</tool_call>`.
     /// Parameter values are JSON when they parse as JSON, strings otherwise (as the template writes).
     pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
         let mut calls = Vec::new();
@@ -307,7 +322,18 @@ pub mod qwen {
             let body = &rest[start + "<tool_call>".len()..];
             let end = body.find("</tool_call>").unwrap_or(body.len());
             let block = &body[..end];
-            if let Some(f) = block.find("<function=") {
+            if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(block.trim()) {
+                let name = o.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                let arguments = match o.get("arguments") {
+                    Some(Value::Object(a)) => a.clone(),
+                    // Some models write the arguments as a JSON string.
+                    Some(Value::String(a)) => serde_json::from_str(a).unwrap_or_default(),
+                    _ => Map::new(),
+                };
+                if !name.is_empty() {
+                    calls.push(ToolCall { name, arguments });
+                }
+            } else if let Some(f) = block.find("<function=") {
                 let after = &block[f + "<function=".len()..];
                 let name_end = after.find('>').unwrap_or(after.len());
                 let name = after[..name_end].trim().to_string();

@@ -42,8 +42,12 @@ impl Quant {
         }
     }
     /// The precision a pre-quantized checkpoint was written with (overrides `--quant`).
+    /// MLX checkpoints count as Q4 (their 4-bit matrices load as affine Q4).
     pub fn stored(files: &ModelFiles) -> Option<Quant> {
-        files.metadata("oxinfer_quant").and_then(Quant::parse)
+        files
+            .metadata("oxinfer_quant")
+            .and_then(Quant::parse)
+            .or_else(|| files.is_mlx().then_some(Quant::Q4))
     }
 }
 
@@ -72,6 +76,11 @@ pub enum Table<'a> {
         s_off: u64,
         cols: usize,
     },
+    /// An MLX affine-quantized table, dequantized row by row from the checkpoint.
+    Mlx {
+        parts: [crate::safetensors::TablePart<'a>; 3],
+        q: crate::safetensors::MlxQuant,
+    },
 }
 
 impl<'a> Table<'a> {
@@ -86,6 +95,21 @@ impl<'a> Table<'a> {
             }
             Table::Q8(m) => crate::quant::dequantize_rows(m, r, r + 1, out),
             Table::Q4(m) => crate::quant::dequantize_rows_q4(m, r, r + 1, out),
+            Table::Mlx { parts, q } => {
+                let (wb, gb) = (n * q.bits / 8, n / q.group * 2);
+                let mut w = vec![0u32; wb / 4];
+                let mut sb = vec![0u16; gb / 2];
+                let mut bb = vec![0u16; gb / 2];
+                let as_bytes = |v: &mut [u16]| unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 2) };
+                let ok = parts[0]
+                    .read(r * wb, unsafe { std::slice::from_raw_parts_mut(w.as_mut_ptr() as *mut u8, wb) })
+                    .and_then(|_| parts[1].read(r * gb, as_bytes(&mut sb)))
+                    .and_then(|_| parts[2].read(r * gb, as_bytes(&mut bb)));
+                if let Err(e) = ok {
+                    panic!("table row {r}: {e}");
+                }
+                crate::quant::mlx_dequant_row(&w, &sb, &bb, q.bits, q.group, out);
+            }
             &Table::Host {
                 qf,
                 sf,
@@ -130,6 +154,7 @@ impl<'a> Table<'a> {
                                 scales: crate::quant::QBuf::borrowed(sc),
                                 n_out: 1,
                                 n_in: cols,
+                                offsets: None,
                             };
                             crate::quant::dequantize_rows_q4(&m, 0, 1, out);
                         }
@@ -146,6 +171,13 @@ impl<'a> Table<'a> {
             Table::Q8(m) => m.bytes(),
             Table::Q4(m) => m.bytes(),
             Table::Host { .. } => 0,
+            Table::Mlx { parts, .. } => parts
+                .iter()
+                .map(|p| match p {
+                    crate::safetensors::TablePart::Mem(b) => b.len(),
+                    crate::safetensors::TablePart::Host(..) => 0,
+                })
+                .sum(),
         }
     }
 
@@ -180,6 +212,13 @@ impl<'a> Table<'a> {
                 });
             }
         }
+        if let (Some(q), Some(parts)) = (files.mlx(full), files.mlx_parts(full)) {
+            let info = files.info(full).unwrap();
+            if info.shape != [rows, cols] {
+                bail!("table {full} has shape {:?}, expected [{rows}, {cols}]", info.shape);
+            }
+            return Ok(Table::Mlx { parts, q });
+        }
         // SAFETY: the table borrows `files` for 'a, which outlives every model holding it.
         if let Some(st) = unsafe { files.quantized(full, rows, cols)? } {
             return Ok(match st {
@@ -209,6 +248,10 @@ pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize
             Stored::Q8(m) => Lin::q8(m),
             Stored::Q4(m) => Lin::q4(m),
         });
+    }
+    // MLX 4-bit: repacked as affine Q4 whatever `q` asks for (other widths dequantize to bf16 below).
+    if let Some(m) = files.mlx_q4(full, n_out, n_in)? {
+        return Ok(Lin::q4(m));
     }
     let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
     if info.shape != [n_out, n_in] {
@@ -395,12 +438,13 @@ pub struct Layer<'a> {
     k: Option<Lin<'a>>,
     v: Option<Lin<'a>>,
     o: Lin<'a>,
-    q_norm: &'a [u16],
-    k_norm: Option<&'a [u16]>,
-    ln_in: &'a [u16],
-    ln_post_attn: &'a [u16],
-    ln_pre_ffn: &'a [u16],
-    ln_post_ffn: &'a [u16],
+    // Norm weights in f32 (with Gemma 3's `1 +` folded in).
+    q_norm: Vec<f32>,
+    k_norm: Option<Vec<f32>>,
+    ln_in: Vec<f32>,
+    ln_post_attn: Vec<f32>,
+    ln_pre_ffn: Vec<f32>,
+    ln_post_ffn: Vec<f32>,
     gate: Lin<'a>,
     up: Lin<'a>,
     down: Lin<'a>,
@@ -415,7 +459,7 @@ pub struct Model<'a> {
     head: Lin<'a>,    // tied LM head (same values as `embed`)
     ple: Option<PleGlobal<'a>>,
     pub layers: Vec<Layer<'a>>,
-    final_norm: &'a [u16],
+    final_norm: Vec<f32>,
     inv_freq_sliding: Vec<f32>,
     inv_freq_full: Vec<f32>,
 }
@@ -525,7 +569,9 @@ impl<'a> Model<'a> {
         // Tied: lookups and the LM head read the same tensor (one copy in a pre-quantized file).
         let embed = Table::load(files, &format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h, head_quant)?;
         let head = lin_with("embed_tokens.weight", cfg.vocab_size, h, head_quant)?;
-        let final_norm = get("norm.weight", &[h])?;
+        let off = cfg.norm_offset();
+        let nw = |w: &[u16]| -> Vec<f32> { w.iter().map(|&v| off + bf16_to_f32(v)).collect() };
+        let final_norm = nw(get("norm.weight", &[h])?);
         let ple = if cfg.has_ple() {
             Some(PleGlobal {
                 embed: Table::load(
@@ -561,7 +607,7 @@ impl<'a> Model<'a> {
                     } else {
                         Some(gl("self_attn.v_proj.weight", n_kv * hd, h)?)
                     },
-                    Some(g("self_attn.k_norm.weight", &[hd])?),
+                    Some(nw(g("self_attn.k_norm.weight", &[hd])?)),
                 )
             } else {
                 (None, None, None)
@@ -591,12 +637,12 @@ impl<'a> Model<'a> {
                 k,
                 v,
                 o: gl("self_attn.o_proj.weight", h, nh * hd)?,
-                q_norm: g("self_attn.q_norm.weight", &[hd])?,
+                q_norm: nw(g("self_attn.q_norm.weight", &[hd])?),
                 k_norm,
-                ln_in: g("input_layernorm.weight", &[h])?,
-                ln_post_attn: g("post_attention_layernorm.weight", &[h])?,
-                ln_pre_ffn: g("pre_feedforward_layernorm.weight", &[h])?,
-                ln_post_ffn: g("post_feedforward_layernorm.weight", &[h])?,
+                ln_in: nw(g("input_layernorm.weight", &[h])?),
+                ln_post_attn: nw(g("post_attention_layernorm.weight", &[h])?),
+                ln_pre_ffn: nw(g("pre_feedforward_layernorm.weight", &[h])?),
+                ln_post_ffn: nw(g("post_feedforward_layernorm.weight", &[h])?),
                 gate: gl("mlp.gate_proj.weight", inter, h)?,
                 up: gl("mlp.up_proj.weight", inter, h)?,
                 down: gl("mlp.down_proj.weight", h, inter)?,
@@ -607,8 +653,12 @@ impl<'a> Model<'a> {
 
         let rs = cfg.rope_spec(true);
         let rf = cfg.rope_spec(false);
-        let inv_freq_sliding = rope_inv_freq(cfg.head_dim, rs.theta, rs.proportion);
-        let inv_freq_full = rope_inv_freq(cfg.global_head_dim, rf.theta, rf.proportion);
+        let scaled = |mut f: Vec<f32>, factor: f64| {
+            f.iter_mut().for_each(|v| *v /= factor as f32);
+            f
+        };
+        let inv_freq_sliding = scaled(rope_inv_freq(cfg.head_dim, rs.theta, rs.proportion), rs.factor);
+        let inv_freq_full = scaled(rope_inv_freq(cfg.global_head_dim, rf.theta, rf.proportion), rf.factor);
 
         Ok(Self {
             cfg,
@@ -753,7 +803,7 @@ impl<'a> Model<'a> {
         }
 
         // Final norm.
-        rmsnorm_rows_inplace(&mut x, h, Some(self.final_norm), eps);
+        rmsnorm_f32w_rows_inplace(&mut x, h, &self.final_norm, eps);
         sess.pos += t;
         x
     }
@@ -782,7 +832,7 @@ impl<'a> Model<'a> {
 
         // ---- Attention ----
         let mut hn = vec![0f32; t * h];
-        rmsnorm_rows(x, h, Some(layer.ln_in), eps, &mut hn);
+        rmsnorm_f32w_rows(x, h, &layer.ln_in, eps, &mut hn);
 
         // Q (and K, V when this layer owns its cache) share the input: one fused parallel region.
         let mut q = vec![0f32; t * nh * hd];
@@ -798,21 +848,27 @@ impl<'a> Model<'a> {
             }
             linear_multi(&mut jobs, h, &hn, t);
         }
+        let qscale = cfg.query_scale();
         for_chunks(&mut q, hd, par, |i, qh| {
             let ti = i / nh;
-            rmsnorm_inplace(qh, Some(layer.q_norm), eps);
+            rmsnorm_f32w_inplace(qh, &layer.q_norm, eps);
             apply_rope(qh, &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half]);
+            if qscale != 1.0 {
+                scale_inplace(qh, qscale);
+            }
         });
 
         if layer.own_kv {
             if layer.k_eq_v {
                 v = k.clone();
             }
-            for_chunks(&mut v, hd, par, |_, vh| rmsnorm_inplace(vh, None, eps));
-            let k_norm = layer.k_norm.unwrap();
+            if !cfg.gemma3 {
+                for_chunks(&mut v, hd, par, |_, vh| rmsnorm_inplace(vh, None, eps));
+            }
+            let k_norm = layer.k_norm.as_deref().unwrap();
             for_chunks(&mut k, hd, par, |i, kh| {
                 let ti = i / n_kv;
-                rmsnorm_inplace(kh, Some(k_norm), eps);
+                rmsnorm_f32w_inplace(kh, k_norm, eps);
                 apply_rope(kh, &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half]);
             });
             sess.caches[l].as_mut().unwrap().push(&k, &v, t);
@@ -825,11 +881,11 @@ impl<'a> Model<'a> {
 
         let mut o = vec![0f32; t * h];
         linear(&layer.o, h, nh * hd, &att, t, &mut o);
-        rmsnorm_rows_inplace(&mut o, h, Some(layer.ln_post_attn), eps);
+        rmsnorm_f32w_rows_inplace(&mut o, h, &layer.ln_post_attn, eps);
         add_inplace(x, &o);
 
         // ---- MLP ----
-        rmsnorm_rows(x, h, Some(layer.ln_pre_ffn), eps, &mut hn);
+        rmsnorm_f32w_rows(x, h, &layer.ln_pre_ffn, eps, &mut hn);
         let inter = layer.inter;
         let mut g = vec![0f32; t * inter];
         let mut u = vec![0f32; t * inter];
@@ -837,7 +893,7 @@ impl<'a> Model<'a> {
         gelu_mul(&mut g, &u);
         let mut d = o; // reuse buffer [t, h]
         linear(&layer.down, h, inter, &g, t, &mut d);
-        rmsnorm_rows_inplace(&mut d, h, Some(layer.ln_post_ffn), eps);
+        rmsnorm_f32w_rows_inplace(&mut d, h, &layer.ln_post_ffn, eps);
         add_inplace(x, &d);
 
         // ---- Per-layer embedding injection ----
