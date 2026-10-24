@@ -32,6 +32,7 @@ pub mod qwen;
 pub mod safetensors;
 pub mod sampler;
 pub mod sd;
+pub mod tools;
 pub mod vision;
 #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
 pub mod web;

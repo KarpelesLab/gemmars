@@ -18,6 +18,9 @@ struct Args {
     model: PathBuf,
     prompt: Option<String>,
     system: Option<String>,
+    no_system: bool,
+    tools: bool,
+    print_prompt: bool,
     think: bool,
     raw: bool,
     chat: bool,
@@ -64,7 +67,10 @@ fn usage() -> ! {
          options:\n\
          \x20 --prompt TEXT        single prompt (default: read from stdin)\n\
          \x20 --chat               interactive multi-turn chat\n\
-         \x20 --system TEXT        system prompt\n\
+         \x20 --system TEXT        system prompt (default: a short one with the local date and time)\n\
+         \x20 --no-system          no system prompt\n\
+         \x20 --tools              let the model call built-in tools (date and time, calculator)\n\
+         \x20 --print-prompt       print the formatted prompt and exit\n\
          \x20 --think              enable thinking mode\n\
          \x20 --raw                no chat template (prompt is fed as-is, with <bos>)\n\
          \x20 --max-tokens N       max new tokens (default 1024)\n\
@@ -110,6 +116,9 @@ fn parse_args() -> Result<Args> {
         model: PathBuf::new(),
         prompt: None,
         system: None,
+        no_system: false,
+        tools: false,
+        print_prompt: false,
         think: false,
         raw: false,
         chat: false,
@@ -151,6 +160,9 @@ fn parse_args() -> Result<Args> {
             "--model" | "-m" => a.model = PathBuf::from(val()?),
             "--prompt" | "-p" => a.prompt = Some(val()?),
             "--system" => a.system = Some(val()?),
+            "--no-system" => a.no_system = true,
+            "--tools" => a.tools = true,
+            "--print-prompt" => a.print_prompt = true,
             "--think" => a.think = true,
             "--raw" => a.raw = true,
             "--chat" => a.chat = true,
@@ -427,17 +439,25 @@ struct Printer {
     printed: usize,
     soc: u32,
     eoc: u32,
+    /// Token that opens a tool call: nothing from it on is shown (the host runs the call).
+    call: Option<u32>,
 }
 
 impl Printer {
-    fn new(fmt: &dyn ChatFormat, think: bool) -> Self {
+    fn new(fmt: &dyn ChatFormat, think: bool, tok: &Tokenizer) -> Self {
         let (soc, eoc) = fmt.think_ids();
+        let call = tok.token_to_id(fmt.tool_call_marker());
         if fmt.starts_in_thinking(think) {
             let mut lock = std::io::stdout().lock();
             let _ = lock.write_all(b"\x1b[2m");
             let _ = lock.flush();
         }
-        Self { printed: 0, soc, eoc }
+        Self {
+            printed: 0,
+            soc,
+            eoc,
+            call,
+        }
     }
 
     fn on_token(&mut self, id: u32) {
@@ -450,7 +470,11 @@ impl Printer {
 
     fn flush_text(&mut self, tok: &Tokenizer, out: &[u32], final_: bool) {
         // Thinking delimiters are rendered as dimming, never as text (some tokenizers keep them).
-        let shown: Vec<u32> = out.iter().copied().filter(|&t| t != self.soc && t != self.eoc).collect();
+        let visible = match self.call.and_then(|c| out.iter().position(|&t| t == c)) {
+            Some(i) => &out[..i],
+            None => out,
+        };
+        let shown: Vec<u32> = visible.iter().copied().filter(|&t| t != self.soc && t != self.eoc).collect();
         if let Ok(text) = tok.decode(&shown, true) {
             let stable = if !final_ && text.ends_with('\u{FFFD}') {
                 text.len().saturating_sub(3)
@@ -503,7 +527,7 @@ fn generate_speculative(
         per_pos: [0; 16],
     };
     let mut out: Vec<u32> = Vec::new();
-    let mut printer = Printer::new(&chat::GemmaChat, false);
+    let mut printer = Printer::new(&chat::GemmaChat, false, tok);
 
     // First token from the prompt's logits (the prefill forward already counted by the caller).
     let logits = model.logits(&hidden_last, 1);
@@ -639,7 +663,7 @@ fn generate<M: TextLm>(
 ) -> (Vec<u32>, usize, f64) {
     let t0 = Instant::now();
     let mut out: Vec<u32> = Vec::new();
-    let mut printer = Printer::new(fmt, think);
+    let mut printer = Printer::new(fmt, think, tok);
     let mut n_forward = 0usize;
     for _ in 0..max_tokens {
         let id = sampler.sample(&logits);
@@ -778,6 +802,71 @@ fn run(mut args: Args) -> Result<()> {
     }
 }
 
+/// The system prompt in effect: `--system`, else the default one (unless `--no-system`, a raw
+/// prompt, or a logits dump, which must match reference renderings without one).
+fn system_prompt(args: &Args) -> Option<String> {
+    if args.system.is_some() {
+        return args.system.clone();
+    }
+    if args.no_system || args.raw || args.dump_logits.is_some() {
+        return None;
+    }
+    Some(oxinfer::tools::default_system_prompt(args.tools))
+}
+
+fn tool_specs(args: &Args) -> Vec<oxinfer::tools::ToolSpec> {
+    if args.tools { oxinfer::tools::builtin_specs() } else { Vec::new() }
+}
+
+/// After a reply, runs the built-in tools it called, feeds the results back and lets the model
+/// continue, for up to 5 rounds. Returns the tokens generated after the last round.
+#[allow(clippy::too_many_arguments)]
+fn continue_with_tools<M: TextLm>(
+    args: &Args,
+    model: &M,
+    sess: &mut M::Sess,
+    tok: &Tokenizer,
+    eos: &[u32],
+    fmt: &dyn ChatFormat,
+    sampler: &mut Sampler,
+    mut out: Vec<u32>,
+) -> Result<Vec<u32>> {
+    if !args.tools {
+        return Ok(out);
+    }
+    for _ in 0..5 {
+        let raw = tok.decode(&out, false).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+        let calls = fmt.parse_tool_calls(&raw);
+        if calls.is_empty() {
+            break;
+        }
+        let results: Vec<oxinfer::tools::ToolResult> = calls
+            .iter()
+            .map(|c| {
+                let content = oxinfer::tools::run_builtin(c);
+                eprintln!("[tool {}({}) -> {content}]", c.name, serde_json::Value::Object(c.arguments.clone()));
+                oxinfer::tools::ToolResult {
+                    name: c.name.clone(),
+                    content,
+                }
+            })
+            .collect();
+        let text = fmt.tool_results(&results, args.think);
+        let ids = tok
+            .encode(text.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?
+            .get_ids()
+            .to_vec();
+        let hs = prefill_mm(model, sess, &ids, args.prefill_chunk.unwrap_or(256), &[]);
+        let h = model.hidden_size();
+        let logits = model.logits(&hs[hs.len() - h..], 1);
+        let (o, n, secs) = generate(model, sess, tok, logits, sampler, eos, args.max_tokens, fmt, args.think);
+        report(ids.len(), 0.0, n, secs);
+        out = o;
+    }
+    Ok(out)
+}
+
 /// Text-to-image with a diffusers Stable Diffusion folder.
 fn run_image(args: &Args) -> Result<()> {
     use oxinfer::sd::{Params, Pipeline, sched::Sampler};
@@ -863,7 +952,7 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
             }
             let mut text = String::new();
             if first {
-                text.push_str(&fmt.conversation_start(args.system.as_deref(), args.think));
+                text.push_str(&fmt.conversation_start_tools(system_prompt(args).as_deref(), args.think, &tool_specs(args)));
                 first = false;
             } else {
                 text.push_str(&fmt.end_of_model_turn());
@@ -886,6 +975,7 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
             if args.profile {
                 prof::report(decode_secs, n);
             }
+            continue_with_tools(args, model, &mut sess, tok, eos, fmt, &mut sampler, out)?;
         }
         return Ok(());
     }
@@ -900,10 +990,14 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
     let text = if args.raw {
         prompt
     } else {
-        let mut t = fmt.conversation_start(args.system.as_deref(), args.think);
+        let mut t = fmt.conversation_start_tools(system_prompt(args).as_deref(), args.think, &tool_specs(args));
         t.push_str(&fmt.user_turn(&prompt, args.think));
         t
     };
+    if args.print_prompt {
+        print!("{text}");
+        return Ok(());
+    }
     let ids = encode(&text)?;
     if args.show_tokens {
         eprintln!("[prompt ids ({}): {ids:?}]", ids.len());
@@ -943,6 +1037,7 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
         eprintln!("-- decode --");
         prof::report(decode_secs, n);
     }
+    continue_with_tools(args, model, &mut sess, tok, eos, fmt, &mut sampler, out)?;
     Ok(())
 }
 
@@ -1057,7 +1152,7 @@ fn run_gemma(args: Args) -> Result<()> {
             let mut text = String::new();
             let mut overrides = Vec::new();
             if first {
-                text.push_str(&chat::conversation_start(args.system.as_deref(), args.think));
+                text.push_str(&chat::GemmaChat.conversation_start_tools(system_prompt(&args).as_deref(), args.think, &tool_specs(&args)));
                 text.push_str(&chat::user_turn(&format!("{mm_text}{line}")));
                 first = false;
             } else {
@@ -1113,6 +1208,7 @@ fn run_gemma(args: Args) -> Result<()> {
             if args.profile {
                 prof::report(decode_secs, n);
             }
+            continue_with_tools(&args, &model, &mut sess, &tok, &eos, &chat::GemmaChat, &mut sampler, out)?;
         }
         return Ok(());
     }
@@ -1134,10 +1230,14 @@ fn run_gemma(args: Args) -> Result<()> {
     let text = if args.raw {
         format!("<bos>{prompt}")
     } else {
-        let mut t = chat::conversation_start(args.system.as_deref(), args.think);
+        let mut t = chat::GemmaChat.conversation_start_tools(system_prompt(&args).as_deref(), args.think, &tool_specs(&args));
         t.push_str(&chat::user_turn(&prompt));
         t
     };
+    if args.print_prompt {
+        print!("{text}");
+        return Ok(());
+    }
     let ids = encode(&text)?;
     let overrides = mm_overrides(&ids, &mm_feats, model.cfg.hidden_size)?;
     if args.show_tokens {
@@ -1220,5 +1320,6 @@ fn run_gemma(args: Args) -> Result<()> {
         eprintln!("-- decode --");
         prof::report(decode_secs, n);
     }
+    continue_with_tools(&args, &model, &mut sess, &tok, &eos, &chat::GemmaChat, &mut sampler, out)?;
     Ok(())
 }

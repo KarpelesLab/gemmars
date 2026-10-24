@@ -71,6 +71,7 @@ impl DevicePref {
 }
 
 pub fn cpu_features() -> Vec<&'static str> {
+    #[allow(unused_mut)] // only the aarch64 and x86 detection below push features
     let mut f = Vec::new();
     #[cfg(target_arch = "aarch64")]
     {

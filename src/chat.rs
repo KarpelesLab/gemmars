@@ -1,4 +1,6 @@
-//! Gemma 4 chat formatting (mirrors the canonical chat template for text-only turns).
+//! Chat formatting for each model family (mirrors their chat templates), including tool calling.
+
+use crate::tools::{ToolCall, ToolResult, ToolSpec};
 
 pub const EOT: &str = "<turn|>";
 
@@ -40,6 +42,16 @@ pub trait ChatFormat {
     /// generation starts inside one when thinking is enabled.
     fn think_ids(&self) -> (u32, u32);
     fn starts_in_thinking(&self, think: bool) -> bool;
+
+    /// Conversation start with tool declarations in the system turn (as the model's template).
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String;
+    /// The text (a special token for Gemma) that opens a tool call in generated output.
+    fn tool_call_marker(&self) -> &'static str;
+    /// Tool calls in a reply decoded with its special tokens.
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall>;
+    /// What to feed after a reply that ended on its tool calls (its stop token was sampled but not
+    /// fed): the results, up to where the model continues.
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String;
 }
 
 pub struct GemmaChat;
@@ -61,6 +73,37 @@ impl ChatFormat for GemmaChat {
     }
     fn starts_in_thinking(&self, _think: bool) -> bool {
         false
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        if tools.is_empty() {
+            return conversation_start(system, think);
+        }
+        let mut s = String::from("<bos><|turn>system\n");
+        if think {
+            s.push_str("<|think|>\n");
+        }
+        if let Some(sys) = system {
+            s.push_str(sys.trim());
+        }
+        for t in tools {
+            s.push_str(&crate::tools::gemma::declaration(t));
+        }
+        s.push_str("<turn|>\n");
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        "<|tool_call>"
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::gemma::parse_calls(raw)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        // The model stopped on `<|tool_response>`; the responses continue the same model turn.
+        let mut s: String = results.iter().map(crate::tools::gemma::response).collect();
+        if think {
+            s.push_str("<|channel>thought\n");
+        }
+        s
     }
 }
 
@@ -94,6 +137,41 @@ impl ChatFormat for QwenChat {
     }
     fn starts_in_thinking(&self, think: bool) -> bool {
         think
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        if tools.is_empty() {
+            return self.conversation_start(system, think);
+        }
+        let mut s = String::from("<|im_start|>system\n");
+        if think {
+            s.push_str(QWEN_REASONING_XHIGH);
+            s.push_str("\n\n");
+        }
+        s.push_str(&crate::tools::qwen::tools_block(tools));
+        if let Some(sys) = system.map(str::trim).filter(|s| !s.is_empty()) {
+            s.push_str("\n\n");
+            s.push_str(sys);
+        }
+        s.push_str("<|im_end|>\n");
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        "<tool_call>"
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::qwen::parse_calls(raw)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        // The assistant turn ended (<|im_end|> was sampled, not fed); results come as a user turn.
+        let mut s = String::from("<|im_end|>\n<|im_start|>user");
+        for r in results {
+            s.push_str("\n<tool_response>\n");
+            s.push_str(&r.content);
+            s.push_str("\n</tool_response>");
+        }
+        s.push_str("<|im_end|>\n<|im_start|>assistant\n");
+        s.push_str(if think { "<think>\n" } else { "<think>\n\n</think>\n\n" });
+        s
     }
 }
 
