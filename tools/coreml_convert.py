@@ -32,10 +32,16 @@ Requires: coremltools >= 8 (tested with 9.0 and torch 2.14; coremltools 9.0 need
 torch, safetensors, numpy, scikit-learn (k-means),
 Xcode command line tools (`xcrun coremlcompiler`). Run on macOS.
 
+quantization (--ffn-quant / --lmhead-quant / --embed-quant):
+  none          fp16
+  lutN[,G]      k-means palettization, N bits (1-8), G output channels per LUT (default 8)
+  int8[,tensor] linear int8 per channel (or per tensor)  -- wrong results on the ANE, GPU only
+  int4[,B]      linear int4 per block of B (default 32)   -- does not compile for the ANE
+
 examples:
   coreml_convert.py --model ~/.cache/oxinfer/hub/Qwen--Qwen3-0.6B --output out/qwen3-0.6b
   coreml_convert.py --model ~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B --output out/q35 \\
-      --context-length 1024 --ffn-quant lut6 --lmhead-quant lut6
+      --context-length 1024 --ffn-quant lut4    # smaller, lower quality
 """
 from __future__ import annotations
 
@@ -102,6 +108,14 @@ class Spec:
     lin_dk: int = 0
     lin_dv: int = 0
     conv_k: int = 0
+    # Gemma 4
+    global_head_dim: int = 0
+    sliding_window: int = 0
+    first_shared: int = 0  # first layer reusing the KV of an earlier layer (n_layers: none)
+    ple_dim: int = 0  # per-layer embedding width (0: none)
+    softcap: float = 0.0  # final logit soft cap
+    theta_local: float = 0.0
+    global_rot_frac: float = 1.0
 
     @property
     def full_layers(self):
@@ -164,7 +178,28 @@ def load_spec(cfg: dict) -> Spec:
             conv_k=tc["linear_conv_kernel_dim"],
             **common,
         )
-    raise SystemExit(f"unsupported model_type {mt!r} (supported: qwen3, qwen3_5)")
+    if mt in ("gemma4", "gemma4_text"):
+        if tc.get("enable_moe_block") or tc.get("num_experts"):
+            raise SystemExit("Gemma 4 MoE checkpoints are not supported yet")
+        if tc.get("attention_k_eq_v"):
+            raise SystemExit("Gemma 4 attention_k_eq_v (12B/31B) is not supported yet")
+        rpl = tc["rope_parameters"]
+        n = common["n_layers"]
+        return Spec(
+            arch="gemma4",
+            theta=float(rpl["full_attention"]["rope_theta"]),
+            theta_local=float(rpl["sliding_attention"]["rope_theta"]),
+            global_rot_frac=float(rpl["full_attention"].get("partial_rotary_factor", 1.0)),
+            rot_dim=head_dim,
+            layer_types=["full" if t == "full_attention" else "sliding" for t in tc["layer_types"]],
+            global_head_dim=tc.get("global_head_dim") or head_dim,
+            sliding_window=tc["sliding_window"],
+            first_shared=n - (tc.get("num_kv_shared_layers") or 0),
+            ple_dim=tc.get("hidden_size_per_layer_input") or 0,
+            softcap=float(tc.get("final_logit_softcapping") or 0.0),
+            **common,
+        )
+    raise SystemExit(f"unsupported model_type {mt!r} (supported: qwen3, qwen3_5, gemma4)")
 
 
 class Checkpoint:
@@ -397,24 +432,28 @@ class GatedDeltaNet(nn.Module):
         z = self.in_z(hs).view(nv, dv, t).permute(0, 2, 1)  # [nv, T, dv]
 
         st = gdn_state[s * nv : (s + 1) * nv]  # [nv, dk, dv] = sqrt(dk) S
-        if t == 1:
-            st = st * torch.exp(g).view(nv, 1, 1)
-            mem = torch.matmul(k, st) * rd  # S^T k, [nv, 1, dv]
-            delta = (v - mem) * beta.view(nv, 1, 1)
-            st = st + torch.matmul(ks.transpose(1, 2), delta)
-            o = torch.matmul(q, st)  # d_k S^T q_scaled
-        else:
-            outs = []
-            for c0 in range(0, t, self.chunk):
-                sl = slice(c0, c0 + self.chunk)
-                o_c, st = self.chunk_step(q[:, sl], k[:, sl], ks[:, sl], v[:, sl], g[:, sl], beta[:, sl], st)
-                outs.append(o_c)
-            o = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
+        outs = []
+        for c0 in range(0, t, self.chunk if t > 1 else 1):
+            n = 1 if (t == 1 or self.chunk == 1) else self.chunk
+            sl = slice(c0, c0 + n)
+            step = self.token_step if n == 1 else self.chunk_step
+            o_c, st = step(q[:, sl], k[:, sl], ks[:, sl], v[:, sl], g[:, sl], beta[:, sl], st)
+            outs.append(o_c)
+        o = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
         gdn_state[s * nv : (s + 1) * nv] = st
 
         o = self.norm(o) * silu(z)  # [nv, T, dv]
         o = o.permute(0, 2, 1).reshape(1, nv * dv, 1, t)
         return self.out_proj(o).squeeze(2).permute(0, 2, 1)  # [1, T, H]
+
+    def token_step(self, q, k, ks, v, g, beta, st):
+        """The recurrence for one token (q, k, ks [nv, 1, dk], v [nv, 1, dv], g, beta [nv, 1])."""
+        nv = g.shape[0]
+        st = st * torch.exp(g).view(nv, 1, 1)
+        mem = torch.matmul(k, st) * (1.0 / math.sqrt(k.shape[-1]))  # S^T k, [nv, 1, dv]
+        delta = (v - mem) * beta.view(nv, 1, 1)
+        st = st + torch.matmul(ks.transpose(1, 2), delta)
+        return torch.matmul(q, st), st  # d_k S^T q_scaled
 
     def chunk_step(self, q, k, ks, v, g, beta, st):
         """Chunked gated delta rule over C tokens (unit q, k and ks = sqrt(d_k) k [nv, C, dk],
@@ -523,6 +562,13 @@ class Decoder(nn.Module):
 def state_shapes(sp: Spec, ctx: int) -> dict:
     """Core ML states of the model (buffer name -> shape), all fp16."""
     out = {}
+    if sp.arch == "gemma4":
+        loc, glob = gemma_slots(sp)
+        # [slot, K heads then V heads, position, head_dim]: one slice update per layer (two
+        # separate K and V updates with a single KV head fail to compile for the ANE)
+        out["kv_cache_local"] = (len(loc), 2 * sp.n_kv, ctx, sp.head_dim)
+        out["kv_cache_global"] = (len(glob), 2 * sp.n_kv, ctx, sp.global_head_dim)
+        return out
     nf = len(sp.full_layers)
     if nf:
         out["kv_cache_0"] = (2 * nf, sp.n_kv, ctx, sp.head_dim)
@@ -544,13 +590,15 @@ class Root(nn.Module):
 
 
 class ChunkFn(nn.Module):
-    def __init__(self, dec: Decoder, prefill: bool):
+    def __init__(self, dec: nn.Module, prefill: bool):
         super().__init__()
         self.model = Root(dec)
         self.prefill = prefill
 
-    def forward(self, hidden_states, position_ids, causal_mask, current_pos):
-        return self.model.model(hidden_states, position_ids, causal_mask, current_pos, self.prefill)
+    def forward(self, hidden_states, position_ids, causal_mask, current_pos, per_layer_inputs=None):
+        if per_layer_inputs is None:
+            return self.model.model(hidden_states, position_ids, causal_mask, current_pos, self.prefill)
+        return self.model.model(hidden_states, position_ids, causal_mask, current_pos, self.prefill, per_layer_inputs)
 
 
 class Embeddings(nn.Module):
@@ -567,15 +615,228 @@ class Embeddings(nn.Module):
 class LMHead(nn.Module):
     """Vocabulary split into `n` 1x1 convolutions (ANE output width limit), one output each."""
 
-    def __init__(self, w, n: int):
+    def __init__(self, w, n: int, softcap: float = 0.0):
         super().__init__()
         v = w.shape[0]
         self.sizes = [v // n + (1 if i < v % n else 0) for i in range(n)]
+        self.softcap = softcap
+        if softcap:  # cap * tanh(logits / cap): fold 1/cap into the weights
+            w = w / softcap
         self.heads = nn.ModuleList([conv1x1(p) for p in torch.split(w, self.sizes)])
 
     def forward(self, hidden_states):
         hs = hidden_states.permute(0, 2, 1).unsqueeze(2)
-        return tuple(h(hs).squeeze(2).transpose(1, 2) for h in self.heads)
+        out = [h(hs).squeeze(2).transpose(1, 2) for h in self.heads]
+        if self.softcap:
+            out = [torch.tanh(o) * self.softcap for o in out]
+        return tuple(out)
+
+
+# ---------------------------------------------------------------------------------------------
+# Gemma 4
+# ---------------------------------------------------------------------------------------------
+
+
+def gelu_tanh(x):
+    """gelu_pytorch_tanh, with x (1 + c x^2) inside so that it does not overflow fp16."""
+    return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * (x * (1.0 + 0.044715 * x * x))))
+
+
+def gemma_slots(sp: Spec):
+    """KV cache slots: the non-shared sliding / full attention layers, in order."""
+    loc = [i for i in range(sp.first_shared) if sp.layer_types[i] == "sliding"]
+    glob = [i for i in range(sp.first_shared) if sp.layer_types[i] == "full"]
+    return loc, glob
+
+
+def gemma_kv_source(sp: Spec, i: int) -> int:
+    """The layer whose K/V layer `i` attends to: itself, or for the KV-shared layers the last
+    non-shared layer of the same type."""
+    if i < sp.first_shared:
+        return i
+    return max(j for j in range(sp.first_shared) if sp.layer_types[j] == sp.layer_types[i])
+
+
+class GemmaAttention(nn.Module):
+    """Gemma 4 attention: q/k RMSNorm with weight, v RMSNorm without, RoPE, no 1/sqrt(d)
+    scaling; KV-shared layers only project q and read the cache of their source layer."""
+
+    def __init__(self, sp: Spec, ck: Checkpoint, i: int):
+        super().__init__()
+        p = f"layers.{i}.self_attn."
+        self.kind = sp.layer_types[i]
+        self.hd = sp.head_dim if self.kind == "sliding" else sp.global_head_dim
+        self.nh, self.nkv, self.eps = sp.n_heads, sp.n_kv, sp.eps
+        slots = gemma_slots(sp)[0 if self.kind == "sliding" else 1]
+        src = gemma_kv_source(sp, i)
+        self.shared = src != i
+        self.slot = slots.index(src)
+        self.q_proj = conv1x1(ck.get(p + "q_proj.weight"))
+        self.o_proj = conv1x1(ck.get(p + "o_proj.weight"))
+        self.q_norm = RMSNorm(ck.get(p + "q_norm.weight"), sp.eps)
+        if not self.shared:
+            self.k_proj = conv1x1(ck.get(p + "k_proj.weight"))
+            self.v_proj = conv1x1(ck.get(p + "v_proj.weight"))
+            self.k_norm = RMSNorm(ck.get(p + "k_norm.weight"), sp.eps)
+
+    def heads(self, y, n, t):
+        if t == 1:
+            return y.view(1, n, 1, self.hd)
+        return y.view(1, n, self.hd, t).permute(0, 1, 3, 2)
+
+    def forward(self, x, cos, sin, mask, current_pos, cache):
+        t = x.shape[1]
+        hs = x.permute(0, 2, 1).unsqueeze(2)
+        q = self.q_norm(self.heads(self.q_proj(hs), self.nh, t))
+        q = q * cos + rotate_half(q) * sin
+        s, nkv = self.slot, self.nkv
+        if not self.shared:
+            k = self.k_norm(self.heads(self.k_proj(hs), nkv, t))
+            k = k * cos + rotate_half(k) * sin
+            v = rms(self.heads(self.v_proj(hs), nkv, t), self.eps)
+            cache[s : s + 1, :, current_pos : current_pos + t, :] = torch.cat([k, v], dim=1)
+        kc = cache[s, :nkv]  # [nkv, ctx, hd]
+        vc = cache[s, nkv:]
+        rep = self.nh // self.nkv
+        if rep > 1:
+            kc = kc.unsqueeze(1).repeat(1, rep, 1, 1)
+            vc = vc.unsqueeze(1).repeat(1, rep, 1, 1)
+        kc = kc.view(1, self.nh, -1, self.hd)
+        vc = vc.view(1, self.nh, -1, self.hd)
+        att = torch.softmax(torch.matmul(q, kc.transpose(-1, -2)) + mask, dim=-1)
+        o = torch.matmul(att, vc).permute(0, 1, 3, 2).reshape(1, self.nh * self.hd, 1, t)
+        return self.o_proj(o).squeeze(2).permute(0, 2, 1)
+
+
+class GemmaLayer(nn.Module):
+    def __init__(self, sp: Spec, ck: Checkpoint, i: int):
+        super().__init__()
+        p = f"layers.{i}."
+        self.idx, self.kind = i, sp.layer_types[i]
+
+        def norm(n):
+            return RMSNorm(ck.get(p + n + ".weight"), sp.eps)
+
+        self.input_layernorm = norm("input_layernorm")
+        self.post_attention_layernorm = norm("post_attention_layernorm")
+        self.pre_feedforward_layernorm = norm("pre_feedforward_layernorm")
+        self.post_feedforward_layernorm = norm("post_feedforward_layernorm")
+        self.self_attn = GemmaAttention(sp, ck, i)
+        self.gate_proj = conv1x1(ck.get(p + "mlp.gate_proj.weight"))
+        self.up_proj = conv1x1(ck.get(p + "mlp.up_proj.weight"))
+        self.down_proj = conv1x1(ck.get(p + "mlp.down_proj.weight"))
+        self.ple = sp.ple_dim
+        if self.ple:
+            self.per_layer_input_gate = conv1x1(ck.get(p + "per_layer_input_gate.weight"))
+            self.per_layer_projection = conv1x1(ck.get(p + "per_layer_projection.weight"))
+            self.post_per_layer_input_norm = norm("post_per_layer_input_norm")
+        self.scalar = float(ck.get(p + "layer_scalar").item()) if ck.has(p + "layer_scalar") else 1.0
+
+    def forward(self, x, cos, sin, mask, current_pos, cache, pli):
+        h = self.self_attn(self.input_layernorm(x), cos, sin, mask, current_pos, cache)
+        x = x + self.post_attention_layernorm(h)
+        hs = self.pre_feedforward_layernorm(x).permute(0, 2, 1).unsqueeze(2)
+        h = self.down_proj(gelu_tanh(self.gate_proj(hs)) * self.up_proj(hs)).squeeze(2).permute(0, 2, 1)
+        x = x + self.post_feedforward_layernorm(h)
+        if self.ple:
+            hs = x.permute(0, 2, 1).unsqueeze(2)
+            g = gelu_tanh(self.per_layer_input_gate(hs)) * pli.permute(0, 2, 1).unsqueeze(2)
+            h = self.per_layer_projection(g).squeeze(2).permute(0, 2, 1)
+            x = x + self.post_per_layer_input_norm(h)
+        if self.scalar != 1.0:
+            x = x * self.scalar
+        return x
+
+
+def rope_table(inv: torch.Tensor, ctx: int):
+    freqs = torch.outer(torch.arange(ctx).float(), inv)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos().to(DTYPE), emb.sin().to(DTYPE)
+
+
+class GemmaDecoder(nn.Module):
+    """Gemma 4 decoder chunk. Extra input: per_layer_inputs [1, T, n_layers * ple_dim] (the
+    combined per-layer embeddings, an output of the embeddings model). States: the KV caches of
+    the sliding (local) and full (global) attention layers, which have different head dims."""
+
+    def __init__(self, sp: Spec, ck: Checkpoint, start: int, end: int, ctx: int):
+        super().__init__()
+        self.sp, self.start, self.end, self.ctx = sp, start, end, ctx
+        self.layers = nn.ModuleList([GemmaLayer(sp, ck, i) for i in range(start, end)])
+        self.last = end == sp.n_layers
+        if self.last:
+            self.norm = RMSNorm(ck.get("norm.weight"), sp.eps)
+        hd, ghd = sp.head_dim, sp.global_head_dim
+        c, s_ = rope_table(1.0 / (sp.theta_local ** (torch.arange(0, hd, 2).float() / hd)), ctx)
+        self.register_buffer("cos_l", c)
+        self.register_buffer("sin_l", s_)
+        # proportional RoPE: the first partial_rotary_factor of the frequency pairs rotate
+        n_rot = int(sp.global_rot_frac * ghd // 2)
+        inv = 1.0 / (sp.theta ** (torch.arange(0, 2 * n_rot, 2).float() / ghd))
+        c, s_ = rope_table(torch.cat([inv, torch.zeros(ghd // 2 - n_rot)]), ctx)
+        self.register_buffer("cos_g", c)
+        self.register_buffer("sin_g", s_)
+        self.sliding = ctx > sp.sliding_window
+        if self.sliding:
+            self.register_buffer("cols", torch.arange(ctx, dtype=torch.int32))
+        for name, shape in state_shapes(sp, ctx).items():
+            self.register_buffer(name, torch.zeros(shape, dtype=DTYPE))
+
+    def forward(self, x, position_ids, causal_mask, current_pos, prefill: bool, per_layer_inputs):
+        sp, t = self.sp, x.shape[1]
+        rope = {
+            "sliding": (self.cos_l[position_ids].view(1, 1, t, -1), self.sin_l[position_ids].view(1, 1, t, -1)),
+            "full": (self.cos_g[position_ids].view(1, 1, t, -1), self.sin_g[position_ids].view(1, 1, t, -1)),
+        }
+        masks = {"full": causal_mask, "sliding": causal_mask}
+        if self.sliding:
+            # keys at positions <= p - window are outside the sliding window of query p
+            out = self.cols.view(1, -1) <= (position_ids.view(-1, 1) - sp.sliding_window)
+            masks["sliding"] = causal_mask + out.to(DTYPE).view(1, 1, t, -1) * -30000.0
+        caches = {"sliding": self.kv_cache_local, "full": self.kv_cache_global}
+        used = set()
+        d = sp.ple_dim
+        for layer in self.layers:
+            cos, sin = rope[layer.kind]
+            pli = per_layer_inputs[:, :, layer.idx * d : (layer.idx + 1) * d] if d else None
+            x = layer(x, cos, sin, masks[layer.kind], current_pos, caches[layer.kind], pli)
+            used.add(layer.kind)
+        for kind, cache in caches.items():  # Core ML rejects declared states the graph never reads
+            if kind not in used:
+                x = x + cache[0, 0, 0, 0:1].view(1, 1, 1) * 0.0
+        if self.last:
+            x = self.norm(x[:, t - 1 :, :])
+        return x
+
+
+class GemmaEmbeddings(nn.Module):
+    """input_ids -> hidden_states = E[ids] * sqrt(H) and per_layer_inputs, the per-layer
+    embeddings combined with the projection of the token embedding (transformers'
+    get_per_layer_inputs + project_per_layer_inputs), [1, T, n_layers * ple_dim]."""
+
+    def __init__(self, sp: Spec, ck: Checkpoint):
+        super().__init__()
+        h, n, d = sp.hidden, sp.n_layers, sp.ple_dim
+        self.n, self.d = n, d
+        self.embed_tokens = nn.Embedding(sp.vocab, h, dtype=DTYPE)
+        self.embed_tokens.weight.data = (ck.get("embed_tokens.weight") * h**0.5).to(DTYPE)
+        if d:
+            self.embed_tokens_per_layer = nn.Embedding(sp.vocab, n * d, dtype=DTYPE)
+            self.embed_tokens_per_layer.weight.data = (ck.get("embed_tokens_per_layer.weight") * d**0.5).to(DTYPE)
+            self.per_layer_model_projection = conv1x1(ck.get("per_layer_model_projection.weight") * h**-0.5)
+            self.per_layer_projection_norm = RMSNorm(ck.get("per_layer_projection_norm.weight"), sp.eps)
+        for p_ in self.parameters():
+            p_.requires_grad_(False)
+
+    def forward(self, input_ids):
+        x = self.embed_tokens(input_ids)  # [1, T, H]
+        if not self.d:
+            return x
+        t = x.shape[1]
+        proj = self.per_layer_model_projection(x.permute(0, 2, 1).unsqueeze(2))  # [1, n*d, 1, T]
+        proj = self.per_layer_projection_norm(proj.view(self.n, self.d, t).permute(2, 0, 1))  # [T, n, d]
+        ple = self.embed_tokens_per_layer(input_ids).view(t, self.n, self.d)
+        return x, ((proj + ple) * (2.0**-0.5)).reshape(1, t, self.n * self.d)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -585,8 +846,14 @@ class LMHead(nn.Module):
 
 @dataclass
 class Quant:
-    """Weight compression: none, lutN[,G] (k-means palettization, G output channels per LUT,
-    0 = per tensor), int8 (per-channel linear) or int4[,B] (per-block linear, block B)."""
+    """Weight compression: none, lutN[,G] (k-means palettization with N in 1,2,3,4,6,8 bits, G
+    output channels per LUT, 0 = per tensor), int8[,tensor] (per-channel or per-tensor linear) or
+    int4[,B] (per-block linear, block B).
+
+    Only LUTs run correctly on the Neural Engine. Measured on an M5 Max / macOS 26 (Qwen3-0.6B):
+    int8 weights compile for the ANE but give wrong results there (logit cosine 0.75 against
+    0.9992 on the GPU, as if activations were quantized too), int4 per-block does not compile for
+    the ANE. They are kept for packages meant for the GPU (CPU_AND_GPU)."""
 
     kind: str = "none"
     bits: int = 0
@@ -601,7 +868,7 @@ class Quant:
             b, _, g = s[3:].partition(",")
             return Quant("lut", int(b), int(g) if g else 8)
         if s.startswith("int8"):
-            return Quant("int8", 8, 0)
+            return Quant("int8", 8, -1 if s.endswith(",tensor") else 0)
         if s.startswith("int4"):
             _, _, b = s.partition(",")
             return Quant("int4", 4, int(b) if b else 32)
@@ -623,7 +890,10 @@ class Quant:
         return self.kind
 
 
-def compress(mlmodel, q: Quant, workers: int):
+def compress(mlmodel, q: Quant, workers: int, op_type: str = "conv"):
+    """Compress the weights consumed by `op_type` ops only (projections, or the embedding
+    gather): RoPE tables and the constant masks of the delta rule stay fp16. Linear int8
+    quantization of every constant also ran incorrectly on the ANE (logit cosine 0.75)."""
     import coremltools.optimize as cto
 
     if q.kind == "none":
@@ -641,15 +911,16 @@ def compress(mlmodel, q: Quant, workers: int):
             )
         else:
             op = cto.coreml.OpPalettizerConfig(mode="kmeans", nbits=q.bits, granularity="per_tensor", num_kmeans_workers=workers)
-        cfg = cto.coreml.OptimizationConfig(global_config=op)
+        cfg = cto.coreml.OptimizationConfig(op_type_configs={op_type: op})
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             return cto.coreml.palettize_weights(mlmodel, cfg)
     if q.kind == "int8":
-        op = cto.coreml.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int8", granularity="per_channel")
+        gran = "per_tensor" if q.group < 0 else "per_channel"
+        op = cto.coreml.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int8", granularity=gran)
     else:
         op = cto.coreml.OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int4", granularity="per_block", block_size=q.group)
-    return cto.coreml.linear_quantize_weights(mlmodel, cto.coreml.OptimizationConfig(global_config=op))
+    return cto.coreml.linear_quantize_weights(mlmodel, cto.coreml.OptimizationConfig(op_type_configs={op_type: op}))
 
 
 def convert(module, example, inputs, outputs, states, enumerate_input=None):
@@ -698,13 +969,32 @@ def compile_package(pkg: str, out_dir: str) -> str:
     return os.path.join(out_dir, os.path.basename(pkg)[: -len(".mlpackage")] + ".mlmodelc")
 
 
-def chunk_ranges(n_layers: int, chunks: int):
-    base, rem = divmod(n_layers, chunks)
-    out, s = [], 0
-    for i in range(chunks):
-        e = s + base + (1 if i < rem else 0)
+def layer_sizes(ck: Checkpoint, n_layers: int):
+    """Weight count of every decoder layer (from the checkpoint headers)."""
+    sizes = [0] * n_layers
+    for name, f in ck.names.items():
+        if name.startswith(ck.prefix + "layers."):
+            i = int(name[len(ck.prefix) + 7 :].split(".")[0])
+            if i < n_layers:
+                sizes[i] += math.prod(ck.files[f].get_slice(name).get_shape())
+    return sizes
+
+
+def chunk_ranges(sizes: list, chunks: int):
+    """Split the layers into `chunks` consecutive ranges of about equal weight size."""
+    n, total = len(sizes), sum(sizes)
+    out, s, acc = [], 0, 0
+    for c in range(chunks - 1):
+        target = total * (c + 1) / chunks
+        e = s + 1
+        acc += sizes[s]
+        # extend while the next layer brings the cumulative size closer to the target
+        while e < n - (chunks - 1 - c) and abs(acc + sizes[e] - target) < abs(acc - target):
+            acc += sizes[e]
+            e += 1
         out.append((s, e))
         s = e
+    out.append((s, n))
     return out
 
 
@@ -712,18 +1002,13 @@ def bits_per_weight(q: Quant) -> float:
     return {"none": 16, "lut": q.bits, "int8": 8, "int4": 4}[q.kind]
 
 
-def auto_chunks(sp: Spec, q: Quant, max_mb: float) -> int:
-    h, i = sp.hidden, sp.inter
-    per_layer = 3 * h * i
-    for t in sp.layer_types:
-        if t == "full":
-            qd = sp.n_heads * sp.head_dim * (2 if sp.attn_gate else 1)
-            per_layer_mix = h * (qd + 2 * sp.n_kv * sp.head_dim) + sp.n_heads * sp.head_dim * h
-        else:
-            vd = sp.lin_nv * sp.lin_dv
-            per_layer_mix = h * (sp.conv_dim + vd + 2 * sp.lin_nv) + vd * h
-        per_layer += per_layer_mix / len(sp.layer_types)
-    total_mb = per_layer * sp.n_layers * bits_per_weight(q) / 8 / 1e6 * 1.1
+def auto_chunks(ck: Checkpoint, q: Quant, max_mb: float) -> int:
+    """Chunks needed to keep each decoder chunk under max_mb (decoder weights + 10%)."""
+    n = 0
+    for name, f in ck.names.items():
+        if name.startswith(ck.prefix + "layers."):
+            n += math.prod(ck.files[f].get_slice(name).get_shape())
+    total_mb = n * bits_per_weight(q) / 8 / 1e6 * 1.1
     return max(1, math.ceil(total_mb / max_mb))
 
 
@@ -777,23 +1062,33 @@ def write_meta(path, args, sp: Spec, names: dict, chunks: int, lm_sizes, gen_cfg
             f"      top_p: {gen_cfg.get('top_p', 1.0)}",
             f"      top_k: {gen_cfg.get('top_k', 0)}",
         ]
-    if sp.arch != "qwen3":
-        # oxinfer extensions (docs/coreml-format.md)
+    # oxinfer extensions (docs/coreml-format.md)
+    if sp.arch == "qwen3_5":
         lines += [
             "    recurrent_state: true",
             "    prefill_full_batches_only: true",
             f"    gdn_chunk_size: {a.gdn_chunk}",
-            f"    layer_types: [{', '.join(sp.layer_types)}]",
-            "    states:",
         ]
+    if sp.arch == "gemma4":
+        lines += [f"    local_attention_window: {sp.sliding_window}", f"    final_logit_softcap: {sp.softcap}"]
+        if sp.ple_dim:
+            lines.append(f"    per_layer_inputs: {sp.n_layers * sp.ple_dim}")
+        if sp.first_shared < sp.n_layers:
+            src = ", ".join(f"{i}: {gemma_kv_source(sp, i)}" for i in range(sp.first_shared, sp.n_layers))
+            lines.append(f"    kv_shared_layers: {{{src}}}")
+    if sp.arch != "qwen3":
+        lines += [f"    layer_types: [{', '.join(sp.layer_types)}]", "    states:"]
         for name, shape in state_shapes(sp, a.context_length).items():
+            if name == "kv_cache_0":
+                layers = sp.full_layers
+            elif name.startswith("kv_cache_"):
+                layers = gemma_slots(sp)[0 if name.endswith("local") else 1]
+            else:
+                layers = sp.linear_layers
             lines.append(f"      - name: model_model_{name}")
             lines.append(f"        shape: [{', '.join(str(s) for s in shape)}]")
             lines.append("        dtype: float16")
-            if name == "kv_cache_0":
-                lines.append(f"        layers: [{', '.join(str(i) for i in sp.full_layers)}]")
-            else:
-                lines.append(f"        layers: [{', '.join(str(i) for i in sp.linear_layers)}]")
+            lines.append(f"        layers: [{', '.join(str(i) for i in layers)}]")
     lines += [
         "",
         "# Conversion parameters",
@@ -823,7 +1118,7 @@ def copy_tokenizer(src: str, dst: str, cfg: dict):
 
 def main():
     ap = argparse.ArgumentParser(
-        description=__doc__.split("\n\n")[0], epilog=__doc__.split("\n\n", 1)[1], formatter_class=argparse.RawDescriptionHelpFormatter
+        description=__doc__.split("\n\n")[0], epilog=__doc__.split("\n\n", 2)[2], formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--model", required=True, help="Hugging Face checkpoint directory (config.json + safetensors)")
     ap.add_argument("--output", required=True, help="output directory (created)")
@@ -839,11 +1134,17 @@ def main():
         default=Quant.parse("lut6"),
         help="decoder layers: none|lutN[,G]|int8|int4[,B] (default lut6 = lut6,8, what ANEMLL recommends and ships; lut4 is ~1.5x smaller but loses ~20 points of top-1 agreement on <1B models)",
     )
-    ap.add_argument("--lmhead-quant", type=Quant.parse, default=Quant.parse("lut6"), help="LM head (default lut6)")
+    ap.add_argument("--lmhead-quant", type=Quant.parse, default=Quant.parse("lut6"), help="LM head (default lut6). int8/int4 are GPU-only, see below")
     ap.add_argument("--embed-quant", type=Quant.parse, default=Quant.parse("none"), help="embeddings (default none)")
     ap.add_argument("--no-quant", action="store_true", help="fp16 everywhere (same as all three = none)")
     ap.add_argument("--split-lm-head", type=int, default=16, help="LM head output splits (default 16)")
-    ap.add_argument("--gdn-chunk", type=int, default=0, help="Gated DeltaNet prefill chunk (tokens, power of 2; default = batch size)")
+    ap.add_argument(
+        "--gdn-chunk",
+        type=int,
+        default=0,
+        help="Gated DeltaNet prefill: chunk of the chunked delta rule (power of 2 dividing the batch; default = batch size, "
+        "the fastest on the ANE); 1 = sequential scan over the batch",
+    )
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2), help="k-means worker processes")
     ap.add_argument("--keep-packages", action="store_true", help="also keep the .mlpackage files")
     ap.add_argument("--parts", default="embeddings,ffn,lm_head", help="comma list of parts to (re)build")
@@ -851,6 +1152,9 @@ def main():
     os.environ.setdefault("PYTHONWARNINGS", "ignore")  # k-means worker processes
     if args.no_quant:
         args.ffn_quant = args.lmhead_quant = args.embed_quant = Quant()
+    for q in (args.ffn_quant, args.lmhead_quant, args.embed_quant):
+        if q.kind in ("int8", "int4"):
+            print(f"warning: {q} weights do not run correctly on the Neural Engine (GPU only), see Quant", file=sys.stderr)
 
     import coremltools as ct
 
@@ -859,17 +1163,17 @@ def main():
     sp = load_spec(cfg)
     args.model = src
     args.name = args.name or os.path.basename(src.rstrip("/")).replace("--", "-")
-    args.prefix = args.prefix or {"qwen3": "qwen", "qwen3_5": "qwen35"}[sp.arch]
+    args.prefix = args.prefix or {"qwen3": "qwen", "qwen3_5": "qwen35", "gemma4": "gemma4"}[sp.arch]
+    ck = Checkpoint(src)
     args.gdn_chunk = args.gdn_chunk or args.batch_size
     if args.gdn_chunk & (args.gdn_chunk - 1) or args.batch_size % args.gdn_chunk:
         raise SystemExit("--gdn-chunk must be a power of two dividing --batch-size")
     ctx, bs = args.context_length, args.batch_size
-    chunks = auto_chunks(sp, args.ffn_quant, args.max_chunk_mb) if args.chunks == "auto" else int(args.chunks)
+    chunks = auto_chunks(ck, args.ffn_quant, args.max_chunk_mb) if args.chunks == "auto" else int(args.chunks)
     parts = set(args.parts.split(","))
     out = os.path.abspath(args.output)
     os.makedirs(out, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="coreml_convert_", dir=out)
-    ck = Checkpoint(src)
     print(f"{sp.arch}: {sp.n_layers} layers ({len(sp.full_layers)} full attention), hidden {sp.hidden}, vocab {sp.vocab}; "
           f"ctx {ctx}, batch {bs}, {chunks} chunk(s); ffn {args.ffn_quant}, lm_head {args.lmhead_quant}, embeddings {args.embed_quant}")
     common_meta = {
@@ -904,14 +1208,22 @@ def main():
     if "embeddings" in parts:
         print("embeddings ...")
         shape = ct.EnumeratedShapes(shapes=[[1, 1], [1, bs]], default=[1, 1])
+        outputs = [ct.TensorType(name="hidden_states", dtype=np.float16)]
+        if sp.arch == "gemma4":
+            module = GemmaEmbeddings(sp, ck)
+            if sp.ple_dim:
+                outputs.append(ct.TensorType(name="per_layer_inputs", dtype=np.float16))
+        else:
+            module = Embeddings(emb_w)
         m = convert(
-            Embeddings(emb_w),
+            module,
             (torch.zeros((1, 1), dtype=torch.int32),),
             [ct.TensorType(name="input_ids", shape=shape, dtype=np.int32)],
-            [ct.TensorType(name="hidden_states", dtype=np.float16)],
+            outputs,
             None,
         )
-        m = compress(m, args.embed_quant, args.workers)
+        del module
+        m = compress(m, args.embed_quant, args.workers, "gather")
         finish(m, base, args.embed_quant, "token embeddings", {})
 
     # LM head
@@ -919,7 +1231,7 @@ def main():
         head_w = emb_w
     else:
         head_w = ck.get("lm_head.weight", raw=True)
-    head = LMHead(head_w, args.split_lm_head)
+    head = LMHead(head_w, args.split_lm_head, sp.softcap)
     base = f"{args.prefix}_lm_head{args.lmhead_quant.suffix}"
     names["lm_head"] = base + ".mlmodelc"
     if "lm_head" in parts:
@@ -938,14 +1250,14 @@ def main():
     # Decoder chunks: infer and prefill are converted and compressed separately, then merged into
     # one multifunction package. Both see byte-identical fp16 weights and k-means is seeded
     # (random_state=0), so the compressed weights are identical too and stored once.
-    for ci, (s, e) in enumerate(chunk_ranges(sp.n_layers, chunks)):
+    for ci, (s, e) in enumerate(chunk_ranges(layer_sizes(ck, sp.n_layers), chunks)):
         base = f"{args.prefix}_FFN_PF{args.ffn_quant.suffix}_chunk_{ci + 1:02d}of{chunks:02d}"
         if ci == 0:
             names["ffn"] = base + ".mlmodelc"
         if "ffn" not in parts:
             continue
         print(f"chunk {ci + 1}/{chunks}: layers {s}..{e - 1}")
-        dec = Decoder(sp, ck, s, e, ctx, args.gdn_chunk)
+        dec = GemmaDecoder(sp, ck, s, e, ctx) if sp.arch == "gemma4" else Decoder(sp, ck, s, e, ctx, args.gdn_chunk)
         fn_pkgs = {}
         for fn, t in (("infer", 1), ("prefill", bs)):
             ex = (
@@ -954,16 +1266,20 @@ def main():
                 torch.zeros((1, 1, t, ctx), dtype=DTYPE),
                 torch.zeros((1,), dtype=torch.int32),
             )
+            inputs = [
+                ct.TensorType(name="hidden_states", shape=(1, t, sp.hidden), dtype=np.float16),
+                ct.TensorType(name="position_ids", shape=(t,), dtype=np.int32),
+                ct.TensorType(name="causal_mask", shape=(1, 1, t, ctx), dtype=np.float16),
+                ct.TensorType(name="current_pos", shape=(1,), dtype=np.int32),
+            ]
+            if sp.ple_dim:
+                ex += (torch.zeros((1, t, sp.n_layers * sp.ple_dim), dtype=DTYPE),)
+                inputs.append(ct.TensorType(name="per_layer_inputs", shape=(1, t, sp.n_layers * sp.ple_dim), dtype=np.float16))
             reset_states(dec)
             m = convert(
                 ChunkFn(dec, fn == "prefill"),
                 ex,
-                [
-                    ct.TensorType(name="hidden_states", shape=(1, t, sp.hidden), dtype=np.float16),
-                    ct.TensorType(name="position_ids", shape=(t,), dtype=np.int32),
-                    ct.TensorType(name="causal_mask", shape=(1, 1, t, ctx), dtype=np.float16),
-                    ct.TensorType(name="current_pos", shape=(1,), dtype=np.int32),
-                ],
+                inputs,
                 [ct.TensorType(name="output_hidden_states", dtype=np.float16)],
                 ct_states(sp, ctx),
             )

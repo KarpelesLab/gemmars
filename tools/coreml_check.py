@@ -16,6 +16,9 @@ re-run the last prompt token through `infer` as ANEMLL's chat.py does.
 --plan    which compute device (ANE / GPU / CPU) Core ML picks for every op of every model
           (MLComputePlan), with the op types that do not run on the Neural Engine.
 
+Note: on macOS 26 Core ML's CPU_ONLY path returns NaN logits for these stateful fp16 graphs
+(ANEMLL's own Qwen3 release too); its timings are still indicative. CPU_AND_GPU is correct.
+
 examples:
   coreml_check.py out/qwen3 --hf ~/.cache/oxinfer/hub/Qwen--Qwen3-0.6B --tokens 300
   coreml_check.py out/qwen3 --bench --units cpu_and_ne,cpu_only --plan
@@ -91,12 +94,15 @@ class Runner:
         self.state = self.chunks[0]["prefill"].make_state()
         self.pos = 0
 
-    def _run(self, fn, hidden, pos, t):
+    def _run(self, fn, emb, pos, t):
+        hidden, pli = emb
         inp = {
             "position_ids": np.arange(pos, pos + t, dtype=np.int32),
             "causal_mask": np.ascontiguousarray(self.mask[:, :, pos : pos + t]),
             "current_pos": np.array([pos], dtype=np.int32),
         }
+        if pli is not None:  # Gemma 4 per-layer embeddings, fed to every chunk
+            inp["per_layer_inputs"] = pli
         for c in self.chunks:
             inp["hidden_states"] = hidden
             hidden = c[fn].predict(inp, self.state)["output_hidden_states"]
@@ -107,7 +113,8 @@ class Runner:
         return np.concatenate([out[f"logits{i + 1}"] for i in range(self.n_split)], axis=-1)[0, -1].astype(np.float32)
 
     def embed(self, ids):
-        return self.emb.predict({"input_ids": np.asarray(ids, dtype=np.int32)[None]})["hidden_states"]
+        out = self.emb.predict({"input_ids": np.asarray(ids, dtype=np.int32)[None]})
+        return out["hidden_states"], out.get("per_layer_inputs")
 
     def prefill(self, ids):
         """Feed a prompt; returns the logits for the next token."""
@@ -158,7 +165,8 @@ def compare(r, ids, gen, ref_logits):
     lg = r.prefill(ids)
     for i in range(len(gen)):
         a, b = lg.astype(np.float64), ref_logits[i].astype(np.float64)
-        cos.append(float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b))))
+        with np.errstate(all="ignore"):  # macOS Accelerate raises spurious FP warnings
+            cos.append(float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b))))
         agree += int(a.argmax() == b.argmax())
         pb, pa = log_softmax(b.astype(np.float64)), log_softmax(a.astype(np.float64))
         kl.append(float((np.exp(pb) * (pb - pa)).sum()))
@@ -265,7 +273,7 @@ def dir_size(path):
 
 def main():
     ap = argparse.ArgumentParser(
-        description=__doc__.split("\n\n")[0], epilog=__doc__.split("\n\n", 1)[1], formatter_class=argparse.RawDescriptionHelpFormatter
+        description=__doc__.split("\n\n")[0], epilog=__doc__.split("\n\n", 2)[2], formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("package", help="directory with meta.yaml")
     ap.add_argument("--hf", help="Hugging Face checkpoint for the float32 reference")
@@ -274,8 +282,8 @@ def main():
     ap.add_argument("--tokens", type=int, default=200, help="generated tokens to compare (default 200)")
     ap.add_argument("--ref-cache", help="npz file caching the reference sequence and logits")
     ap.add_argument("--single-token", action="store_true", help="feed the prompt through `infer` only (no `prefill` calls)")
-    ap.add_argument("--bench", action="store_true")
-    ap.add_argument("--plan", action="store_true")
+    ap.add_argument("--bench", action="store_true", help="measure prefill and decode speed")
+    ap.add_argument("--plan", action="store_true", help="print the compute device of every op (MLComputePlan)")
     ap.add_argument("--units", default="cpu_and_ne", help="compute units for --hf / --bench (comma list): " + ", ".join(UNITS))
     ap.add_argument("--runs", type=int, default=3, help="benchmark repetitions (best is reported)")
     ap.add_argument("--bench-prefill", type=int, default=256, help="prompt tokens for the prefill benchmark")
@@ -294,6 +302,8 @@ def main():
         tok = AutoTokenizer.from_pretrained(d)
         if args.no_template:
             ids = tok(args.prompt, add_special_tokens=False).input_ids
+        elif p["architecture"] == "gemma4" and not tok.chat_template:
+            ids = tok(f"<bos><|turn>user\n{args.prompt}<turn|>\n<|turn>model\n", add_special_tokens=False).input_ids
         else:
             ids = tok.apply_chat_template([{"role": "user", "content": args.prompt}], add_generation_prompt=True, tokenize=False)
             ids = tok(ids, add_special_tokens=False).input_ids
