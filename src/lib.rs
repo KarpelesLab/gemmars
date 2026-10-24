@@ -25,6 +25,7 @@ pub mod media;
 pub mod metal;
 pub mod mm_config;
 pub mod model;
+pub mod modernbert;
 pub mod mpnet;
 pub mod nomic_bert;
 pub mod platform;

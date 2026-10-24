@@ -100,7 +100,6 @@ multilingual-e5-small and mxbai-embed-large-v1 were checked (cosine >= 0.99999 t
 E5 models expect a `query: ` / `passage: ` prefix in the text itself (they define no prompts).
 MPNet (all-mpnet-base-v2: BERT plus a shared T5-style relative position bias) is supported too,
 cosine >= 0.999991 to the reference (0.999996 against bf16-rounded reference weights).
-ModernBERT and Qwen2-based embedders are other architectures and are not supported yet.
 
 NomicBERT (`nomic_bert.rs`: rotary positions, fused Wqkv, SwiGLU, dynamic NTK scaling past 2048
 tokens) runs nomic-embed-text-v1 and v1.5: cosine >= 0.99998 to the reference (`--trust-remote-code`)
@@ -108,6 +107,12 @@ with and without the `search_query: ` / `search_document: ` prefixes, which go i
 model defines no prompts), and on a 4000-token text; 0.999999 against bf16-rounded weights.
 v1.5's Matryoshka recipe layer-norms the pooled vector before truncating, which is not a
 sentence-transformers module, so `--dim` alone truncates without it.
+
+ModernBERT (alternating global and sliding-window attention) is supported too:
+modernbert-embed-base and gte-modernbert-base give cosines of 0.99993 and 0.99998 against the
+fp32 reference, and 1 - 1e-6 against one with the same bf16-rounded matrices. modernbert-embed
+expects a `search_query: ` / `search_document: ` prefix in the text itself.
+Qwen2-based embedders (gte-Qwen2, stella) are another architecture and are not supported yet.
 
 Two details that are easy to get wrong: transformers halves EmbeddingGemma's sliding window for
 bidirectional attention (512 in the config means keys less than 257 positions away on either

@@ -7,6 +7,7 @@
 use crate::bert::{BertConfig, BertModel};
 use crate::config::{QwenConfig, TextConfig};
 use crate::model::{Model, Quant};
+use crate::modernbert::{ModernBertConfig, ModernBertModel};
 use crate::mpnet::{MpnetConfig, MpnetModel};
 use crate::nomic_bert::{NomicBertConfig, NomicBertModel};
 use crate::qwen::QwenModel;
@@ -21,6 +22,7 @@ enum Backbone<'a> {
     Bert(Box<BertModel<'a>>),
     Mpnet(Box<MpnetModel<'a>>),
     Nomic(Box<NomicBertModel<'a>>),
+    ModernBert(Box<ModernBertModel<'a>>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +163,8 @@ impl<'a> Embedder<'a> {
             Backbone::Mpnet(Box::new(MpnetModel::load(MpnetConfig::load(dir)?, files, quant)?))
         } else if model_type == "nomic_bert" {
             Backbone::Nomic(Box::new(NomicBertModel::load(NomicBertConfig::load(dir)?, files, quant)?))
+        } else if crate::modernbert::is_modernbert(&model_type) {
+            Backbone::ModernBert(Box::new(ModernBertModel::load(ModernBertConfig::load(dir)?, files, quant)?))
         } else {
             bail!("model_type {model_type} is not supported for embeddings");
         };
@@ -170,6 +174,7 @@ impl<'a> Embedder<'a> {
             Backbone::Bert(m) => m.cfg.hidden_size,
             Backbone::Mpnet(m) => m.cfg.hidden_size,
             Backbone::Nomic(m) => m.cfg.hidden_size,
+            Backbone::ModernBert(m) => m.cfg.hidden_size,
         };
 
         // Modules after the transformer, in order.
@@ -297,6 +302,7 @@ impl<'a> Embedder<'a> {
             (None, Backbone::Bert(m)) => m.cfg.hidden_size,
             (None, Backbone::Mpnet(m)) => m.cfg.hidden_size,
             (None, Backbone::Nomic(m)) => m.cfg.hidden_size,
+            (None, Backbone::ModernBert(m)) => m.cfg.hidden_size,
         }
     }
 
@@ -326,6 +332,7 @@ impl<'a> Embedder<'a> {
             Backbone::Bert(m) => m.forward(ids),
             Backbone::Mpnet(m) => m.forward(ids),
             Backbone::Nomic(m) => m.forward(ids),
+            Backbone::ModernBert(m) => m.forward(ids),
         }
     }
 
