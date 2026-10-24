@@ -15,6 +15,7 @@
 //! math. Accumulators must be named variables: arrays of `simdgroup_float8x8` are spilled to
 //! memory by the shader compiler and run 12x slower.
 
+use crate::ggml::GgmlType;
 use crate::gpu::{Backend, DeviceWeight, Job, WeightRef};
 use crate::platform::gpu::metal::{Id, Objc, Sel};
 use crate::quant::PAGE;
@@ -267,6 +268,283 @@ kernel void softmax_rows(device float* s [[buffer(0)]], constant SM& p [[buffer(
 }
 "#;
 
+/// GGUF (ggml) block formats for the GEMM: one dequantizer per type producing the 32 values of
+/// K block `b` of a row (a sub-block of a 256-element super-block for the K and i-quants). The
+/// weights are the raw tensor bytes; `P::s_off` carries the row length in bytes. The i-quant grids
+/// (`GGUF_TABLES`) are appended from `ggml_tables.rs` when the library is built.
+const GGUF_SHADER_SRC: &str = r#"
+struct GgW { device const uchar* q; uint rb; };
+#define MK_GG(T) T{ { (device const uchar*)qb + p.w_off, p.s_off } }
+inline float h2f(device const uchar* p) { return float(as_type<half>(ushort(ushort(p[0]) | (ushort(p[1]) << 8)))); }
+inline uint rd16(device const uchar* p) { return uint(p[0]) | (uint(p[1]) << 8); }
+inline uint rd32(device const uchar* p) { return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); }
+inline uchar4 ld4(device const uchar* p) { return uchar4(*(device const packed_uchar4*)p); }
+inline float4 f4(uchar4 v) { return float4(v); }
+inline float4 f4(char4 v) { return float4(v); }
+inline device const uchar* sblk(GgW w, uint row, uint b, uint tsz) { return w.q + (ulong)row * w.rb + (ulong)(b / 8) * tsz; }
+// 8 values of an i-quant grid entry (bytes, lowest first) with sign bits `s` (bit j: value j negative).
+inline void grid8(ulong g, uint s, float db, thread float4* o) {
+    float v[8];
+    for (uint j = 0; j < 8; j++) v[j] = db * float((g >> (8 * j)) & 255) * ((s >> j) & 1 ? -1.f : 1.f);
+    o[0] = float4(v[0], v[1], v[2], v[3]); o[1] = float4(v[4], v[5], v[6], v[7]);
+}
+inline void grid4x2(uint g1, uint g2, uint s, float db, thread float4* o) {
+    grid8(ulong(g1) | (ulong(g2) << 32), s, db, o);
+}
+inline uint ksign(uint i) { return i | ((popcount(i) & 1) << 7); }
+
+struct Q4_0W { GgW g; };
+inline void load(Q4_0W w, uint row, uint b, thread float4* out) {
+    device const uchar* B = w.g.q + (ulong)row * w.g.rb + b * 18;
+    float d = h2f(B);
+    for (uint i = 0; i < 4; i++) {
+        uchar4 v = ld4(B + 2 + 4 * i);
+        out[i] = (f4(v & uchar(15)) - 8.f) * d;
+        out[i + 4] = (f4(v >> uchar(4)) - 8.f) * d;
+    }
+}
+struct IQ4_NLW { GgW g; };
+inline float4 kv4(uchar4 v) { return float4(kvalues_iq4nl[v.x], kvalues_iq4nl[v.y], kvalues_iq4nl[v.z], kvalues_iq4nl[v.w]); }
+inline void load(IQ4_NLW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = w.g.q + (ulong)row * w.g.rb + b * 18;
+    float d = h2f(B);
+    for (uint i = 0; i < 4; i++) {
+        uchar4 v = ld4(B + 2 + 4 * i);
+        out[i] = kv4(v & uchar(15)) * d;
+        out[i + 4] = kv4(v >> uchar(4)) * d;
+    }
+}
+struct Q8_0W { GgW g; };
+inline void load(Q8_0W w, uint row, uint b, thread float4* out) {
+    device const uchar* B = w.g.q + (ulong)row * w.g.rb + b * 34;
+    float d = h2f(B);
+    for (uint i = 0; i < 8; i++) out[i] = f4(as_type<char4>(ld4(B + 2 + 4 * i))) * d;
+}
+inline void scale_min_k4(uint j, device const uchar* s, thread float& sc, thread float& mn) {
+    if (j < 4) { sc = float(s[j] & 63); mn = float(s[j + 4] & 63); }
+    else { sc = float((s[j + 4] & 15) | ((s[j - 4] >> 6) << 4)); mn = float((s[j + 4] >> 4) | ((s[j] >> 6) << 4)); }
+}
+struct Q4_KW { GgW g; };
+inline void load(Q4_KW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 144);
+    uint j = b % 8;
+    float sc, mn; scale_min_k4(j, B + 4, sc, mn);
+    float d1 = h2f(B) * sc, m1 = h2f(B + 2) * mn;
+    device const uchar* q = B + 16 + 32 * (j / 2);
+    uchar sh = uchar(4 * (j % 2));
+    for (uint i = 0; i < 8; i++) out[i] = f4((ld4(q + 4 * i) >> sh) & uchar(15)) * d1 - m1;
+}
+struct Q5_KW { GgW g; };
+inline void load(Q5_KW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 176);
+    uint j = b % 8;
+    float sc, mn; scale_min_k4(j, B + 4, sc, mn);
+    float d1 = h2f(B) * sc, m1 = h2f(B + 2) * mn;
+    device const uchar* q = B + 48 + 32 * (j / 2);
+    uchar sh = uchar(4 * (j % 2));
+    for (uint i = 0; i < 8; i++) {
+        uchar4 hb = ((ld4(B + 16 + 4 * i) >> uchar(j)) & uchar(1)) << uchar(4);
+        out[i] = f4(((ld4(q + 4 * i) >> sh) & uchar(15)) | hb) * d1 - m1;
+    }
+}
+struct Q6_KW { GgW g; };
+inline void load(Q6_KW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 210);
+    uint j = b % 8, n = j / 4, jj = j % 4;
+    float d = h2f(B + 208);
+    device const uchar* ql = B + 64 * n + 32 * (jj & 1);
+    device const uchar* qh = B + 128 + 32 * n;
+    uchar lsh = uchar(4 * (jj >> 1)), hsh = uchar(2 * jj);
+    for (uint i = 0; i < 8; i++) {
+        float dl = d * float(as_type<char>(B[192 + 8 * n + 2 * jj + i / 4]));
+        uchar4 q = ((ld4(ql + 4 * i) >> lsh) & uchar(15)) | (((ld4(qh + 4 * i) >> hsh) & uchar(3)) << uchar(4));
+        out[i] = (f4(q) - 32.f) * dl;
+    }
+}
+struct Q3_KW { GgW g; };
+inline void load(Q3_KW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 110);
+    uint j = b % 8, n = j / 4, jj = j % 4;
+    float d = h2f(B + 108);
+    uchar sh = uchar(2 * jj), m = uchar(1 << (4 * n + jj));
+    for (uint h = 0; h < 2; h++) {
+        uint k = 8 * n + 2 * jj + h;
+        uint lo = k < 8 ? (B[96 + k] & 15) : (B[96 + k - 8] >> 4);
+        uint hi = (B[104 + k % 4] >> (2 * (k / 4))) & 3;
+        float dl = d * float(int(lo | (hi << 4)) - 32);
+        for (uint i = 0; i < 4; i++) {
+            uint l = 16 * h + 4 * i;
+            uchar4 q = (ld4(B + 32 + 32 * n + l) >> sh) & uchar(3);
+            uchar4 hm = ld4(B + l) & m;
+            out[4 * h + i] = (f4(q) - select(float4(4.f), float4(0.f), hm != uchar4(0))) * dl;
+        }
+    }
+}
+struct Q2_KW { GgW g; };
+inline void load(Q2_KW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 84);
+    uint j = b % 8, n = j / 4, jj = j % 4;
+    float d = h2f(B + 80), dmin = h2f(B + 82);
+    uchar sh = uchar(2 * jj);
+    for (uint h = 0; h < 2; h++) {
+        uchar s = B[8 * n + 2 * jj + h];
+        float dl = d * float(s & 15), ml = dmin * float(s >> 4);
+        for (uint i = 0; i < 4; i++) out[4 * h + i] = f4((ld4(B + 16 + 32 * n + 16 * h + 4 * i) >> sh) & uchar(3)) * dl - ml;
+    }
+}
+struct IQ4_XSW { GgW g; };
+inline void load(IQ4_XSW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 136);
+    uint j = b % 8;
+    int ls = int(((B[4 + j / 2] >> (4 * (j % 2))) & 15) | (((rd16(B + 2) >> (2 * j)) & 3) << 4)) - 32;
+    float dl = h2f(B) * float(ls);
+    for (uint i = 0; i < 4; i++) {
+        uchar4 v = ld4(B + 8 + 16 * j + 4 * i);
+        out[i] = kv4(v & uchar(15)) * dl;
+        out[i + 4] = kv4(v >> uchar(4)) * dl;
+    }
+}
+struct IQ2_XXSW { GgW g; };
+inline void load(IQ2_XXSW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 66);
+    uint j = b % 8;
+    uint a0 = rd32(B + 2 + 8 * j), a1 = rd32(B + 6 + 8 * j);
+    float db = h2f(B) * (0.5f + float(a1 >> 28)) * 0.25f;
+    for (uint l = 0; l < 4; l++) grid8(iq2xxs_grid[(a0 >> (8 * l)) & 255], ksign((a1 >> (7 * l)) & 127), db, out + 2 * l);
+}
+struct IQ2_XSW { GgW g; };
+inline void load(IQ2_XSW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 74);
+    uint j = b % 8;
+    float d = h2f(B);
+    uchar s = B[66 + j];
+    for (uint l = 0; l < 4; l++) {
+        uint q = rd16(B + 2 + 2 * (4 * j + l));
+        float db = d * (0.5f + float(l < 2 ? (s & 15) : (s >> 4))) * 0.25f;
+        grid8(iq2xs_grid[q & 511], ksign(q >> 9), db, out + 2 * l);
+    }
+}
+struct IQ2_SW { GgW g; };
+inline void load(IQ2_SW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 82);
+    uint j = b % 8;
+    float d = h2f(B);
+    uchar s = B[74 + j];
+    uint qh = B[66 + j];
+    for (uint l = 0; l < 4; l++) {
+        float db = d * (0.5f + float(l < 2 ? (s & 15) : (s >> 4))) * 0.25f;
+        uint idx = uint(B[2 + 4 * j + l]) | ((qh << (8 - 2 * l)) & 0x300);
+        grid8(iq2s_grid[idx], B[34 + 4 * j + l], db, out + 2 * l);
+    }
+}
+struct IQ3_XXSW { GgW g; };
+inline void load(IQ3_XXSW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 98);
+    uint j = b % 8;
+    uint aux = rd32(B + 66 + 4 * j);
+    float db = h2f(B) * (0.5f + float(aux >> 28)) * 0.5f;
+    for (uint l = 0; l < 4; l++)
+        grid4x2(iq3xxs_grid[B[2 + 8 * j + 2 * l]], iq3xxs_grid[B[3 + 8 * j + 2 * l]], ksign((aux >> (7 * l)) & 127), db, out + 2 * l);
+}
+struct IQ3_SW { GgW g; };
+inline void load(IQ3_SW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 110);
+    uint j = b % 8;
+    float db = h2f(B) * float(1 + 2 * ((B[106 + j / 2] >> (4 * (j % 2))) & 15));
+    uint qh = B[66 + j];
+    for (uint l = 0; l < 4; l++) {
+        uint i1 = uint(B[2 + 8 * j + 2 * l]) | ((qh << (8 - 2 * l)) & 256);
+        uint i2 = uint(B[3 + 8 * j + 2 * l]) | ((qh << (7 - 2 * l)) & 256);
+        grid4x2(iq3s_grid[i1], iq3s_grid[i2], B[74 + 4 * j + l], db, out + 2 * l);
+    }
+}
+// Ternary grids: values -1, 0, 1 as signed bytes, plus +-1/8.
+inline void grid1(ulong g, float dl, float delta, thread float4* o) {
+    float v[8];
+    for (uint j = 0; j < 8; j++) v[j] = dl * (float(as_type<char>(uchar((g >> (8 * j)) & 255))) + delta);
+    o[0] = float4(v[0], v[1], v[2], v[3]); o[1] = float4(v[4], v[5], v[6], v[7]);
+}
+struct IQ1_SW { GgW g; };
+inline void load(IQ1_SW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 50);
+    uint j = b % 8;
+    uint qh = rd16(B + 34 + 2 * j);
+    float dl = h2f(B) * float(2 * ((qh >> 12) & 7) + 1);
+    float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+    for (uint l = 0; l < 4; l++) grid1(iq1s_grid[uint(B[2 + 4 * j + l]) | (((qh >> (3 * l)) & 7) << 8)], dl, delta, out + 2 * l);
+}
+struct IQ1_MW { GgW g; };
+inline void load(IQ1_MW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = sblk(w.g, row, b, 56);
+    uint j = b % 8;
+    uint s0 = rd16(B + 48), s1 = rd16(B + 50), s2 = rd16(B + 52), s3 = rd16(B + 54);
+    float d = float(as_type<half>(ushort((s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000))));
+    uint sv = rd16(B + 48 + 2 * (j / 2)) >> (6 * (j % 2));
+    for (uint l = 0; l < 4; l++) {
+        uint qh = B[32 + 2 * j + l / 2];
+        uint idx = uint(B[4 * j + l]) | ((qh << (l % 2 ? 4 : 8)) & 0x700);
+        float dl = d * float(2 * ((sv >> (l < 2 ? 0 : 3)) & 7) + 1);
+        float delta = (qh & (l % 2 ? 0x80 : 0x08)) ? -0.125f : 0.125f;
+        grid1(iq1s_grid[idx], dl, delta, out + 2 * l);
+    }
+}
+#define GG(T) GEMM(gemm_##T, T##W, MK_GG(T##W))
+GG(Q4_0) GG(IQ4_NL) GG(Q8_0) GG(Q4_K) GG(Q5_K) GG(Q6_K) GG(Q3_K) GG(Q2_K) GG(IQ4_XS)
+GG(IQ2_XXS) GG(IQ2_XS) GG(IQ2_S) GG(IQ3_XXS) GG(IQ3_S) GG(IQ1_S) GG(IQ1_M)
+"#;
+
+/// GGUF types with a Metal GEMM (`gemm_<TYPE>` in `GGUF_SHADER_SRC`).
+const GGUF_GPU_TYPES: [GgmlType; 16] = [
+    GgmlType::Q4_0,
+    GgmlType::IQ4_NL,
+    GgmlType::Q8_0,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+    GgmlType::Q3_K,
+    GgmlType::Q2_K,
+    GgmlType::IQ4_XS,
+    GgmlType::IQ2_XXS,
+    GgmlType::IQ2_XS,
+    GgmlType::IQ2_S,
+    GgmlType::IQ3_XXS,
+    GgmlType::IQ3_S,
+    GgmlType::IQ1_S,
+    GgmlType::IQ1_M,
+];
+
+/// The i-quant grids as MSL constant arrays.
+fn gguf_shader_tables() -> String {
+    use crate::ggml::tables::*;
+    use std::fmt::Write;
+    let mut s = String::new();
+    let arr = |s: &mut String, ty: &str, name: &str, vals: &mut dyn Iterator<Item = String>| {
+        let _ = write!(s, "constant {ty} {name}[] = {{");
+        for v in vals {
+            let _ = write!(s, "{v},");
+        }
+        s.push_str("};\n");
+    };
+    arr(
+        &mut s,
+        "float",
+        "kvalues_iq4nl",
+        &mut KVALUES_IQ4NL.iter().map(|v| format!("{v}.f")),
+    );
+    for (name, t) in [
+        ("iq2xxs_grid", &IQ2XXS_GRID[..]),
+        ("iq2xs_grid", &IQ2XS_GRID[..]),
+        ("iq2s_grid", &IQ2S_GRID[..]),
+        ("iq1s_grid", &IQ1S_GRID[..]),
+    ] {
+        arr(&mut s, "ulong", name, &mut t.iter().map(|v| format!("{v:#x}ul")));
+    }
+    for (name, t) in [("iq3xxs_grid", &IQ3XXS_GRID[..]), ("iq3s_grid", &IQ3S_GRID[..])] {
+        arr(&mut s, "uint", name, &mut t.iter().map(|v| format!("{v:#x}u")));
+    }
+    s
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ConvParams {
@@ -379,6 +657,8 @@ pub struct MetalBackend {
     /// Implicit-GEMM convolution pipelines, same order.
     conv_pipes: [Id; 3],
     gemm_f32: Id,
+    /// GEMM pipelines for the GGUF block formats.
+    gguf_pipes: Vec<(GgmlType, Id)>,
     group_stats: Id,
     row_stats: Id,
     softmax: Id,
@@ -459,7 +739,7 @@ impl MetalBackend {
             unsafe { o.nsstring_to_string(msg0(err, o.sel(c"localizedDescription"))) }
         };
         // Compile the shader library from source.
-        let src = CString::new(SHADER_SRC)?;
+        let src = CString::new(format!("{SHADER_SRC}{}{GGUF_SHADER_SRC}", gguf_shader_tables()))?;
         let ns_src = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), src.as_ptr()) };
         let new_lib: MsgNewLib = o.msg_send();
         let mut err: Id = std::ptr::null_mut();
@@ -494,6 +774,10 @@ impl MetalBackend {
         let pipe_q4a = pipeline(c"gemm_q4a")?;
         let conv_pipes = [pipeline(c"conv_bf")?, pipeline(c"conv_q8")?, pipeline(c"conv_q4")?];
         let gemm_f32 = pipeline(c"gemm_f32")?;
+        let gguf_pipes = GGUF_GPU_TYPES
+            .iter()
+            .map(|&k| Ok((k, pipeline(&CString::new(format!("gemm_{}", k.name()))?)?)))
+            .collect::<Result<Vec<_>>>()?;
         let group_stats = pipeline(c"group_stats")?;
         let row_stats = pipeline(c"row_stats")?;
         let softmax = pipeline(c"softmax_rows")?;
@@ -532,6 +816,7 @@ impl MetalBackend {
             pipe_q4a,
             conv_pipes,
             gemm_f32,
+            gguf_pipes,
             group_stats,
             row_stats,
             softmax,
@@ -582,6 +867,10 @@ impl MetalBackend {
         Some(Buf { id, offset_bytes: 0 })
     }
 
+    fn gguf_pipe(&self, kind: GgmlType) -> Option<Id> {
+        self.gguf_pipes.iter().find(|(k, _)| *k == kind).map(|(_, p)| *p)
+    }
+
     /// Makes `g` at least `bytes` long (replaced buffers are released).
     fn grow(&self, g: &mut Grow, bytes: usize) -> bool {
         if g.cap >= bytes && !g.id.is_null() {
@@ -624,7 +913,7 @@ fn format_index(w: &WeightRef) -> (usize, usize, usize) {
         WeightRef::Bf16(_) => (0, 2, 1),
         WeightRef::Q8(_) => (1, 1, 4),
         WeightRef::Q4(_) => (2, 1, 2),
-        WeightRef::Gguf(_) => unreachable!("GGUF weights are never uploaded"),
+        WeightRef::Gguf(_) => (usize::MAX, 1, 1),
     }
 }
 
@@ -653,7 +942,14 @@ impl Backend for MetalBackend {
 
     fn upload(&self, w: &WeightRef, _n_out: usize, _n_in: usize) -> Option<DeviceWeight> {
         let mw = match w {
-            WeightRef::Gguf(_) => return None,
+            WeightRef::Gguf(m) => {
+                self.gguf_pipe(m.kind)?;
+                MetalWeight {
+                    data: self.wrap(m.data.as_ptr(), m.data.len())?,
+                    scales: None,
+                    offsets: None,
+                }
+            }
             WeightRef::Bf16(w) => MetalWeight {
                 data: self.wrap(w.as_ptr() as *const u8, w.len() * 2)?,
                 scales: None,
@@ -1056,7 +1352,7 @@ impl Backend for MetalBackend {
     }
 
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool {
-        if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in || jobs.iter().any(|j| matches!(j.w, WeightRef::Gguf(_))) {
+        if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in {
             return false;
         }
         let t_pad = t.div_ceil(TILE) * TILE;
@@ -1097,17 +1393,21 @@ impl Backend for MetalBackend {
             for j in jobs.iter() {
                 let mw = j.dev.downcast_ref::<MetalWeight>().unwrap();
                 let (fi, elem_bytes, scale_bytes) = format_index(&j.w);
+                // GGUF: byte offset of the data, and the row length in bytes in place of s_off.
+                let (s_off, pipe) = match &j.w {
+                    WeightRef::Gguf(m) => (m.row_bytes(), self.gguf_pipe(m.kind).unwrap()),
+                    _ => (
+                        mw.scales.as_ref().map(|s| s.offset_bytes / scale_bytes).unwrap_or(0),
+                        if mw.offsets.is_some() { self.pipe_q4a } else { self.pipes[fi] },
+                    ),
+                };
                 let params = Params {
                     n_out: j.n_out as u32,
                     n_in: n_in as u32,
                     w_off: (mw.data.offset_bytes / elem_bytes) as u32,
-                    s_off: mw.scales.as_ref().map(|s| s.offset_bytes / scale_bytes).unwrap_or(0) as u32,
+                    s_off: s_off as u32,
                 };
-                set_pipe(
-                    enc,
-                    self.sels.set_pipeline,
-                    if mw.offsets.is_some() { self.pipe_q4a } else { self.pipes[fi] },
-                );
+                set_pipe(enc, self.sels.set_pipeline, pipe);
                 if let Some((ob, gpr, gk)) = &mw.offsets {
                     let op = OffsetParams {
                         o_off: (ob.offset_bytes / 2) as u32,

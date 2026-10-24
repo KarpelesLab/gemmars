@@ -20,7 +20,7 @@ use crate::quant::{PageVec, QAct, QBLOCK, QBuf, f16_to_f32};
 use anyhow::{Result, bail};
 
 #[path = "ggml_tables.rs"]
-mod tables;
+pub(crate) mod tables;
 use tables::*;
 
 #[cfg(target_arch = "aarch64")]
@@ -979,66 +979,66 @@ impl QMat for GgufMatrix {
     }
 }
 
+fn lcg(seed: &mut u64) -> u64 {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed >> 33
+}
+
+fn put_f16(b: &mut [u8], i: usize, v: f32) {
+    b[i..i + 2].copy_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+}
+
+/// `nb` random blocks of `kind` with sane scales (test data for kernels and benchmarks): random bytes, then every f16 scale field
+/// set to a random value of magnitude 2^-10..2^-4 (`signed`: either sign).
+pub fn random_blocks(kind: GgmlType, nb: usize, seed: &mut u64) -> Vec<u8> {
+    use GgmlType::*;
+    let ts = kind.type_size();
+    let mut v: Vec<u8> = (0..nb * ts).map(|_| lcg(seed) as u8).collect();
+    let rnd = |seed: &mut u64, signed: bool| {
+        // Built from bits (2^-10 .. 2^-4) so the fixtures are identical on every target.
+        let mag = f32::from_bits(((117 + lcg(seed) % 6) << 23) as u32 | (lcg(seed) as u32 & 0x7f_ffff));
+        if signed && lcg(seed) & 1 == 1 { -mag } else { mag }
+    };
+    for b in v.chunks_exact_mut(ts) {
+        match kind {
+            F32 => {
+                let x = rnd(seed, true) * 64.0;
+                b.copy_from_slice(&x.to_le_bytes());
+            }
+            F16 => put_f16(b, 0, rnd(seed, true) * 64.0),
+            BF16 => b.copy_from_slice(&half::bf16::from_f32(rnd(seed, true) * 64.0).to_bits().to_le_bytes()),
+            Q4_1 | Q5_1 => {
+                put_f16(b, 0, rnd(seed, false));
+                put_f16(b, 2, rnd(seed, true) * 8.0);
+            }
+            Q2_K => {
+                put_f16(b, 80, rnd(seed, false));
+                put_f16(b, 82, rnd(seed, false));
+            }
+            Q3_K => put_f16(b, 108, rnd(seed, true)),
+            Q4_K | Q5_K => {
+                put_f16(b, 0, rnd(seed, false));
+                put_f16(b, 2, rnd(seed, false));
+            }
+            Q6_K => put_f16(b, 208, rnd(seed, true)),
+            IQ1_M => {
+                let d = half::f16::from_f32(rnd(seed, true)).to_bits();
+                for k in 0..4 {
+                    let i = 48 + 2 * k;
+                    let s = (u16::from_le_bytes([b[i], b[i + 1]]) & 0x0fff) | (((d >> (4 * k)) & 0xF) << 12);
+                    b[i..i + 2].copy_from_slice(&s.to_le_bytes());
+                }
+            }
+            _ => put_f16(b, 0, rnd(seed, true)),
+        }
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kernels::matmul_quant_multi;
-
-    fn lcg(seed: &mut u64) -> u64 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        *seed >> 33
-    }
-
-    fn put_f16(b: &mut [u8], i: usize, v: f32) {
-        b[i..i + 2].copy_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
-    }
-
-    /// `nb` random blocks of `kind` with sane scales: random bytes, then every f16 scale field
-    /// set to a random value of magnitude 2^-10..2^-4 (`signed`: either sign).
-    pub(crate) fn random_blocks(kind: GgmlType, nb: usize, seed: &mut u64) -> Vec<u8> {
-        use GgmlType::*;
-        let ts = kind.type_size();
-        let mut v: Vec<u8> = (0..nb * ts).map(|_| lcg(seed) as u8).collect();
-        let rnd = |seed: &mut u64, signed: bool| {
-            // Built from bits (2^-10 .. 2^-4) so the fixtures are identical on every target.
-            let mag = f32::from_bits(((117 + lcg(seed) % 6) << 23) as u32 | (lcg(seed) as u32 & 0x7f_ffff));
-            if signed && lcg(seed) & 1 == 1 { -mag } else { mag }
-        };
-        for b in v.chunks_exact_mut(ts) {
-            match kind {
-                F32 => {
-                    let x = rnd(seed, true) * 64.0;
-                    b.copy_from_slice(&x.to_le_bytes());
-                }
-                F16 => put_f16(b, 0, rnd(seed, true) * 64.0),
-                BF16 => b.copy_from_slice(&half::bf16::from_f32(rnd(seed, true) * 64.0).to_bits().to_le_bytes()),
-                Q4_1 | Q5_1 => {
-                    put_f16(b, 0, rnd(seed, false));
-                    put_f16(b, 2, rnd(seed, true) * 8.0);
-                }
-                Q2_K => {
-                    put_f16(b, 80, rnd(seed, false));
-                    put_f16(b, 82, rnd(seed, false));
-                }
-                Q3_K => put_f16(b, 108, rnd(seed, true)),
-                Q4_K | Q5_K => {
-                    put_f16(b, 0, rnd(seed, false));
-                    put_f16(b, 2, rnd(seed, false));
-                }
-                Q6_K => put_f16(b, 208, rnd(seed, true)),
-                IQ1_M => {
-                    let d = half::f16::from_f32(rnd(seed, true)).to_bits();
-                    for k in 0..4 {
-                        let i = 48 + 2 * k;
-                        let s = (u16::from_le_bytes([b[i], b[i + 1]]) & 0x0fff) | (((d >> (4 * k)) & 0xF) << 12);
-                        b[i..i + 2].copy_from_slice(&s.to_le_bytes());
-                    }
-                }
-                _ => put_f16(b, 0, rnd(seed, true)),
-            }
-        }
-        v
-    }
 
     fn fnv(v: &[f32]) -> u64 {
         let mut h = 0xcbf29ce484222325u64;

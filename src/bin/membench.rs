@@ -58,11 +58,22 @@ fn bench_gpu(n_out: usize, n_in: usize) {
         .collect();
     let q8 = quant::quantize_bf16(&w, n_out, n_in);
     let q4 = quant::quantize_q4(&w, n_out, n_in);
-    let refs: [(&str, WeightRef); 3] = [
+    // KINDS=Q4_K,IQ3_S,..: GGUF formats to check as well (random blocks with sane scales).
+    let gg: Vec<oxinfer::ggml::GgufMatrix> = std::env::var("KINDS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|k| oxinfer::ggml::GgmlType::ALL.into_iter().find(|t| t.name() == k))
+        .map(|k| {
+            let raw = oxinfer::ggml::random_blocks(k, n_out * n_in / k.block_size(), &mut 1);
+            oxinfer::ggml::GgufMatrix::from_bytes(k, &raw, n_out, n_in).unwrap()
+        })
+        .collect();
+    let mut refs: Vec<(&str, WeightRef)> = vec![
         ("bf16", WeightRef::Bf16(&w)),
         ("q8", WeightRef::Q8(&q8)),
         ("q4", WeightRef::Q4(&q4)),
     ];
+    refs.extend(gg.iter().map(|m| (m.kind.name(), WeightRef::Gguf(m))));
     for (name, wr) in refs.iter() {
         let dev = be.upload(wr, n_out, n_in).expect("upload");
         println!("\n{name} [{n_out} x {n_in}] on {}:", be.name());
@@ -154,7 +165,11 @@ fn bench_gguf(n_out: usize, n_in: usize, threads: usize) {
     fn run<M: QMat>(name: &str, ms: &[M], n_in: usize, rnd: &mut dyn FnMut() -> u32) {
         let n_out = ms[0].n_out();
         let mut line = format!("  {name:<8} {:>6.1} MB", ms[0].bytes() as f64 / 1e6);
-        for t in [1usize, 2, 4] {
+        let ts: Vec<usize> = match std::env::var("T") {
+            Ok(v) => v.split(',').filter_map(|x| x.parse().ok()).collect(),
+            Err(_) => vec![1, 2, 4],
+        };
+        for t in ts {
             let x: Vec<f32> = (0..t * n_in).map(|_| (rnd() % 2001) as f32 / 1000.0 - 1.0).collect();
             let mut y = vec![0f32; t * n_out];
             let mut best = 0f64;
