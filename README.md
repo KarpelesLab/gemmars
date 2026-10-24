@@ -118,6 +118,17 @@ Two details that are easy to get wrong: transformers halves EmbeddingGemma's sli
 bidirectional attention (512 in the config means keys less than 257 positions away on either
 side), and Qwen3-Embedding pools the `<|endoftext|>` token its tokenizer appends.
 
+From the library (`examples/embed.rs`):
+
+```rust
+let dir = oxinfer::hf::resolve("BAAI/bge-m3", None)?;
+let files = oxinfer::safetensors::ModelFiles::open(&dir, false)?;
+let emb = oxinfer::embed::Embedder::load(&dir, &files, oxinfer::model::Quant::Bf16)?;
+let mut e = emb.embed("what is a panda?", None)?;          // or Some("query") with named prompts
+e.truncate(256)?;                                         // Matryoshka (--dim)
+let lexical = emb.sparse_tokens(&e);                      // BGE-M3 heads: e.sparse / e.colbert
+```
+
 ## Tool calling
 
 Both model families can call tools, in the format each was trained on: Gemma 4 declares them in
@@ -207,7 +218,8 @@ both sides), on SD 1.5: LCM-LoRA (kohya keys, 278 UNet modules including convolu
 steps, 79.6 dB; the ufotable LoCon (kohya, 278 UNet + 72 text-encoder modules) at 0.8, 20 steps
 at guidance 7.5, 78.4 dB, and the same file re-saved by diffusers in the PEFT layout gives the
 identical image; both together (LCM 1.0 + ufotable 0.6), 82.3 dB. Scale 0 reproduces the base
-model bit for bit. LoRAs apply on the command line only for now; the browser build loads none.
+model bit for bit. In the library, `sd::Pipeline::load_with_loras(dir, &[LoraSpec { path, scale }],
+report)` does the same (`examples/sd_lora.rs`); the browser build loads no LoRA yet.
 
 ## Image and audio input
 
@@ -263,7 +275,7 @@ For speculative decoding also fetch `google/gemma-4-E4B-it-assistant` (160 MB) t
 Repo ids are looked up on the [ATOnline](https://www.atonline.com/) mirror first: its
 `AI/Model:get` method (`https://ws.atonline.com/_special/rest/AI/Model:get?key=org/name`) lists a
 repo's files with download URLs, small ones inlined. Repos it does not carry come from
-huggingface.co. `OXINFER_HUB=mirror` or `OXINFER_HUB=hf` pins one source; the HuggingFace token is
+huggingface.co. `OXINFER_HUB=mirror` or `OXINFER_HUB=hf` (`oxinfer::hf::set_hub` in the library) pins one source; the HuggingFace token is
 only ever sent to huggingface.co. The browser build uses the same lookup (the mirror allows
 cross-origin requests).
 

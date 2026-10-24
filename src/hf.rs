@@ -219,14 +219,44 @@ fn list_hf(repo: &str) -> Result<Listing> {
         .collect())
 }
 
-/// Which hub to fetch from: `OXINFER_HUB=auto` (default: the mirror, then huggingface.co for
-/// repos it does not carry), `mirror` or `hf`.
+/// Where repositories are fetched from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hub {
+    /// The mirror, then huggingface.co for repos it does not carry (the default).
+    Auto,
+    /// The ATOnline mirror only.
+    Mirror,
+    /// huggingface.co only.
+    HuggingFace,
+}
+
+static HUB: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Selects the hub for later fetches, overriding `OXINFER_HUB`.
+pub fn set_hub(hub: Hub) {
+    HUB.store(hub as u8 + 1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The hub in use: the one given to [`set_hub`], else `OXINFER_HUB=auto|mirror|hf`, else `Auto`.
+pub fn hub() -> Result<Hub> {
+    Ok(match HUB.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Hub::Auto,
+        2 => Hub::Mirror,
+        3 => Hub::HuggingFace,
+        _ => match std::env::var("OXINFER_HUB").unwrap_or_default().as_str() {
+            "" | "auto" => Hub::Auto,
+            "mirror" => Hub::Mirror,
+            "hf" => Hub::HuggingFace,
+            h => bail!("OXINFER_HUB={h}: expected auto, mirror or hf"),
+        },
+    })
+}
+
 fn listing(repo: &str) -> Result<Listing> {
-    let hub = std::env::var("OXINFER_HUB").unwrap_or_default();
-    match hub.as_str() {
-        "hf" => list_hf(repo),
-        "mirror" => list_mirror(repo)?.with_context(|| format!("{repo}: not on the mirror ({MIRROR_API})")),
-        "" | "auto" => match list_mirror(repo) {
+    match hub()? {
+        Hub::HuggingFace => list_hf(repo),
+        Hub::Mirror => list_mirror(repo)?.with_context(|| format!("{repo}: not on the mirror ({MIRROR_API})")),
+        Hub::Auto => match list_mirror(repo) {
             Ok(Some(l)) => Ok(l),
             Ok(None) => list_hf(repo),
             Err(e) => {
@@ -234,7 +264,6 @@ fn listing(repo: &str) -> Result<Listing> {
                 list_hf(repo)
             }
         },
-        h => bail!("OXINFER_HUB={h}: expected auto, mirror or hf"),
     }
 }
 

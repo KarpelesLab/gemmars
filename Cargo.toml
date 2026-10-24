@@ -26,6 +26,14 @@ path = "src/main.rs"
 name = "membench"
 path = "src/bin/membench.rs"
 
+[[example]]
+name = "embed"
+required-features = ["hf"]
+
+[[example]]
+name = "sd_lora"
+required-features = ["hf"]
+
 [features]
 default = ["media", "hf", "gpu"]
 # Image / audio file decoding through oxideav.

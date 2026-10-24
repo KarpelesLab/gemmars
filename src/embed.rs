@@ -76,6 +76,18 @@ pub struct Embedding {
     pub colbert: Option<Vec<Vec<f32>>>,
 }
 
+impl Embedding {
+    /// Matryoshka truncation: keeps the first `dim` values of the dense vector and renormalizes.
+    pub fn truncate(&mut self, dim: usize) -> Result<()> {
+        if dim == 0 || dim > self.dense.len() {
+            bail!("cannot truncate a {}-dimensional embedding to {dim}", self.dense.len());
+        }
+        self.dense.truncate(dim);
+        l2_normalize(&mut self.dense);
+        Ok(())
+    }
+}
+
 pub struct Embedder<'a> {
     backbone: Backbone<'a>,
     pub tok: Tokenizer,
@@ -311,6 +323,16 @@ impl<'a> Embedder<'a> {
     }
     pub fn has_colbert(&self) -> bool {
         self.colbert.is_some()
+    }
+
+    /// The lexical weights of `e` keyed by token text (as FlagEmbedding reports them).
+    pub fn sparse_tokens(&self, e: &Embedding) -> Option<Vec<(String, f32)>> {
+        let s = e.sparse.as_ref()?;
+        Some(
+            s.iter()
+                .map(|&(id, w)| (self.tok.id_to_token(id).unwrap_or_else(|| id.to_string()), w))
+                .collect(),
+        )
     }
 
     /// The text of prompt `name` (`query`, `document`, ...), if the model defines it.

@@ -1137,27 +1137,18 @@ fn run_embed(args: &Args) -> Result<()> {
     for text in &texts {
         let mut e = emb.embed(text, args.prompt_name.as_deref())?;
         if let Some(d) = args.dim {
-            if d == 0 || d > e.dense.len() {
-                bail!("--dim {d}: the embedding has {} dimensions", e.dense.len());
-            }
-            e.dense.truncate(d);
-            oxinfer::embed::l2_normalize(&mut e.dense);
+            e.truncate(d).context("--dim")?;
         }
         if args.similarity {
             vecs.push(e.dense);
             continue;
         }
         let line = if args.sparse {
-            let m: serde_json::Map<String, serde_json::Value> = e
-                .sparse
+            let m: serde_json::Map<String, serde_json::Value> = emb
+                .sparse_tokens(&e)
                 .unwrap()
                 .into_iter()
-                .map(|(id, w)| {
-                    (
-                        emb.tok.id_to_token(id).unwrap_or_else(|| id.to_string()),
-                        serde_json::Value::from(w as f64),
-                    )
-                })
+                .map(|(k, w)| (k, serde_json::Value::from(w as f64)))
                 .collect();
             serde_json::Value::Object(m).to_string()
         } else if args.colbert {
