@@ -35,7 +35,7 @@ pub struct Pool {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn raise_qos() {
+pub(crate) fn raise_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
@@ -45,7 +45,7 @@ fn raise_qos() {
     }
 }
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-fn raise_qos() {}
+pub(crate) fn raise_qos() {}
 
 /// Claims and runs blocks of the current region, if any. Returns false if no region was published.
 #[inline]

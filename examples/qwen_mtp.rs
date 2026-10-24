@@ -32,6 +32,7 @@ fn main() -> anyhow::Result<()> {
         draft_tokens: 3,
         adaptive: true,
         stop: stop.clone(),
+        ..Default::default()
     };
     let mut dec = MtpDecoder::new(&model, &mtp, opts);
     let mut sampler = Sampler::new(temperature, 20, 0.95, 42);

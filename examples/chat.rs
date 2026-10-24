@@ -35,6 +35,7 @@ fn main() -> anyhow::Result<()> {
         if stdin.lock().read_line(&mut line)? == 0 || line.trim().is_empty() {
             break;
         }
+        let io0 = engine.streamer().map(|s| s.stats());
         let reply = engine.send(line.trim_end(), &mut |d| {
             // Thinking dimmed, as the CLI shows it.
             let mut out = std::io::stdout().lock();
@@ -59,6 +60,15 @@ fn main() -> anyhow::Result<()> {
             100.0 * s.acceptance(),
             s.context_tokens
         );
+        if let (Some(st), Some(io0)) = (engine.streamer(), io0) {
+            let io = st.stats() - io0;
+            eprintln!(
+                "[stream: {:.2} GB read from flash, {:.2} GB already cached, {:.1}s waiting for IO]",
+                io.bytes_read as f64 / 1e9,
+                io.bytes_cached as f64 / 1e9,
+                io.stall.as_secs_f64()
+            );
+        }
     }
     Ok(())
 }

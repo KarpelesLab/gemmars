@@ -419,6 +419,22 @@ impl<'a> Lin<'a> {
     pub fn bytes(&self) -> usize {
         self.as_ref().bytes()
     }
+    /// The memory this weight reads, as `(address, length)` spans (for weight streaming).
+    pub fn mem_ranges(&self) -> Vec<(usize, usize)> {
+        fn span<T>(v: &[T]) -> (usize, usize) {
+            (v.as_ptr() as usize, std::mem::size_of_val(v))
+        }
+        match &self.w {
+            Weight::Bf16(w, _) => vec![span(&w[..])],
+            Weight::Q8(m) => vec![span(&m.q[..]), span(&m.scales[..])],
+            Weight::Q4(m) => {
+                let mut v = vec![span(&m.q[..]), span(&m.scales[..])];
+                v.extend(m.offsets.as_ref().map(|o| span(&o.v[..])));
+                v
+            }
+            Weight::Gguf(m) => vec![span(&m.data[..])],
+        }
+    }
     pub fn as_ref(&self) -> crate::gpu::WeightRef<'_> {
         match &self.w {
             Weight::Bf16(w, _) => crate::gpu::WeightRef::Bf16(w),

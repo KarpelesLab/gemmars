@@ -74,8 +74,9 @@ where
 }
 
 enum Storage {
+    /// A mapped file, kept open for streaming reads (`crate::stream`).
     #[cfg(not(target_arch = "wasm32"))]
-    Mmap(Mmap),
+    Mmap(Mmap, File),
     /// Heap copy in a page-aligned, page-multiple allocation (so accelerators can map it in place):
     /// (buffer, file length, padding before the file's first byte). The padding puts the tensor
     /// data on a 16-byte boundary when the header length leaves it unaligned (as MLX writes it).
@@ -88,7 +89,7 @@ impl Storage {
     fn bytes(&self) -> &[u8] {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            Storage::Mmap(m) => &m[..],
+            Storage::Mmap(m, _) => &m[..],
             Storage::Heap(v, n, pad) => unsafe { std::slice::from_raw_parts((v.as_ptr() as *const u8).add(*pad), *n) },
             Storage::Host(_) => &[],
         }
@@ -187,7 +188,8 @@ impl SafeTensors {
             Storage::Heap(read_file_parallel(&file, len, pad)?, len, pad)
         } else {
             let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-            Storage::Mmap(unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?)
+            let map = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
+            Storage::Mmap(map, file)
         };
         #[cfg(target_arch = "wasm32")]
         let mmap = {
@@ -377,10 +379,19 @@ impl SafeTensors {
         self.len() == 0
     }
 
+    /// The mapped file and its bytes, when this file is memory-mapped (`--mmap`).
+    pub fn mapping(&self) -> Option<MappedFile<'_>> {
+        match &self.mmap {
+            #[cfg(not(target_arch = "wasm32"))]
+            Storage::Mmap(m, f) => Some(MappedFile { bytes: &m[..], file: f }),
+            _ => None,
+        }
+    }
+
     /// Touch every page so the weights are resident before the first forward pass.
     pub fn preload(&self) {
         #[cfg(unix)]
-        if let Storage::Mmap(m) = &self.mmap {
+        if let Storage::Mmap(m, _) = &self.mmap {
             let _ = m.advise(memmap2::Advice::WillNeed);
         }
         const CHUNK: usize = 64 << 20;
@@ -394,6 +405,14 @@ impl SafeTensors {
         });
         std::hint::black_box(total);
     }
+}
+
+/// A memory-mapped checkpoint file: its bytes as mapped, and the open file (for positional
+/// reads and read-ahead hints on the same pages; see `crate::stream`).
+#[derive(Clone, Copy)]
+pub struct MappedFile<'a> {
+    pub bytes: &'a [u8],
+    pub file: &'a std::fs::File,
 }
 
 /// A model directory: either `model.safetensors` or an index plus shards.
@@ -1145,6 +1164,12 @@ impl ModelFiles {
     /// Checkpoint size (u64: a browser module's usize is 32-bit, checkpoints can be larger).
     pub fn total_bytes(&self) -> u64 {
         self.shards.iter().map(|s| s.len() as u64).sum()
+    }
+
+    /// Every shard's mapping; None if any shard is not memory-mapped (read into RAM, or kept by
+    /// a browser host).
+    pub fn mappings(&self) -> Option<Vec<MappedFile<'_>>> {
+        self.shards.iter().map(|s| s.mapping()).collect()
     }
 
     pub fn preload(&self) {

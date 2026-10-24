@@ -41,6 +41,16 @@ struct Args {
     mtp: bool,
     mtp_fixed: bool,
     mtp_from: Option<PathBuf>,
+    mtp_cost: Option<bool>,
+    stream: bool,
+    cache_budget_gb: Option<f64>,
+    resident_mb: Option<u64>,
+    prefetch_mb: Option<u64>,
+    resident_mode: oxinfer::stream::ResidentMode,
+    flash_mbps: Option<f64>,
+    stream_io: Option<oxinfer::stream::IoMethod>,
+    stream_trace: bool,
+    stream_threads: Option<usize>,
     images: Vec<PathBuf>,
     audios: Vec<PathBuf>,
     dump_mm: Option<PathBuf>,
@@ -104,6 +114,19 @@ fn usage() -> ! {
          \x20 --mtp-fixed          with --mtp, always draft --draft-tokens (default: adaptive 1..N)\n\
          \x20 --mtp-from DIR       implies --mtp, with the MTP weights from another checkpoint (e.g. the\n\
          \x20                      original one when the model is a converted copy without them)\n\
+         \x20 --mtp-cost           with --mtp, pick each round's draft length from measured round times and\n\
+         \x20                      acceptance (default with --stream; --no-mtp-cost turns it off)\n\
+         \x20 --stream             Qwen: stream weights from the mapped file (models larger than RAM): a\n\
+         \x20                      reader thread fetches the next layers while one computes\n\
+         \x20 --cache-budget-gb F  with --stream, page cache the model may use: a resident set of\n\
+         \x20                      F - prefetch stays cached, the other layers are dropped after use\n\
+         \x20 --resident-mb N      with --stream, resident set size (instead of the budget's)\n\
+         \x20 --prefetch-mb N      with --stream, read-ahead window (default 768)\n\
+         \x20 --resident-mode M    cache (default) | lock (mlock) | copy (anonymous memory)\n\
+         \x20 --flash-mbps N       with --stream, emulate storage reading N MB/s (or $OXINFER_FLASH_MBPS)\n\
+         \x20 --stream-io M        advise (default on Apple) | pread | touch\n\
+         \x20 --stream-trace       with --stream, one line of IO statistics per decoding step\n\
+         \x20 --stream-threads N   with --stream, reader threads (default 2)\n\
          \x20 --image FILE         attach an image (repeatable; PNG/JPEG/WebP/GIF/BMP via oxideav)\n\
          \x20 --audio FILE         attach an audio clip (repeatable; WAV/MP3/FLAC/AAC/OGG via oxideav)\n\
          \x20 --max-soft-tokens N  image soft-token budget: 70, 140, 280 (default), 560 or 1120\n\
@@ -172,6 +195,16 @@ fn parse_args() -> Result<Args> {
         mtp: false,
         mtp_fixed: false,
         mtp_from: None,
+        mtp_cost: None,
+        stream: false,
+        cache_budget_gb: None,
+        resident_mb: None,
+        prefetch_mb: None,
+        resident_mode: oxinfer::stream::ResidentMode::Cache,
+        flash_mbps: None,
+        stream_io: None,
+        stream_trace: false,
+        stream_threads: None,
         images: Vec::new(),
         audios: Vec::new(),
         dump_mm: None,
@@ -236,6 +269,36 @@ fn parse_args() -> Result<Args> {
                 a.mtp_from = Some(PathBuf::from(val()?));
                 a.mtp = true;
             }
+            "--mtp-cost" => a.mtp_cost = Some(true),
+            "--no-mtp-cost" => a.mtp_cost = Some(false),
+            "--stream" => {
+                a.stream = true;
+                a.mmap = true;
+            }
+            "--cache-budget-gb" => a.cache_budget_gb = Some(val()?.parse()?),
+            "--resident-mb" => a.resident_mb = Some(val()?.parse()?),
+            "--prefetch-mb" => a.prefetch_mb = Some(val()?.parse()?),
+            "--resident-mode" => {
+                use oxinfer::stream::ResidentMode;
+                a.resident_mode = match val()?.as_str() {
+                    "cache" => ResidentMode::Cache,
+                    "lock" => ResidentMode::Lock,
+                    "copy" => ResidentMode::Copy,
+                    other => bail!("unknown resident mode {other} (cache, lock or copy)"),
+                }
+            }
+            "--flash-mbps" => a.flash_mbps = Some(val()?.parse()?),
+            "--stream-io" => {
+                use oxinfer::stream::IoMethod;
+                a.stream_io = Some(match val()?.as_str() {
+                    "advise" => IoMethod::Advise,
+                    "pread" => IoMethod::Pread,
+                    "touch" => IoMethod::Touch,
+                    other => bail!("unknown streaming IO {other} (advise, pread or touch)"),
+                })
+            }
+            "--stream-trace" => a.stream_trace = true,
+            "--stream-threads" => a.stream_threads = Some(val()?.parse()?),
             "--image" => a.images.push(PathBuf::from(val()?)),
             "--audio" => a.audios.push(PathBuf::from(val()?)),
             "--dump-mm" => a.dump_mm = Some(PathBuf::from(val()?)),
@@ -394,8 +457,31 @@ fn generate<M: TextLm>(
     think: bool,
 ) -> (Vec<u32>, usize, f64) {
     let mut printer = Printer::new(fmt, think, tok);
-    let d = generate::decode(model, sess, logits, sampler, eos, max_tokens, &mut |out| printer.print(tok, out));
+    let stream = STREAM.lock().unwrap().clone();
+    let trace = TRACE.load(std::sync::atomic::Ordering::Relaxed);
+    let s_start = stream.as_ref().map(|s| s.stats());
+    let (mut s_last, mut t_last) = (s_start, Instant::now());
+    let d = generate::decode(model, sess, logits, sampler, eos, max_tokens, &mut |out| {
+        // Every token after the first follows one forward pass.
+        if let (true, Some(s), Some(s0)) = (trace && out.len() > 1, &stream, &s_last) {
+            let now = s.stats();
+            eprintln!(
+                "[token: {}]",
+                stream_line(&(now - *s0), 1, t_last.elapsed().as_secs_f64())
+            );
+            (s_last, t_last) = (Some(now), Instant::now());
+        }
+        printer.print(tok, out)
+    });
     printer.finish(tok, &d.tokens, eos);
+    if let (Some(s), Some(s0)) = (&stream, s_start) {
+        let st = s.stats() - s0;
+        eprintln!(
+            "[stream: {}; {:.2} GB read per forward]",
+            stream_line(&st, d.forwards, d.secs),
+            st.bytes_read as f64 / 1e9 / d.forwards.max(1) as f64
+        );
+    }
     (d.tokens, d.forwards, d.secs)
 }
 
@@ -802,7 +888,7 @@ fn run_qwen(args: Args) -> Result<()> {
     let cfg = config::QwenConfig::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
-    let model = qwen::QwenModel::load(cfg, &files, args.quant)?;
+    let mut model = qwen::QwenModel::load(cfg, &files, args.quant)?;
     let tok = load_tokenizer(&args.model)?;
     let fmt = chat::QwenChat::for_model(&args.model);
     let eos = chat::with_turn_end(fmt, &tok, eos);
@@ -826,7 +912,7 @@ fn run_qwen(args: Args) -> Result<()> {
         Some(d) => Some(safetensors::ModelFiles::open(d, false)?),
         None => None,
     };
-    let mtp = if args.mtp || (args.save_quantized.is_some() && oxinfer::qwen_mtp::mtp_prefix(&files).is_some()) {
+    let mut mtp = if args.mtp || (args.save_quantized.is_some() && oxinfer::qwen_mtp::mtp_prefix(&files).is_some()) {
         let t1 = Instant::now();
         let mut m = model.load_mtp(side.as_ref().unwrap_or(&files))?;
         if let Some(side) = &side
@@ -846,10 +932,119 @@ fn run_qwen(args: Args) -> Result<()> {
     if let Some(out) = &args.save_quantized {
         return save_quantized(&args.model, out, &files, model.quant);
     }
-    match &mtp {
-        Some(m) if args.mtp => run_qwen_mtp(&args, &model, m, &tok, &eos, fmt),
+    let streamer = if args.stream {
+        let mut fs = vec![&files];
+        fs.extend(side.as_ref());
+        Some(start_stream(&args, &mut model, mtp.as_mut().filter(|_| args.mtp), &fs)?)
+    } else {
+        None
+    };
+    *STREAM.lock().unwrap() = streamer.clone();
+    TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
+    let r = match &mtp {
+        Some(m) if args.mtp => run_qwen_mtp(&args, &model, m, &tok, &eos, fmt, streamer.as_deref()),
         _ => run_text(&args, &model, &tok, &eos, fmt),
+    };
+    if let Some(s) = &streamer
+        && let Some(c) = s.cached_bytes()
+    {
+        eprintln!("[stream: {:.2} GB of the model files in the page cache at exit]", c as f64 / 1e9);
     }
+    // The streamer reads the mapped files: stop it before they are unmapped.
+    *STREAM.lock().unwrap() = None;
+    if let Some(m) = &mut mtp {
+        m.set_stream(None);
+    }
+    model.set_stream(None);
+    drop(streamer);
+    r
+}
+
+static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The active weight streamer, for the per-token trace of plain decoding.
+static STREAM: std::sync::Mutex<Option<std::sync::Arc<oxinfer::stream::Streamer>>> = std::sync::Mutex::new(None);
+
+/// Draft tokens per round by default: more when streaming, where verifying 9 tokens costs about
+/// as much as verifying 1.
+fn default_draft_tokens(args: &Args) -> usize {
+    args.draft_tokens.unwrap_or(if args.stream { 8 } else { 3 })
+}
+
+/// Starts weight streaming for `--stream` and prints the plan.
+fn start_stream(
+    args: &Args,
+    model: &mut qwen::QwenModel,
+    mtp: Option<&mut oxinfer::qwen_mtp::QwenMtp>,
+    files: &[&safetensors::ModelFiles],
+) -> Result<std::sync::Arc<oxinfer::stream::Streamer>> {
+    use oxinfer::stream::StreamOptions;
+    let mut opts = StreamOptions::default().with_env();
+    opts.cache_budget = args.cache_budget_gb.map(|g| (g * 1e9) as u64);
+    opts.resident_bytes = args.resident_mb.map(|m| m << 20);
+    if let Some(p) = args.prefetch_mb {
+        opts.prefetch_bytes = p << 20;
+    }
+    opts.resident_mode = args.resident_mode;
+    if let Some(f) = args.flash_mbps {
+        opts.flash_bytes_per_sec = Some(f * 1e6);
+    }
+    if let Some(io) = args.stream_io {
+        opts.io = io;
+    }
+    if let Some(n) = args.stream_threads {
+        opts.io_threads = n;
+    }
+    let s = oxinfer::stream::attach_qwen(model, mtp, files, default_draft_tokens(args), opts)?;
+    let plan = s.plan();
+    let o = s.options();
+    let resident: Vec<&str> = plan.units.iter().filter(|u| u.2).map(|u| u.0.as_str()).collect();
+    eprintln!(
+        "[stream: {} units, {:.2} GB resident ({}), {:.2} GB streamed per pass, prefetch {} MB, {}{}, io {:?}, set-up {:.2}s]",
+        plan.units.len(),
+        plan.resident_bytes as f64 / 1e9,
+        if resident.len() > 6 {
+            format!("{}, ... {} units", resident[..4].join(", "), resident.len())
+        } else {
+            resident.join(", ")
+        },
+        plan.streamed_bytes as f64 / 1e9,
+        o.prefetch_bytes >> 20,
+        match (o.cache_budget, o.resident_bytes) {
+            (_, Some(_)) | (Some(_), None) => format!("{:?} resident, streamed units evicted after use", o.resident_mode),
+            _ => "no budget (the OS page cache decides)".into(),
+        },
+        match o.flash_bytes_per_sec {
+            Some(r) => format!(", flash emulated at {:.0} MB/s", r / 1e6),
+            None => String::new(),
+        },
+        o.io,
+        plan.setup.as_secs_f64()
+    );
+    if plan.unmapped_bytes > 0 {
+        eprintln!(
+            "[stream: warning: {:.2} GB of weights are copies in RAM, not read from the file]",
+            plan.unmapped_bytes as f64 / 1e9
+        );
+    }
+    if plan.resident_failures > 0 {
+        eprintln!("[stream: {} resident units could not be locked or copied]", plan.resident_failures);
+    }
+    Ok(s)
+}
+
+/// One line of streaming statistics for `steps` decoding steps (`--stream-trace` and summaries).
+fn stream_line(d: &oxinfer::stream::StreamStats, tokens: usize, secs: f64) -> String {
+    format!(
+        "{tokens} tok in {:.2}s: read {:.2} GB from storage, {:.2} GB cache hits, stalled {:.2}s ({:.0}%), reader busy {:.2}s (throttled {:.2}s)",
+        secs,
+        d.bytes_read as f64 / 1e9,
+        d.bytes_cached as f64 / 1e9,
+        d.stall.as_secs_f64(),
+        100.0 * d.stall.as_secs_f64() / secs.max(1e-9),
+        d.io_busy.as_secs_f64(),
+        d.throttled.as_secs_f64()
+    )
 }
 
 /// Generation (single prompt or chat) with MTP speculative decoding.
@@ -860,6 +1055,7 @@ fn run_qwen_mtp(
     tok: &Tokenizer,
     eos: &[u32],
     fmt: &dyn ChatFormat,
+    stream: Option<&oxinfer::stream::Streamer>,
 ) -> Result<()> {
     use oxinfer::qwen_mtp::{MtpDecoder, MtpOptions};
     if args.tools || args.dump_logits.is_some() || args.print_prompt {
@@ -870,17 +1066,26 @@ fn run_qwen_mtp(
         Ok(enc.get_ids().to_vec())
     };
     let opts = MtpOptions {
-        draft_tokens: args.draft_tokens.unwrap_or(3),
+        draft_tokens: default_draft_tokens(args),
         adaptive: !args.mtp_fixed,
         stop: eos.to_vec(),
+        cost_aware: !args.mtp_fixed && args.mtp_cost.unwrap_or(args.stream),
+        // Long drafts stay exact when streaming (verification is IO-bound there).
+        exact: args.stream,
     };
     eprintln!(
         "[MTP speculative decoding: {} draft tokens{}, {}]",
         opts.draft_tokens,
-        if opts.adaptive { " max (adaptive)" } else { "" },
+        if opts.cost_aware {
+            " max (cost-aware)"
+        } else if opts.adaptive {
+            " max (adaptive)"
+        } else {
+            ""
+        },
         if args.temperature > 0.0 { "sampled" } else { "greedy" }
     );
-    if opts.draft_tokens > oxinfer::qwen_mtp::MAX_EXACT_DRAFT {
+    if opts.draft_tokens > oxinfer::qwen_mtp::MAX_EXACT_DRAFT && !opts.exact {
         eprintln!(
             "[note: verifying more than {} drafts runs the prefill GEMM kernels, whose rounding differs from decoding: \
              the output can drift from plain decoding at near-ties]",
@@ -903,8 +1108,24 @@ fn run_qwen_mtp(
         let prefill_secs = t.elapsed().as_secs_f64();
         prof::reset();
         let before = dec.stats.clone();
+        let s0 = stream.map(|s| s.stats());
         let mut printer = Printer::new(fmt, args.think, tok);
-        let d = generate::decode_mtp(dec, &logits, &mut sampler, eos, args.max_tokens, &mut |out| printer.print(tok, out));
+        let (mut s_last, mut t_last, mut n_last) = (s0, Instant::now(), 0usize);
+        let d = generate::decode_mtp(dec, &logits, &mut sampler, eos, args.max_tokens, &mut |out| {
+            // A round commits several tokens at once: report when its reads show up.
+            if let (true, Some(s), Some(sl)) = (args.stream_trace, stream, &s_last) {
+                let now = s.stats();
+                if now.bytes_read != sl.bytes_read || now.stall != sl.stall {
+                    let n = out.len() - n_last;
+                    eprintln!(
+                        "[step: +{n}: {}]",
+                        stream_line(&(now - *sl), n, t_last.elapsed().as_secs_f64())
+                    );
+                    (s_last, t_last, n_last) = (Some(now), Instant::now(), out.len());
+                }
+            }
+            printer.print(tok, out)
+        });
         let out = d.tokens;
         let decode_secs = d.secs;
         printer.finish(tok, &out, eos);
@@ -928,6 +1149,20 @@ fn run_qwen_mtp(
             100.0 * accepted as f64 / drafted.max(1) as f64,
             st.per_round
         );
+        eprintln!(
+            "[MTP time: drafting {:.2}s, verification {:.2}s ({:.0} ms per forward)]",
+            st.draft_secs - before.draft_secs,
+            st.verify_secs - before.verify_secs,
+            1e3 * (st.verify_secs - before.verify_secs) / rounds.max(1) as f64
+        );
+        if let (Some(s), Some(s0)) = (stream, s0) {
+            let d = s.stats() - s0;
+            eprintln!(
+                "[stream: {}; {:.2} GB read per forward]",
+                stream_line(&d, out.len().saturating_sub(1), decode_secs),
+                d.bytes_read as f64 / 1e9 / rounds.max(1) as f64
+            );
+        }
         if args.profile {
             prof::report(decode_secs, out.len());
         }

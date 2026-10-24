@@ -103,7 +103,25 @@ pub(crate) enum Ffn<'a> {
     Moe(Moe<'a>),
 }
 
-impl Ffn<'_> {
+impl<'a> Ffn<'a> {
+    /// Every weight of the block (all experts of a MoE).
+    pub(crate) fn lins(&self) -> Vec<&Lin<'a>> {
+        match self {
+            Ffn::Dense(m) => vec![&m.gate, &m.up, &m.down],
+            Ffn::Moe(m) => {
+                let mut v: Vec<&Lin> = vec![&m.shared.gate, &m.shared.up, &m.shared.down];
+                for g in &m.gate_up {
+                    match g {
+                        GateUp::Fused(l) => v.push(l),
+                        GateUp::Split(a, b) => v.extend([a, b]),
+                    }
+                }
+                v.extend(m.down.iter());
+                v
+            }
+        }
+    }
+
     pub(crate) fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
         match self {
             Ffn::Dense(m) => m.forward(x, t, h, y),
@@ -121,9 +139,12 @@ impl Ffn<'_> {
     }
 }
 
-impl Attn<'_> {
+impl<'a> Attn<'a> {
     pub(crate) fn bytes(&self) -> usize {
         self.q.bytes() + self.k.bytes() + self.v.bytes() + self.o.bytes()
+    }
+    pub(crate) fn lins(&self) -> [&Lin<'a>; 4] {
+        [&self.q, &self.k, &self.v, &self.o]
     }
 }
 
@@ -142,6 +163,8 @@ pub struct QwenModel<'a> {
     final_norm: Vec<f32>,
     pub(crate) lm_head: Lin<'a>,
     pub(crate) inv_freq: Vec<f32>,
+    /// Weight streaming: unit `l` is layer `l`, unit `num_hidden_layers` the LM head.
+    stream: Option<crate::stream::StreamHook>,
 }
 
 /// Recurrent state of one Gated DeltaNet layer.
@@ -153,13 +176,111 @@ pub struct GdnState {
 
 /// What a recording forward (`QwenModel::forward_hidden_rec`) keeps of one Gated DeltaNet layer
 /// so the session can rewind to any position inside the span: unlike a KV cache, the recurrent
-/// state cannot be truncated, so the state after every token is stored (buffers are reused).
+/// state cannot be truncated, so the state before the span and the delta rule's per-token inputs
+/// are kept, and a rewind replays the rule over the kept tokens (the same arithmetic as the
+/// forward, so bit-identical). Keeping every intermediate state instead would cost 151 MB per
+/// token on Qwen3.8-27B; this is one state plus ~45 KB per token. Buffers are reused.
 #[derive(Clone, Default)]
 struct GdnRecord {
-    states: Vec<f32>, // [t - 1, n_v * hd_k * hd_v]: `s` after each token but the last
-    qkv: Vec<f32>,    // [t, conv_dim]: raw conv inputs
-    conv0: Vec<f32>,  // conv state before the span
+    s0: Vec<f32>,    // state before the span
+    c: Vec<f32>,     // [t, conv_dim]: conv outputs (after SiLU)
+    b: Vec<f32>,     // [t, n_v]
+    a: Vec<f32>,     // [t, n_v]
+    qkv: Vec<f32>,   // [t, conv_dim]: raw conv inputs
+    conv0: Vec<f32>, // conv state before the span
     conv_dim: usize,
+    rule: DeltaRule,
+}
+
+/// The shapes and per-head constants of one layer's gated delta rule.
+#[derive(Clone, Default)]
+struct DeltaRule {
+    nk: usize,
+    nv: usize,
+    hdk: usize,
+    hdv: usize,
+    tiled: bool,
+    decay_coef: Vec<f32>,
+    dt_bias: Vec<f32>,
+}
+
+impl DeltaRule {
+    /// Runs the gated delta rule over `t` tokens of conv outputs `c` (`[t, 2 * key_dim +
+    /// value_dim]`) and gate inputs `b`, `a` (`[t, n_v]`), updating the state `s` in place and,
+    /// if given, writing each token's output to `out` (`[t, value_dim]`). Parallel over value
+    /// heads.
+    fn run(&self, s: &mut [f32], c: &[f32], b: &[f32], a: &[f32], t: usize, out: Option<&mut [f32]>) {
+        let (nk, nv, hdk, hdv) = (self.nk, self.nv, self.hdk, self.hdv);
+        let (key_dim, value_dim) = (nk * hdk, nv * hdv);
+        let conv_dim = 2 * key_dim + value_dim;
+        let rep = nv / nk;
+        let op = out.map(|o| SendPtrF(o.as_mut_ptr()));
+        let sp = SendPtrF(s.as_mut_ptr());
+        let qscale = (hdk as f32).powf(-0.5);
+        pool::run(nv, &|hv| {
+            let hk = if self.tiled { hv % nk } else { hv / rep };
+            // SAFETY: each head owns its own state slab and output columns.
+            let s = unsafe { std::slice::from_raw_parts_mut(sp.get().add(hv * hdk * hdv), hdk * hdv) };
+            let mut qn = vec![0f32; hdk];
+            let mut kn = vec![0f32; hdk];
+            let mut kvmem = vec![0f32; hdv];
+            let mut delta = vec![0f32; hdv];
+            for i in 0..t {
+                let row = &c[i * conv_dim..(i + 1) * conv_dim];
+                let qv = &row[hk * hdk..(hk + 1) * hdk];
+                let kv = &row[key_dim + hk * hdk..key_dim + (hk + 1) * hdk];
+                let vv = &row[2 * key_dim + hv * hdv..2 * key_dim + (hv + 1) * hdv];
+                let qn_inv = (qv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt().recip();
+                let kn_inv = (kv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt().recip();
+                for d in 0..hdk {
+                    qn[d] = qv[d] * qn_inv * qscale;
+                    kn[d] = kv[d] * kn_inv;
+                }
+                let beta = 1.0 / (1.0 + fast_exp(-b[i * nv + hv]));
+                let ga = a[i * nv + hv] + self.dt_bias[hv];
+                let softplus = if ga > 20.0 { ga } else { (1.0 + ga.exp()).ln() };
+                let decay = (self.decay_coef[hv] * softplus).exp();
+                // S *= decay; kvmem = k^T S
+                kvmem.fill(0.0);
+                for dk in 0..hdk {
+                    let srow = &mut s[dk * hdv..(dk + 1) * hdv];
+                    let kd = kn[dk];
+                    for j in 0..hdv {
+                        srow[j] *= decay;
+                        kvmem[j] += srow[j] * kd;
+                    }
+                }
+                for j in 0..hdv {
+                    delta[j] = (vv[j] - kvmem[j]) * beta;
+                }
+                // S += k (x) delta; out = q^T S
+                match op {
+                    Some(op) => {
+                        // SAFETY: each (token, head) output slice is written by this head only.
+                        let o = unsafe { std::slice::from_raw_parts_mut(op.get().add(i * value_dim + hv * hdv), hdv) };
+                        o.fill(0.0);
+                        for dk in 0..hdk {
+                            let srow = &mut s[dk * hdv..(dk + 1) * hdv];
+                            let (kd, qd) = (kn[dk], qn[dk]);
+                            for j in 0..hdv {
+                                srow[j] += kd * delta[j];
+                                o[j] += srow[j] * qd;
+                            }
+                        }
+                    }
+                    None => {
+                        for dk in 0..hdk {
+                            let srow = &mut s[dk * hdv..(dk + 1) * hdv];
+                            let kd = kn[dk];
+                            for j in 0..hdv {
+                                srow[j] += kd * delta[j];
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -191,8 +312,10 @@ impl QwenSession {
             let i = pos - start - 1; // the last kept token, within the span
             for (st, rec) in self.gdn.iter_mut().zip(&self.rec) {
                 let Some(st) = st else { continue };
-                let n = st.s.len();
-                st.s.copy_from_slice(&rec.states[i * n..(i + 1) * n]);
+                st.s.copy_from_slice(&rec.s0);
+                let nv = rec.rule.nv;
+                rec.rule
+                    .run(&mut st.s, &rec.c, &rec.b[..(i + 1) * nv], &rec.a[..(i + 1) * nv], i + 1, None);
                 // The conv state is the last K-1 raw inputs up to and including token i.
                 let cd = rec.conv_dim;
                 let keep = st.conv.len() / cd;
@@ -416,7 +539,41 @@ impl<'a> QwenModel<'a> {
             final_norm,
             lm_head,
             inv_freq,
+            stream: None,
         })
+    }
+
+    /// The streaming units of this model in execution order (see `crate::stream`): the layers,
+    /// then the LM head.
+    pub fn stream_units(&self) -> Vec<crate::stream::UnitSpec> {
+        let mut v: Vec<crate::stream::UnitSpec> = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(l, layer)| {
+                let mut lins: Vec<&Lin> = match &layer.mixer {
+                    Mixer::Gdn(g) => vec![&g.qkv, &g.z, &g.b, &g.a, &g.out],
+                    Mixer::Attn(a) => a.lins().to_vec(),
+                };
+                lins.extend(layer.ffn.lins());
+                crate::stream::UnitSpec {
+                    name: format!("layer.{l}"),
+                    ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
+                    uses: 1.0,
+                }
+            })
+            .collect();
+        v.push(crate::stream::UnitSpec {
+            name: "lm_head".into(),
+            ranges: self.lm_head.mem_ranges(),
+            uses: 1.0,
+        });
+        v
+    }
+
+    /// Brackets every layer and the LM head with `hook`'s units (None stops streaming).
+    pub fn set_stream(&mut self, hook: Option<crate::stream::StreamHook>) {
+        self.stream = hook;
     }
 
     pub fn streamed_bytes(&self) -> usize {
@@ -459,6 +616,7 @@ impl<'a> QwenModel<'a> {
     }
 
     pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        let _unit = crate::stream::enter(&self.stream, self.layers.len());
         let _timer = prof::start(Cat::Head);
         let mut logits = vec![0f32; t * self.cfg.vocab_size];
         linear(&self.lm_head, self.cfg.vocab_size, self.cfg.hidden_size, hidden, t, &mut logits);
@@ -476,9 +634,9 @@ impl<'a> QwenModel<'a> {
         self.forward_impl(sess, tokens, mm, false)
     }
 
-    /// `forward_hidden_mm` without overrides that also records the recurrent states after every
-    /// token, so `sess.rewind` can then go back to any position inside `tokens` (speculative
-    /// verification). Costs one extra write of the Gated DeltaNet states per token.
+    /// `forward_hidden_mm` without overrides that also records what `sess.rewind` needs to go
+    /// back to any position inside `tokens` (speculative verification): one copy of the Gated
+    /// DeltaNet states, and a replay of the kept tokens' delta rule on rewind.
     pub fn forward_hidden_rec(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
         self.forward_impl(sess, tokens, &[], true)
     }
@@ -508,6 +666,7 @@ impl<'a> QwenModel<'a> {
         let mut hn = vec![0f32; t * h];
         let mut y = vec![0f32; t * h];
         for (l, layer) in self.layers.iter().enumerate() {
+            let _unit = crate::stream::enter(&self.stream, l);
             rmsnorm_f32w_rows(&x, h, &layer.ln_in, eps, &mut hn);
             match &layer.mixer {
                 Mixer::Gdn(gd) => {
@@ -633,7 +792,6 @@ impl<'a> QwenModel<'a> {
         let (key_dim, value_dim) = (nk * hdk, nv * hdv);
         let conv_dim = 2 * key_dim + value_dim;
         let kc = cfg.linear_conv_kernel_dim;
-        let rep = nv / nk;
 
         let mut qkv = vec![0f32; t * conv_dim];
         let mut z = vec![0f32; t * value_dim];
@@ -673,12 +831,23 @@ impl<'a> QwenModel<'a> {
                 }
             });
         }
-        let state_len = st.s.len();
+        let rule = DeltaRule {
+            nk,
+            nv,
+            hdk,
+            hdv,
+            tiled: cfg.v_heads_tiled,
+            decay_coef: gd.decay_coef.clone(),
+            dt_bias: gd.dt_bias.clone(),
+        };
         if let Some(r) = rec.as_deref_mut() {
+            r.s0.clone_from(&st.s);
             r.conv0.clone_from(&st.conv);
             r.qkv.clone_from(&qkv);
+            r.c.clone_from(&c);
+            r.b.clone_from(&b);
+            r.a.clone_from(&a);
             r.conv_dim = conv_dim;
-            r.states.resize((t - 1) * state_len, 0.0);
         }
         // Update conv state with the last kc-1 raw inputs.
         {
@@ -700,65 +869,10 @@ impl<'a> QwenModel<'a> {
 
         // Gated delta rule, recurrent over time, parallel over value heads.
         let mut out = vec![0f32; t * value_dim];
-        let op = SendPtrF(out.as_mut_ptr());
-        let sp = SendPtrF(st.s.as_mut_ptr());
-        let qscale = (hdk as f32).powf(-0.5);
-        let rp = rec.map(|r| SendPtrF(r.states.as_mut_ptr()));
-        pool::run(nv, &|hv| {
-            let hk = if cfg.v_heads_tiled { hv % nk } else { hv / rep };
-            // SAFETY: each head owns its own state slab and output columns.
-            let s = unsafe { std::slice::from_raw_parts_mut(sp.get().add(hv * hdk * hdv), hdk * hdv) };
-            let mut qn = vec![0f32; hdk];
-            let mut kn = vec![0f32; hdk];
-            let mut kvmem = vec![0f32; hdv];
-            let mut delta = vec![0f32; hdv];
-            for i in 0..t {
-                let row = &c[i * conv_dim..(i + 1) * conv_dim];
-                let qv = &row[hk * hdk..(hk + 1) * hdk];
-                let kv = &row[key_dim + hk * hdk..key_dim + (hk + 1) * hdk];
-                let vv = &row[2 * key_dim + hv * hdv..2 * key_dim + (hv + 1) * hdv];
-                let qn_inv = (qv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt().recip();
-                let kn_inv = (kv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt().recip();
-                for d in 0..hdk {
-                    qn[d] = qv[d] * qn_inv * qscale;
-                    kn[d] = kv[d] * kn_inv;
-                }
-                let beta = 1.0 / (1.0 + fast_exp(-b[i * nv + hv]));
-                let ga = a[i * nv + hv] + gd.dt_bias[hv];
-                let softplus = if ga > 20.0 { ga } else { (1.0 + ga.exp()).ln() };
-                let decay = (gd.decay_coef[hv] * softplus).exp();
-                // S *= decay; kvmem = k^T S
-                kvmem.fill(0.0);
-                for dk in 0..hdk {
-                    let srow = &mut s[dk * hdv..(dk + 1) * hdv];
-                    let kd = kn[dk];
-                    for j in 0..hdv {
-                        srow[j] *= decay;
-                        kvmem[j] += srow[j] * kd;
-                    }
-                }
-                for j in 0..hdv {
-                    delta[j] = (vv[j] - kvmem[j]) * beta;
-                }
-                // S += k (x) delta; out = q^T S
-                let o = unsafe { std::slice::from_raw_parts_mut(op.get().add(i * value_dim + hv * hdv), hdv) };
-                o.fill(0.0);
-                for dk in 0..hdk {
-                    let srow = &mut s[dk * hdv..(dk + 1) * hdv];
-                    let (kd, qd) = (kn[dk], qn[dk]);
-                    for j in 0..hdv {
-                        srow[j] += kd * delta[j];
-                        o[j] += srow[j] * qd;
-                    }
-                }
-                // The state after the last token is the session's own.
-                if let Some(rp) = rp.filter(|_| i + 1 < t) {
-                    // SAFETY: each (token, head) slab of the record is written by this head only.
-                    let dst = unsafe { std::slice::from_raw_parts_mut(rp.get().add(i * state_len + hv * hdk * hdv), hdk * hdv) };
-                    dst.copy_from_slice(s);
-                }
-            }
-        });
+        rule.run(&mut st.s, &c, &b, &a, t, Some(&mut out));
+        if let Some(r) = rec {
+            r.rule = rule;
+        }
         drop(_timer);
 
         // Gated RMSNorm per head: norm(o) * w * silu(z)

@@ -49,6 +49,7 @@ pub mod qwen_mtp;
 pub mod safetensors;
 pub mod sampler;
 pub mod sd;
+pub mod stream;
 pub mod tools;
 pub mod torch;
 pub mod vision;

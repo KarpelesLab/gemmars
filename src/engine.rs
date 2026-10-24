@@ -95,6 +95,11 @@ pub struct EngineOptions {
     pub draft_tokens: Option<usize>,
     /// Where repo ids are downloaded (default [`crate::hf::cache_root`]). Key `cache_dir`.
     pub cache_dir: Option<PathBuf>,
+    /// Qwen3.5/3.8: stream the weights from the (mapped) file for models larger than memory,
+    /// prefetching the next layers while one computes (implies `mmap`; see [`crate::stream`]).
+    /// MTP then drafts up to 8 tokens with a cost-aware length. Keys `stream` (on with the
+    /// defaults), `cache_budget_gb`, `resident_mb`, `prefetch_mb`, `flash_mbps`.
+    pub stream: Option<crate::stream::StreamOptions>,
 }
 
 impl Default for EngineOptions {
@@ -113,6 +118,7 @@ impl Default for EngineOptions {
             draft: None,
             draft_tokens: None,
             cache_dir: None,
+            stream: None,
         }
     }
 }
@@ -150,6 +156,11 @@ impl EngineOptions {
         "draft",
         "draft_tokens",
         "cache_dir",
+        "stream",
+        "cache_budget_gb",
+        "resident_mb",
+        "prefetch_mb",
+        "flash_mbps",
     ];
 
     /// Sets an option by name (see the field docs for the keys). Unknown keys are errors.
@@ -182,6 +193,17 @@ impl EngineOptions {
             "draft" => self.draft = opt_str(value),
             "draft_tokens" => self.draft_tokens = parse_opt_usize(key, value)?,
             "cache_dir" => self.cache_dir = opt_str(value).map(PathBuf::from),
+            "stream" => self.stream = parse_bool(key, value)?.then(Default::default),
+            "cache_budget_gb" | "resident_mb" | "prefetch_mb" | "flash_mbps" => {
+                let st = self.stream.get_or_insert_with(Default::default);
+                let v: f64 = value.parse().with_context(|| format!("{key}: not a number: {value:?}"))?;
+                match key {
+                    "cache_budget_gb" => st.cache_budget = Some((v * 1e9) as u64),
+                    "resident_mb" => st.resident_bytes = Some((v * (1u64 << 20) as f64) as u64),
+                    "prefetch_mb" => st.prefetch_bytes = (v * (1u64 << 20) as f64) as u64,
+                    _ => st.flash_bytes_per_sec = Some(v * 1e6),
+                }
+            }
             _ => bail!("unknown option {key:?} (known: {})", Self::KEYS.join(", ")),
         }
         Ok(())
@@ -456,8 +478,19 @@ pub struct Engine {
     unfed: Option<u32>,
     cancel: Arc<AtomicBool>,
     stats: Stats,
+    /// The weight streamer (`EngineOptions::stream`), stopped on drop before the files go.
+    streamer: Option<Arc<crate::stream::Streamer>>,
     /// Must stay last: the model, sessions and references above point into it.
     _arena: Arena,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // The model holds handles too; stop the reader thread before the arena unmaps the files.
+        if let Some(s) = &self.streamer {
+            s.shutdown();
+        }
+    }
 }
 
 impl Engine {
@@ -506,7 +539,9 @@ impl Engine {
         }
 
         let mut arena = Arena(Vec::new());
-        let files = arena.keep(ModelFiles::open(&dir, !opts.mmap)?);
+        let mut streamer = None;
+        // Streaming reads the weights in place: always mapped.
+        let files = arena.keep(ModelFiles::open(&dir, !(opts.mmap || opts.stream.is_some()))?);
         let tok = load_tokenizer(&dir)?;
         let eos = config::load_eos_ids(&dir);
         let (lm, fmt, quant, layers, hidden, vocab, streamed): (Lm, &'static (dyn ChatFormat + Sync), _, _, _, _, _) = match family {
@@ -544,8 +579,29 @@ impl Engine {
                 (lm, fmt, info.0, info.1, info.2, info.3, info.4)
             }
             Family::Qwen => {
-                let model = arena.keep(QwenModel::load(config::QwenConfig::load(&dir)?, files, opts.quant)?);
+                let mut model = QwenModel::load(config::QwenConfig::load(&dir)?, files, opts.quant)?;
                 let fmt: &'static (dyn ChatFormat + Sync) = chat::QwenChat::for_model(&dir);
+                let side = match (&side_dir, mtp) {
+                    (Some(d), true) => Some(arena.keep(ModelFiles::open(d, false)?)),
+                    _ => None,
+                };
+                let mut m = if mtp {
+                    let mut m = model.load_mtp(side.unwrap_or(files))?;
+                    if let Some(side) = side {
+                        m.attach_sidecar(&model.cfg, side, model.quant)?;
+                    }
+                    Some(m)
+                } else {
+                    None
+                };
+                // The streamer is attached before the model and MTP layer are frozen in the arena.
+                let draft_tokens = opts.draft_tokens.unwrap_or(if opts.stream.is_some() { 8 } else { 3 });
+                if let Some(so) = &opts.stream {
+                    let mut fs = vec![files];
+                    fs.extend(side);
+                    streamer = Some(crate::stream::attach_qwen(&mut model, m.as_mut(), &fs, draft_tokens, so.clone())?);
+                }
+                let model = arena.keep(model);
                 let c = &model.cfg;
                 let info = (
                     model.quant,
@@ -554,30 +610,27 @@ impl Engine {
                     c.vocab_size,
                     model.streamed_bytes(),
                 );
-                let lm = if mtp {
-                    let side = match &side_dir {
-                        Some(d) => Some(arena.keep(ModelFiles::open(d, false)?)),
-                        None => None,
-                    };
-                    let mut m = model.load_mtp(side.unwrap_or(files))?;
-                    if let Some(side) = side {
-                        m.attach_sidecar(&model.cfg, side, model.quant)?;
+                let lm = match m {
+                    Some(m) => {
+                        let m: &'static QwenMtp<'static> = arena.keep(m);
+                        let stop = chat::with_turn_end(fmt, &tok, eos.clone());
+                        let mopts = MtpOptions {
+                            draft_tokens,
+                            adaptive: !opts.mtp_fixed,
+                            stop,
+                            // Streaming passes are IO-bound: long drafts pay off, so pick their
+                            // length by cost and keep them exact.
+                            cost_aware: !opts.mtp_fixed && opts.stream.is_some(),
+                            exact: opts.stream.is_some(),
+                        };
+                        Lm::QwenMtp {
+                            dec: Box::new(MtpDecoder::new(model, m, mopts)),
+                        }
                     }
-                    let m: &'static QwenMtp<'static> = arena.keep(m);
-                    let stop = chat::with_turn_end(fmt, &tok, eos.clone());
-                    let mopts = MtpOptions {
-                        draft_tokens: opts.draft_tokens.unwrap_or(3),
-                        adaptive: !opts.mtp_fixed,
-                        stop,
-                    };
-                    Lm::QwenMtp {
-                        dec: Box::new(MtpDecoder::new(model, m, mopts)),
-                    }
-                } else {
-                    Lm::Qwen {
+                    None => Lm::Qwen {
                         model,
                         sess: model.new_session(),
-                    }
+                    },
                 };
                 (lm, fmt, info.0, info.1, info.2, info.3, info.4)
             }
@@ -636,8 +689,16 @@ impl Engine {
             unfed: None,
             cancel: Arc::new(AtomicBool::new(false)),
             stats: Stats::default(),
+            streamer,
             _arena: arena,
         })
+    }
+
+    /// The weight streamer when loaded with [`EngineOptions::stream`]: per-step IO statistics
+    /// ([`crate::stream::Streamer::stats`], subtract two snapshots), the plan, the page-cache
+    /// footprint, and the emulated flash bandwidth.
+    pub fn streamer(&self) -> Option<&Arc<crate::stream::Streamer>> {
+        self.streamer.as_ref()
     }
 
     pub fn info(&self) -> &ModelInfo {

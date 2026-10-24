@@ -78,6 +78,8 @@ pub struct QwenMtp<'a> {
     /// The sidecar's own token embedding (FastMTP), used instead of the main model's.
     embed: Option<Table<'a>>,
     hidden: usize,
+    /// Weight streaming: unit 0 is the layer, unit 1 the trimmed draft head.
+    stream: Option<crate::stream::StreamHook>,
 }
 
 /// The MTP layer's own KV cache: one entry per main-model position whose successor is known.
@@ -129,7 +131,36 @@ impl<'a> QwenMtp<'a> {
             head: None,
             embed: None,
             hidden: h,
+            stream: None,
         })
+    }
+
+    /// The streaming units in execution order (see `crate::stream`): the layer (with `fc`), then
+    /// the trimmed draft head if there is one (drafts otherwise use the main model's LM head).
+    /// `draft_tokens` is how many times a round runs them (their residency priority).
+    pub fn stream_units(&self, draft_tokens: usize) -> Vec<crate::stream::UnitSpec> {
+        let mut lins = vec![&self.fc];
+        lins.extend(self.attn.lins());
+        lins.extend(self.ffn.lins());
+        let uses = draft_tokens.max(1) as f64 + 0.5;
+        let mut v = vec![crate::stream::UnitSpec {
+            name: "mtp".into(),
+            ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
+            uses,
+        }];
+        if let Some(d) = &self.head {
+            v.push(crate::stream::UnitSpec {
+                name: "draft_head".into(),
+                ranges: d.head.mem_ranges(),
+                uses,
+            });
+        }
+        v
+    }
+
+    /// Brackets the layer and the draft head with `hook`'s units (None stops streaming).
+    pub fn set_stream(&mut self, hook: Option<crate::stream::StreamHook>) {
+        self.stream = hook;
     }
 
     /// Takes what a draft sidecar adds besides the MTP layer (a FastMTP GGUF): its own token
@@ -201,6 +232,7 @@ impl<'a> QwenMtp<'a> {
             rmsnorm_f32w(&hidden[i * h..(i + 1) * h], &self.norm_hidden, eps, rh);
         }
         let mut x = vec![0f32; t * h];
+        let _unit = crate::stream::enter(&self.stream, 0);
         linear(&self.fc, h, 2 * h, &cat, t, &mut x);
 
         let start = sess.kv.len;
@@ -226,7 +258,9 @@ impl<'a> QwenMtp<'a> {
             None => sampler.distribution(&model.logits(out, 1)),
             Some(d) => {
                 let mut logits = vec![0f32; d.d2t.len()];
+                let unit = crate::stream::enter(&self.stream, 1);
                 linear(&d.head, d.d2t.len(), h, out, 1, &mut logits);
+                drop(unit);
                 sampler
                     .distribution(&logits)
                     .into_iter()
@@ -251,6 +285,16 @@ impl<'a> QwenModel<'a> {
 /// near-ties (the distribution is unaffected beyond that rounding).
 pub const MAX_EXACT_DRAFT: usize = 6;
 
+/// The longest draft verified with the batch-invariant decode kernels under the current kernel
+/// setting (`MAX_EXACT_DRAFT` unless `MtpOptions::exact` or `kernels::set_decode_max_tokens`
+/// raised it).
+pub fn max_exact_draft() -> usize {
+    crate::kernels::decode_max_tokens() - 1
+}
+
+/// Longest draft the cost-aware policy considers.
+pub const MAX_DRAFT: usize = 14;
+
 /// Speculative decoding settings.
 #[derive(Clone, Debug)]
 pub struct MtpOptions {
@@ -262,6 +306,15 @@ pub struct MtpOptions {
     pub adaptive: bool,
     /// Tokens that end generation: nothing after one is committed within a round.
     pub stop: Vec<u32>,
+    /// Choose each round's draft length (1 to `draft_tokens`) to maximize expected tokens per
+    /// second, from the measured time of a round at each length and the measured acceptance rate
+    /// at each draft position (overrides `adaptive`). Pays off when a verification pass costs
+    /// about the same for 1 or 9 tokens, as when the weights stream from storage.
+    pub cost_aware: bool,
+    /// Keep verification bit-exact for drafts longer than `MAX_EXACT_DRAFT` by running up to
+    /// `draft_tokens + 1` tokens through the decode kernels (raises the process-wide
+    /// `kernels::set_decode_max_tokens`, which never lowers it).
+    pub exact: bool,
 }
 
 impl Default for MtpOptions {
@@ -270,7 +323,87 @@ impl Default for MtpOptions {
             draft_tokens: 3,
             adaptive: false,
             stop: Vec::new(),
+            cost_aware: false,
+            exact: false,
         }
+    }
+}
+
+/// Measurements behind the cost-aware draft length.
+#[derive(Clone, Debug, Default)]
+pub struct DraftCosts {
+    /// `round_secs[k]`: moving average of a round's wall time (drafting + verification) with `k`
+    /// drafts, and how many rounds it saw.
+    pub round_secs: Vec<(f64, usize)>,
+    /// Moving average of one recursive draft step (MTP layer + head over one row).
+    pub step_secs: f64,
+    /// `tried[j]` / `ok[j]`: rounds whose draft reached position `j`, and those that accepted it.
+    pub tried: Vec<usize>,
+    pub ok: Vec<usize>,
+}
+
+impl DraftCosts {
+    fn record(&mut self, k: usize, secs: f64, accepted: usize, step_secs: Option<f64>) {
+        let ema = |old: f64, n: usize, v: f64| if n == 0 { v } else { 0.7 * old + 0.3 * v };
+        if self.round_secs.len() <= k {
+            self.round_secs.resize(k + 1, (0.0, 0));
+        }
+        let (t, n) = self.round_secs[k];
+        self.round_secs[k] = (ema(t, n, secs), n + 1);
+        if let Some(s) = step_secs {
+            self.step_secs = ema(self.step_secs, (self.step_secs > 0.0) as usize, s);
+        }
+        if self.tried.len() < k {
+            self.tried.resize(k, 0);
+            self.ok.resize(k, 0);
+        }
+        for j in 0..k.min(accepted + 1) {
+            self.tried[j] += 1;
+            self.ok[j] += (j < accepted) as usize;
+        }
+    }
+
+    /// Estimated round time with `k` drafts: measured, else the nearest measured length plus
+    /// (or minus) the draft steps in between. Unmeasured lengths get no verification cost
+    /// growth, which makes the policy try them.
+    fn round_time(&self, k: usize) -> Option<f64> {
+        if let Some(&(t, n)) = self.round_secs.get(k)
+            && n > 0
+        {
+            return Some(t);
+        }
+        let (k0, &(t0, _)) = self
+            .round_secs
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.1 > 0)
+            .min_by_key(|(j, _)| j.abs_diff(k))?;
+        Some((t0 + (k as f64 - k0 as f64) * self.step_secs).max(1e-6))
+    }
+
+    /// Expected committed tokens per round with `k` drafts: 1 + sum over i of the probability
+    /// that the first i drafts are all accepted (Laplace-smoothed per-position rates).
+    fn expected_tokens(&self, k: usize) -> f64 {
+        let mut e = 1.0;
+        let mut p = 1.0;
+        for j in 0..k {
+            let (t, o) = (self.tried.get(j).copied().unwrap_or(0), self.ok.get(j).copied().unwrap_or(0));
+            p *= (o as f64 + 1.0) / (t as f64 + 2.0);
+            e += p;
+        }
+        e
+    }
+
+    /// The draft length in `1..=k_max` with the most expected tokens per second.
+    pub fn best(&self, k_max: usize) -> Option<usize> {
+        let mut best: Option<(usize, f64)> = None;
+        for k in 1..=k_max.max(1) {
+            let rate = self.expected_tokens(k) / self.round_time(k)?;
+            if best.is_none_or(|b| rate > b.1) {
+                best = Some((k, rate));
+            }
+        }
+        best.map(|b| b.0)
     }
 }
 
@@ -284,6 +417,11 @@ pub struct MtpStats {
     pub emitted: usize,
     /// `per_round[n]`: rounds that accepted `n` drafts.
     pub per_round: Vec<usize>,
+    /// Time spent drafting (MTP layer and head) and verifying (main model), in seconds.
+    pub draft_secs: f64,
+    pub verify_secs: f64,
+    /// Inputs of the cost-aware draft policy.
+    pub costs: DraftCosts,
 }
 
 impl MtpStats {
@@ -324,7 +462,18 @@ pub struct MtpDecoder<'m> {
 
 impl<'m> MtpDecoder<'m> {
     pub fn new(model: &'m QwenModel<'m>, mtp: &'m QwenMtp<'m>, opts: MtpOptions) -> Self {
-        let k_cur = if opts.adaptive {
+        let opts = MtpOptions {
+            draft_tokens: if opts.cost_aware {
+                opts.draft_tokens.min(MAX_DRAFT)
+            } else {
+                opts.draft_tokens
+            },
+            ..opts
+        };
+        if opts.exact && opts.draft_tokens + 1 > crate::kernels::decode_max_tokens() {
+            crate::kernels::set_decode_max_tokens(opts.draft_tokens + 1);
+        }
+        let k_cur = if opts.adaptive || opts.cost_aware {
             opts.draft_tokens.clamp(1, 3)
         } else {
             opts.draft_tokens
@@ -413,6 +562,8 @@ impl<'m> MtpDecoder<'m> {
         let k = self.k_cur.min(max_new.max(1) - 1);
 
         // Draft: the pending rows end with (h_{n-1}, next), whose output gives the first draft.
+        let t_round = crate::clock::Instant::now();
+        let mut step_secs = None;
         let mut drafts = Vec::with_capacity(k);
         let mut qs: Vec<Vec<(u32, f32)>> = Vec::with_capacity(k);
         if k > 0 {
@@ -424,10 +575,15 @@ impl<'m> MtpDecoder<'m> {
                 drafts.push(d);
                 qs.push(q);
                 if j + 1 < k {
+                    let t = crate::clock::Instant::now();
                     g = mtp.forward(model, &mut self.msess, &g, &[d]);
+                    if j == 0 {
+                        step_secs = Some(t.elapsed().as_secs_f64());
+                    }
                 }
             }
         }
+        let draft_secs = t_round.elapsed().as_secs_f64();
 
         // Verify [next, drafts..] in one forward, recording the recurrent states for rewinding.
         let mut seq = Vec::with_capacity(k + 1);
@@ -444,6 +600,7 @@ impl<'m> MtpDecoder<'m> {
             model.forward_hidden_mm(&mut self.sess, &seq, &[])
         };
         let logits = model.logits(&hs, seq.len());
+        let verify_secs = t_round.elapsed().as_secs_f64() - draft_secs;
         if let Some(mut s1) = check {
             // Debug: the batched verification must match one-token forwards exactly.
             for (i, &tk) in seq.iter().enumerate() {
@@ -505,7 +662,19 @@ impl<'m> MtpDecoder<'m> {
             self.stats.per_round.resize(accepted + 1, 0);
         }
         self.stats.per_round[accepted] += 1;
-        if self.opts.adaptive && k == self.k_cur {
+        self.stats.draft_secs += draft_secs;
+        self.stats.verify_secs += verify_secs;
+        if k == self.k_cur && k > 0 {
+            // A draft step's own cost (the head's share included) when the first step was
+            // not timed: the drafting time spread over the steps.
+            let step = step_secs.or(Some(draft_secs / k as f64));
+            self.stats.costs.record(k, draft_secs + verify_secs, accepted, step);
+        }
+        if self.opts.cost_aware {
+            if let Some(b) = self.stats.costs.best(self.opts.draft_tokens.max(1)) {
+                self.k_cur = b;
+            }
+        } else if self.opts.adaptive && k == self.k_cur {
             if accepted == k {
                 self.k_cur = (self.k_cur + 1).min(self.opts.draft_tokens.max(1));
             } else if accepted == 0 {
@@ -590,6 +759,64 @@ mod tests {
                 assert!(same, "{name}: t={t} differs from one-token matmuls");
             }
         }
+    }
+
+    /// The decode kernels stay batch-invariant past 7 tokens (for exact long drafts), GGUF
+    /// k-quants included.
+    #[test]
+    fn long_verification_is_batch_invariant() {
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        use crate::kernels::matmul_quant_multi_at;
+        let (n_out, n_in) = (21, 512);
+        let mut seed = 5u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+        };
+        let x: Vec<f32> = (0..15 * n_in).map(|_| rnd()).collect();
+        let mut s2 = 9u64;
+        for kind in [GgmlType::Q4_K, GgmlType::Q6_K, GgmlType::Q2_K, GgmlType::IQ4_XS] {
+            let raw = random_blocks(kind, n_out * n_in / kind.block_size(), &mut s2);
+            let m = GgufMatrix::from_bytes(kind, &raw, n_out, n_in).unwrap();
+            let mut y1 = vec![0f32; 15 * n_out];
+            for (xr, yr) in x.chunks(n_in).zip(y1.chunks_mut(n_out)) {
+                matmul_quant_multi_at(&mut [(&m, yr)], xr, 1, 15);
+            }
+            for t in 8..=15 {
+                let mut yt = vec![0f32; t * n_out];
+                matmul_quant_multi_at(&mut [(&m, &mut yt[..])], &x[..t * n_in], t, 15);
+                let same = yt.iter().zip(&y1).all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(same, "{kind}: t={t} differs from one-token matmuls");
+            }
+        }
+    }
+
+    #[test]
+    fn cost_aware_policy_prefers_long_drafts_when_verification_is_flat() {
+        // Each draft accepted with probability 0.7.
+        let mut seed = 3u64;
+        let mut accept = |k: usize| {
+            (0..k)
+                .take_while(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 33) % 10 < 7
+                })
+                .count()
+        };
+        let mut c = DraftCosts::default();
+        // Verification costs 1 s whatever the length, a draft step 10 ms.
+        for round in 0..400 {
+            let k = 1 + round % 8;
+            c.record(k, 1.0 + 0.01 * k as f64, accept(k), Some(0.01));
+        }
+        assert!(c.best(8).unwrap() >= 6, "{:?}", c.best(8));
+        // Verification time proportional to the tokens: one draft is best.
+        let mut c = DraftCosts::default();
+        for round in 0..400 {
+            let k = 1 + round % 8;
+            c.record(k, (k + 1) as f64, accept(k), Some(0.01));
+        }
+        assert_eq!(c.best(8), Some(1));
     }
 
     #[test]

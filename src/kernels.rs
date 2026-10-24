@@ -1123,8 +1123,30 @@ impl<M: QMat> Clone for QJobRef<'_, M> {
 }
 impl<M: QMat> Copy for QJobRef<'_, M> {}
 
+/// Most tokens a quantized matmul runs with the decode kernels (int8 dot products, token pairs),
+/// whose rows are bit-identical whatever the token count; more use the prefill GEMM.
+static DECODE_MAX_TOKENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(7);
+
+/// See [`set_decode_max_tokens`].
+pub fn decode_max_tokens() -> usize {
+    DECODE_MAX_TOKENS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs quantized matmuls of up to `n` tokens (clamped to 7..=15) with the batch-invariant
+/// decode kernels instead of the prefill GEMM (default 7). Speculative verification of `n`
+/// tokens then reproduces one-token decoding bit for bit; the decode kernels are slower than the
+/// GEMM when compute-bound, which matters little when the weights stream from storage.
+pub fn set_decode_max_tokens(n: usize) {
+    DECODE_MAX_TOKENS.store(n.clamp(7, 15), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Several quantized matmuls sharing the same f32 input `x` ([t, n_in]); each job is `(matrix, y [t, n_out])`.
 pub fn matmul_quant_multi<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: usize) {
+    matmul_quant_multi_at(jobs, x, t, decode_max_tokens())
+}
+
+/// [`matmul_quant_multi`] with the decode kernels up to `decode_max` tokens.
+pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: usize, decode_max: usize) {
     if t == 0 || jobs.is_empty() {
         return;
     }
@@ -1160,10 +1182,11 @@ pub fn matmul_quant_multi<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: 
         }
     }
     // Prefill (and float-stored weights at any t): dequantize + f32 GEMM. Decode: int8 dot products.
-    let dense = |m: &M| t >= 8 || m.dense();
+    let gemm = t > decode_max;
+    let dense = |m: &M| gemm || m.dense();
     let xt = refs.iter().any(|j| dense(j.m)).then(|| pack_xt(x, t, n_in));
     let xa = refs.iter().any(|j| !dense(j.m)).then(|| quantize_act(x, t, n_in));
-    let (tchunks, tc) = if t >= 8 { token_split(blocks.len(), t, nthreads) } else { (1, t) };
+    let (tchunks, tc) = if gemm { token_split(blocks.len(), t, nthreads) } else { (1, t) };
     pool::run(blocks.len() * tchunks, &|b| {
         let (j, r0, r1) = blocks[b / tchunks];
         let job = refs[j as usize];
