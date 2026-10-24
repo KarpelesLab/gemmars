@@ -32,7 +32,7 @@ identical tokens.
 | google/gemma-4-31B-it | 31B | 62 GB | supported, sharded loading, untested |
 | google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
 | Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text only; matches the bf16 reference; see below |
-| Qwen/Qwen3.6-35B-A3B and fine-tunes (PixilabAI/Zawen-v0.1-35B-A3B) | 35B MoE, 3B active | 69 GB | text only; matches the reference at full width (see below); full checkpoint not yet run |
+| Qwen/Qwen3.6-35B-A3B and fine-tunes (PixilabAI/Zawen-v0.1-35B-A3B) | 35B MoE, 3B active | 69 GB | text only; Zawen matches the reference (see below) |
 | Qwen/Qwen3.5-0.8B | 0.8B | 1.7 GB | text only; the small one used for the wasm measurements |
 | mlx-community/gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit | 5.1B / 8.0B | 3.6 / 5.2 GB (MLX 4-bit) | text, images and audio; see [MLX checkpoints](#mlx-checkpoints) |
 | mlx-community/Qwen3-4B-4bit (Qwen3 dense) | 4.0B | 2.3 GB (MLX 4-bit) | text; matches the reference on the same weights (same top 10) |
@@ -64,7 +64,10 @@ one matmul. Prefill gathers each expert's tokens and runs every expert as one gr
 the CPU. With `--quant q4` (about 19 GB) on an M5 Max, that is about 220 tok/s of prefill and 65
 tok/s of decode. On randomly initialised weights at the real width (2048 hidden, 256 experts, 2
 layers, the real vocabulary), oxinfer matches transformers in float32 to a max logit difference of
-7e-5, with the same 20 greedy tokens. MLX-quantized experts are not read yet.
+7e-5, with the same 20 greedy tokens. On Zawen-v0.1-35B-A3B's real weights, cut to its first 4
+layers, the float32 match is 3e-5. The full 40 layers against transformers in bf16 give a mean
+logit difference of 0.035, with the same top 10 in the same order (Q8: same top 10; Q4: same top
+token). MLX-quantized experts are not read yet.
 
 Thinking is on by default in the Qwen template; `--think` enables it here (the trace is dimmed),
 otherwise the generation prompt closes the think block.

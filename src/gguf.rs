@@ -428,6 +428,8 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
         "token_embd.weight" => "model.embed_tokens.weight".to_string(),
         "output_norm.weight" => "model.norm.weight".to_string(),
         "output.weight" => "lm_head.weight".to_string(),
+        // FastMTP sidecars: draft-vocabulary index -> target token id (for a trimmed output head).
+        "d2t" => "mtp.d2t".to_string(),
         n => {
             let rest = n.strip_prefix("blk.")?;
             let (l, rest) = rest.split_once('.')?;
