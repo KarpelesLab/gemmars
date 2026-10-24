@@ -233,17 +233,56 @@ impl Conv {
 
     /// `x` is `[h*w, cin]`; returns `([oh*ow, cout], oh, ow)` for the given stride.
     pub fn forward(&self, x: &[f32], h: usize, w: usize, stride: usize) -> (Vec<f32>, usize, usize) {
+        debug_assert_eq!(x.len(), h * w * self.cin);
+        let g = self.geom(h, w, stride);
+        if self.k == 1 && stride == 1 {
+            let _t = timing::start(timing::CONV);
+            return (self.lin.forward_untimed(x, h * w), h, w);
+        }
+        if let Some(y) = self.lin.device_conv(x, g, None) {
+            return (y, g.oh, g.ow);
+        }
+        (self.forward_cpu(x, h, w, stride), g.oh, g.ow)
+    }
+
+    fn geom(&self, h: usize, w: usize, stride: usize) -> crate::gpu::ConvGeom {
+        let pad = self.k / 2;
+        let oh = (h + 2 * pad - self.k) / stride + 1;
+        let ow = (w + 2 * pad - self.k) / stride + 1;
+        crate::gpu::ConvGeom {
+            h,
+            w,
+            cin: self.cin,
+            k: self.k,
+            stride,
+            oh,
+            ow,
+        }
+    }
+
+    /// The convolution of `pre(x)`: on the device with the normalization fused into the input
+    /// loads when possible, otherwise normalized once on the CPU.
+    pub fn forward_pre(&self, x: &[f32], h: usize, w: usize, stride: usize, pre: Pre) -> (Vec<f32>, usize, usize) {
+        let g = self.geom(h, w, stride);
+        if let Some(y) = self.lin.device_conv(x, g, Some(pre)) {
+            check_gpu("conv+norm", &y, || {
+                let xn = pre.apply(x, h * w);
+                self.forward_cpu(&xn, h, w, stride)
+            });
+            return (y, g.oh, g.ow);
+        }
+        let xn = pre.apply(x, h * w);
+        self.forward(&xn, h, w, stride)
+    }
+
+    /// Unfold on the CPU, then the shared matmul.
+    fn forward_cpu(&self, x: &[f32], h: usize, w: usize, stride: usize) -> Vec<f32> {
         let (k, cin, cout) = (self.k, self.cin, self.cout);
-        debug_assert_eq!(x.len(), h * w * cin);
         let pad = k / 2;
         let oh = (h + 2 * pad - k) / stride + 1;
         let ow = (w + 2 * pad - k) / stride + 1;
         if k == 1 && stride == 1 {
-            let _t = timing::start(timing::CONV);
-            return (self.lin.forward_untimed(x, h * w), h, w);
-        }
-        if let Some(y) = self.forward_device(x, h, w, stride, oh, ow) {
-            return (y, oh, ow);
+            return self.lin.forward_untimed(x, h * w);
         }
         let row = k * k * cin;
         let chunk = (UNFOLD_BYTES / (row * 4)).max(ow).min(oh * ow);
@@ -276,49 +315,125 @@ impl Conv {
             out[p0 * cout..(p0 + n) * cout].copy_from_slice(&y);
             p0 += n;
         }
-        (out, oh, ow)
+        out
     }
 }
 
-impl Conv {
-    /// The convolution on the active accelerator, when it takes this shape.
-    fn forward_device(&self, x: &[f32], h: usize, w: usize, stride: usize, oh: usize, ow: usize) -> Option<Vec<f32>> {
+/// The normalization in front of an op: group norm (with SiLU or not) or layer norm.
+#[derive(Clone, Copy)]
+pub enum Pre<'a> {
+    Group(&'a GroupNorm, bool),
+    Layer(&'a LayerNorm),
+}
+
+impl Pre<'_> {
+    fn spec(&self) -> crate::gpu::NormSpec<'_> {
+        match *self {
+            Pre::Group(g, silu) => crate::gpu::NormSpec {
+                kind: crate::gpu::NormKind::Group(g.groups),
+                eps: g.eps,
+                gamma: &g.w,
+                beta: &g.b,
+                silu,
+            },
+            Pre::Layer(l) => crate::gpu::NormSpec {
+                kind: crate::gpu::NormKind::Layer,
+                eps: l.eps,
+                gamma: &l.w,
+                beta: &l.b,
+                silu: false,
+            },
+        }
+    }
+
+    /// The normalized copy of `x` (`rows` pixels or rows), on the CPU.
+    pub fn apply(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        match *self {
+            Pre::Group(g, silu) => {
+                let mut y = x.to_vec();
+                g.apply(&mut y, rows, silu);
+                y
+            }
+            Pre::Layer(l) => l.forward(x, rows),
+        }
+    }
+}
+
+/// With `OXINFER_GPU_CHECK=1`, recomputes a device result on the CPU and prints the difference.
+fn check_gpu(what: &str, y: &[f32], cpu: impl FnOnce() -> Vec<f32>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("OXINFER_GPU_CHECK").is_some()) {
+        return;
+    }
+    let r = cpu();
+    let (mut num, mut den, mut max) = (0f64, 0f64, 0f32);
+    for (a, b) in y.iter().zip(&r) {
+        num += ((a - b) as f64).powi(2);
+        den += (*b as f64).powi(2);
+        max = max.max((a - b).abs());
+    }
+    eprintln!(
+        "[gpu check {what} ({} values): rel L2 {:.2e}, max |diff| {:.2e}]",
+        y.len(),
+        (num / den.max(1e-30)).sqrt(),
+        max
+    );
+}
+
+impl Linear {
+    /// True when the active accelerator takes this layer for `rows` inputs.
+    pub fn on_device(&self, rows: usize) -> bool {
+        crate::gpu::active().is_some_and(|be| be.wants(self.n_out, self.n_in, rows))
+    }
+
+    /// The layer as a convolution with geometry `g` on the active accelerator (a 1x1 convolution
+    /// over `rows` pixels is a linear layer), optionally normalizing the input on the way in.
+    fn device_conv(&self, x: &[f32], g: crate::gpu::ConvGeom, pre: Option<Pre>) -> Option<Vec<f32>> {
         let be = crate::gpu::active()?;
-        let (n_out, n_in) = (self.lin.n_out, self.lin.n_in);
-        // Big enough to beat the submission cost, and in the shapes the device kernels tile.
-        let flops = 2.0 * (oh * ow) as f64 * n_out as f64 * n_in as f64;
-        if flops < 3e8 || !self.cin.is_multiple_of(32) || !n_out.is_multiple_of(64) {
+        let t = g.oh * g.ow;
+        if !g.cin.is_multiple_of(32) || !be.wants(self.n_out, self.n_in, t) {
             return None;
         }
         let _t = timing::start(timing::CONV);
-        let dev = self.lin.w.device_weight(n_out, n_in)?;
-        let mut y = vec![0f32; oh * ow * n_out];
-        let g = crate::gpu::ConvGeom {
-            h,
-            w,
-            cin: self.cin,
-            k: self.k,
-            stride,
-            oh,
-            ow,
-        };
+        let dev = self.w.device_weight(self.n_out, self.n_in)?;
+        let mut y = vec![0f32; t * self.n_out];
+        let spec = pre.as_ref().map(|p| p.spec());
         let mut job = crate::gpu::Job {
-            w: self.lin.w.as_ref(),
+            w: self.w.as_ref(),
             dev,
-            n_out,
+            n_out: self.n_out,
             y: &mut y,
         };
-        if !be.conv2d(x, &g, &mut job) {
+        if !be.conv2d(x, &g, spec.as_ref(), &mut job) {
             return None;
         }
-        if let Some(b) = &self.lin.b {
-            for_chunks(&mut y, n_out, true, |_, r| {
+        if let Some(b) = &self.b {
+            for_chunks(&mut y, self.n_out, true, |_, r| {
                 for (v, &bb) in r.iter_mut().zip(b) {
                     *v += bb;
                 }
             });
         }
         Some(y)
+    }
+
+    /// The layer applied to `pre(x)` (`rows` rows): normalization fused on the device when the
+    /// accelerator takes it, otherwise normalized on the CPU first.
+    pub fn forward_pre(&self, x: &[f32], rows: usize, pre: Pre) -> Vec<f32> {
+        let g = crate::gpu::ConvGeom {
+            h: rows,
+            w: 1,
+            cin: self.n_in,
+            k: 1,
+            stride: 1,
+            oh: rows,
+            ow: 1,
+        };
+        if let Some(y) = self.device_conv(x, g, Some(pre)) {
+            check_gpu("linear+norm", &y, || self.forward(&pre.apply(x, rows), rows));
+            return y;
+        }
+        self.forward(&pre.apply(x, rows), rows)
     }
 }
 
@@ -576,6 +691,21 @@ fn matmul_f32(m: &[f32], n_out: usize, n_in: usize, x: &[f32], t: usize) -> Vec<
 #[allow(clippy::too_many_arguments)]
 pub fn attention(q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, dh: usize, causal: bool) -> Vec<f32> {
     let _t = timing::start(timing::ATTN);
+    // Big enough to beat a device round trip: on the accelerator.
+    if let Some(be) = crate::gpu::active()
+        && 4.0 * (tq * tk * heads * dh) as f64 >= 1e8
+    {
+        let mut out = vec![0f32; tq * heads * dh];
+        if be.attention(q, k, v, tq, tk, heads, dh, causal, &mut out) {
+            check_gpu("attention", &out, || attention_cpu(q, k, v, tq, tk, heads, dh, causal));
+            return out;
+        }
+    }
+    attention_cpu(q, k, v, tq, tk, heads, dh, causal)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_cpu(q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, dh: usize, causal: bool) -> Vec<f32> {
     let d = heads * dh;
     // Zero padding to multiples of 32 keeps the SIMD GEMM tiles on (and changes no dot product).
     let dhp = dh.next_multiple_of(32);

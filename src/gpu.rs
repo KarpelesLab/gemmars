@@ -47,6 +47,24 @@ pub struct ConvGeom {
     pub ow: usize,
 }
 
+/// A normalization applied to a convolution's input as it is loaded (so it runs on the device
+/// without an extra pass): `GroupNorm(groups)` over the channels of all pixels, or `Layer` over each
+/// pixel's (row's) channels; then `* gamma + beta`, then SiLU if `silu`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NormKind {
+    Group(usize),
+    Layer,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NormSpec<'a> {
+    pub kind: NormKind,
+    pub eps: f32,
+    pub gamma: &'a [f32],
+    pub beta: &'a [f32],
+    pub silu: bool,
+}
+
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
     /// Whether this backend should run a matmul of these dimensions. Dispatch has a fixed cost
@@ -58,9 +76,27 @@ pub trait Backend: Send + Sync {
     /// nothing was computed (the caller then runs the whole batch on the CPU).
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool;
     /// Runs a convolution directly on the device (gathering the k x k neighbourhoods itself, so
-    /// the unfolded input never exists in host memory). `job.y` is `[oh*ow, n_out]`. Returns
-    /// false when the backend does not handle this case (the caller unfolds on the CPU).
-    fn conv2d(&self, _x: &[f32], _g: &ConvGeom, _job: &mut Job) -> bool {
+    /// the unfolded input never exists in host memory), optionally normalizing its input on the
+    /// way in. `job.y` is `[oh*ow, n_out]`. Returns false when the backend does not handle this
+    /// case (the caller normalizes and unfolds on the CPU).
+    fn conv2d(&self, _x: &[f32], _g: &ConvGeom, _norm: Option<&NormSpec>, _job: &mut Job) -> bool {
+        false
+    }
+    /// Multi-head attention: `q` `[tq, heads*dh]`, `k` and `v` `[tk, heads*dh]` into `out`
+    /// (`[tq, heads*dh]`), softmax(q k^T / sqrt(dh)) v, keys after each query masked if `causal`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention(
+        &self,
+        _q: &[f32],
+        _k: &[f32],
+        _v: &[f32],
+        _tq: usize,
+        _tk: usize,
+        _heads: usize,
+        _dh: usize,
+        _causal: bool,
+        _out: &mut [f32],
+    ) -> bool {
         false
     }
     /// Cumulative timing summary for `--profile`.

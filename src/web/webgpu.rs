@@ -115,7 +115,10 @@ impl Backend for WebGpuBackend {
         }
         Some(Box::new(Handle(h)))
     }
-    fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, job: &mut Job) -> bool {
+    fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {
+        if norm.is_some() {
+            return false;
+        }
         let Some(h) = job.dev.downcast_ref::<Handle>() else { return false };
         if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(64) {
             return false;

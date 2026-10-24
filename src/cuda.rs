@@ -429,7 +429,10 @@ impl Backend for CudaBackend {
         Some(Box::new(CudaWeightBox(cw)))
     }
 
-    fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, job: &mut Job) -> bool {
+    fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {
+        if norm.is_some() {
+            return false;
+        }
         let n_in = g.k * g.k * g.cin;
         let t = g.oh * g.ow;
         if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(TILE) || x.len() < g.h * g.w * g.cin || job.y.len() < t * job.n_out {

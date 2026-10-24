@@ -4,7 +4,7 @@
 //! from the weight shapes, so the same code loads SD 1.5, SD 2.1 and SD-Turbo.
 
 use super::ops::{
-    Conv, GroupNorm, LayerNorm, Linear, Tensors, attention, concat_channels, gelu_erf, silu_inplace, timestep_embedding, upsample2x,
+    Conv, GroupNorm, LayerNorm, Linear, Pre, Tensors, attention, concat_channels, gelu_erf, silu_inplace, timestep_embedding, upsample2x,
 };
 use crate::kernels::{add_inplace, for_chunks};
 use anyhow::{Context, Result, bail};
@@ -46,15 +46,13 @@ impl Resnet {
     /// `x` is `[h*w, cin]`; `temb` is the (already SiLU-activated) time embedding.
     pub fn forward(&self, x: &[f32], h: usize, w: usize, temb: Option<&[f32]>) -> Vec<f32> {
         let n = h * w;
-        let mut y = x.to_vec();
-        self.n1.apply(&mut y, n, true);
-        let (mut y, _, _) = self.c1.forward(&y, h, w, 1);
+        // Each norm + SiLU is fused into the convolution that follows it (on the device).
+        let (mut y, _, _) = self.c1.forward_pre(x, h, w, 1, Pre::Group(&self.n1, true));
         if let (Some(l), Some(te)) = (&self.temb, temb) {
             let add = l.forward(te, 1);
             for_chunks(&mut y, self.cout, true, |_, r| add_inplace(r, &add));
         }
-        self.n2.apply(&mut y, n, true);
-        let (mut y, _, _) = self.c2.forward(&y, h, w, 1);
+        let (mut y, _, _) = self.c2.forward_pre(&y, h, w, 1, Pre::Group(&self.n2, true));
         match &self.short {
             Some(s) => add_inplace(&mut y, &s.forward(x, n)),
             None => add_inplace(&mut y, x),
@@ -82,12 +80,26 @@ impl Attn {
         })
     }
 
-    /// Queries from `x` (`[n, dim]`), keys and values from `ctx` (`[m, ctx_dim]`; `x` itself for
-    /// self-attention).
-    fn forward(&self, x: &[f32], n: usize, ctx: Option<(&[f32], usize)>) -> Vec<f32> {
-        let (c, m) = ctx.unwrap_or((x, n));
-        let q = self.q.forward(x, n);
-        let (k, v) = (self.k.forward(c, m), self.v.forward(c, m));
+    /// Queries from `pre(x)` (`[n, dim]`), keys and values from `ctx` (`[m, ctx_dim]`; `pre(x)`
+    /// itself for self-attention). On the device the norm is fused into each projection;
+    /// otherwise `x` is normalized once.
+    fn forward(&self, x: &[f32], n: usize, pre: Pre, ctx: Option<(&[f32], usize)>) -> Vec<f32> {
+        let (q, k, v);
+        if self.q.on_device(n) {
+            q = self.q.forward_pre(x, n, pre);
+            (k, v) = match ctx {
+                Some((c, m)) => (self.k.forward(c, m), self.v.forward(c, m)),
+                None => (self.k.forward_pre(x, n, pre), self.v.forward_pre(x, n, pre)),
+            };
+        } else {
+            let xn = pre.apply(x, n);
+            q = self.q.forward(&xn, n);
+            (k, v) = match ctx {
+                Some((c, m)) => (self.k.forward(c, m), self.v.forward(c, m)),
+                None => (self.k.forward(&xn, n), self.v.forward(&xn, n)),
+            };
+        }
+        let m = ctx.map_or(n, |(_, m)| m);
         let d = self.q.n_out;
         let a = attention(&q, &k, &v, n, m, self.heads, d / self.heads, false);
         self.o.forward(&a, n)
@@ -140,16 +152,14 @@ impl SpatialTransformer {
     }
 
     fn forward(&self, x: &[f32], n: usize, ctx: &[f32], m: usize) -> Vec<f32> {
-        let mut y = x.to_vec();
-        self.norm.apply(&mut y, n, false);
-        let mut h = self.proj_in.forward(&y, n);
+        let mut h = self.proj_in.forward_pre(x, n, Pre::Group(&self.norm, false));
         for b in &self.blocks {
-            let a = b.a1.forward(&b.n1.forward(&h, n), n, None);
+            let a = b.a1.forward(&h, n, Pre::Layer(&b.n1), None);
             add_inplace(&mut h, &a);
-            let a = b.a2.forward(&b.n2.forward(&h, n), n, Some((ctx, m)));
+            let a = b.a2.forward(&h, n, Pre::Layer(&b.n2), Some((ctx, m)));
             add_inplace(&mut h, &a);
             // GEGLU: the projection's first half is the value, the second half its gate.
-            let g = b.ff1.forward(&b.n3.forward(&h, n), n);
+            let g = b.ff1.forward_pre(&h, n, Pre::Layer(&b.n3));
             let inner = b.ff1.n_out / 2;
             let mut gated = vec![0f32; n * inner];
             for_chunks(&mut gated, inner, true, |i, r| {
@@ -336,7 +346,6 @@ impl Unet {
                 x = u.forward(&up, h, w, 1).0;
             }
         }
-        self.norm_out.apply(&mut x, h * w, true);
-        self.conv_out.forward(&x, h, w, 1).0
+        self.conv_out.forward_pre(&x, h, w, 1, Pre::Group(&self.norm_out, true)).0
     }
 }

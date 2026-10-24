@@ -57,6 +57,12 @@ inline float4 bf4(packed_ushort4 u4) {
     ushort4 u = ushort4(u4);
     return float4(as_type<float>(uint(u.x) << 16), as_type<float>(uint(u.y) << 16), as_type<float>(uint(u.z) << 16), as_type<float>(uint(u.w) << 16));
 }
+// f32 "weights": attention keys and transposed values.
+struct F32W { device const float* w; uint n_in; };
+inline void load(F32W w, uint row, uint b, thread float4* out) {
+    device const float4* p = (device const float4*)(w.w + (ulong)row * w.n_in + b * 32);
+    for (uint i = 0; i < 8; i++) out[i] = p[i];
+}
 inline void load(BfW w, uint row, uint b, thread float4* out) {
     // bf16 tensors inside a safetensors blob are only 2-byte aligned: packed loads.
     device const packed_ushort4* p = (device const packed_ushort4*)(w.w + (ulong)row * w.n_in + b * 32);
@@ -112,9 +118,21 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
 // K runs over (ky, kx, ci) with cin % 32 == 0, so each 32-wide block of K is one tap's contiguous
 // channel slice. Every threadgroup gathers its 64 pixels x 32 channels into threadgroup memory
 // (zeros outside the image), then runs the same simdgroup MMAs as the GEMM.
-struct CP { uint n_out; uint n_in; uint w_off; uint s_off; uint h; uint w; uint cin; uint k; uint stride; uint ow; uint npix; uint pad; };
+// mode: 0 plain, 1 group norm (stats per group of cpg channels), 2 layer norm (stats per input
+// pixel); st holds (mean, 1/std); gb holds gamma[cin] then beta[cin].
+struct CP { uint n_out; uint n_in; uint w_off; uint s_off; uint h; uint w; uint cin; uint k; uint stride; uint ow; uint npix; uint pad; uint mode; uint silu; uint cpg; uint _p; };
+inline float4 norm4(float4 v, uint c, uint pin, constant CP& p, device const float2* st, device const float* gb) {
+    float o[4] = { v.x, v.y, v.z, v.w };
+    for (uint i = 0; i < 4; i++) {
+        uint ch = c + i;
+        float2 m = p.mode == 1 ? st[ch / p.cpg] : st[pin];
+        float y = (o[i] - m.x) * m.y * gb[ch] + gb[p.cin + ch];
+        o[i] = p.silu != 0 ? y / (1.0f + exp(-y)) : y;
+    }
+    return float4(o[0], o[1], o[2], o[3]);
+}
 template <typename W>
-inline void conv_body(W wt, device const float* x, device float* y, constant CP& p, uint2 tg, uint tid, uint sg, threadgroup float* Ws, threadgroup float* Xs) {
+inline void conv_body(W wt, device const float* x, device float* y, constant CP& p, device const float2* st, device const float* gb, uint2 tg, uint tid, uint sg, threadgroup float* Ws, threadgroup float* Xs) {
     uint o0 = tg.x * 64, t0 = tg.y * 64;
     uint nblk = p.n_in / 32;
     simdgroup_float8x8 c00(0.f), c01(0.f), c02(0.f), c03(0.f), c10(0.f), c11(0.f), c12(0.f), c13(0.f),
@@ -134,7 +152,13 @@ inline void conv_body(W wt, device const float* x, device float* y, constant CP&
         threadgroup float4* xd = (threadgroup float4*)(Xs + drow * LD + dhalf * 16);
         if (pix < p.npix && iy >= 0 && ix >= 0 && iy < int(p.h) && ix < int(p.w)) {
             device const float4* src = (device const float4*)(x + ((ulong)iy * p.w + ix) * p.cin + ci0 + dhalf * 16);
-            xd[0] = src[0]; xd[1] = src[1]; xd[2] = src[2]; xd[3] = src[3];
+            float4 v0 = src[0], v1 = src[1], v2 = src[2], v3 = src[3];
+            if (p.mode != 0) {
+                uint c0 = ci0 + dhalf * 16, pin = uint(iy) * p.w + uint(ix);
+                v0 = norm4(v0, c0, pin, p, st, gb); v1 = norm4(v1, c0 + 4, pin, p, st, gb);
+                v2 = norm4(v2, c0 + 8, pin, p, st, gb); v3 = norm4(v3, c0 + 12, pin, p, st, gb);
+            }
+            xd[0] = v0; xd[1] = v1; xd[2] = v2; xd[3] = v3;
         } else {
             xd[0] = 0.f; xd[1] = 0.f; xd[2] = 0.f; xd[3] = 0.f;
         }
@@ -161,16 +185,71 @@ inline void conv_body(W wt, device const float* x, device float* y, constant CP&
 #define CONV(NAME, WT, MAKE) \
 kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], \
                  device const float* x [[buffer(2)]], device float* y [[buffer(3)]], constant CP& p [[buffer(4)]], \
+                 device const float2* st [[buffer(5)]], device const float* gb [[buffer(6)]], \
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
                  uint sg [[simdgroup_index_in_threadgroup]]) { \
     threadgroup float Ws[64 * LD]; threadgroup float Xs[64 * LD]; \
-    WT w = MAKE; conv_body<WT>(w, x, y, p, tg, tid, sg, Ws, Xs); }
+    WT w = MAKE; conv_body<WT>(w, x, y, p, st, gb, tg, tid, sg, Ws, Xs); }
 
 #define MK_Q4 Q4W{ (device const uchar*)qb + p.w_off, (device const half*)sb + p.s_off, p.n_in / 32, p.n_in / 2 }
 #define MK_Q8 Q8W{ (device const char*)qb + p.w_off, (device const float*)sb + p.s_off, p.n_in / 32, p.n_in }
 #define MK_BF BfW{ (device const ushort*)qb + p.w_off, p.n_in }
-GEMM(gemm_bf, BfW, MK_BF) GEMM(gemm_q8, Q8W, MK_Q8) GEMM(gemm_q4, Q4W, MK_Q4)
+#define MK_F32 F32W{ (device const float*)qb + p.w_off, p.n_in }
+GEMM(gemm_bf, BfW, MK_BF) GEMM(gemm_q8, Q8W, MK_Q8) GEMM(gemm_q4, Q4W, MK_Q4) GEMM(gemm_f32, F32W, MK_F32)
 CONV(conv_bf, BfW, MK_BF) CONV(conv_q8, Q8W, MK_Q8) CONV(conv_q4, Q4W, MK_Q4)
+
+// ---- Normalization statistics and softmax --------------------------------------------------------
+// Two passes (mean, then the mean squared deviation) for accuracy.
+struct GS { uint n; uint c; uint groups; float eps; };
+kernel void group_stats(device const float* x [[buffer(0)]], device float2* st [[buffer(1)]], constant GS& p [[buffer(2)]],
+                        uint g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    uint cpg = p.c / p.groups, total = p.n * cpg;
+    float s = 0.f;
+    for (uint i = tid; i < total; i += 256) s += x[(ulong)(i / cpg) * p.c + g * cpg + i % cpg];
+    s = simd_sum(s);
+    if (lane == 0) red[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = (red[0] + red[1] + red[2] + red[3] + red[4] + red[5] + red[6] + red[7]) / float(total);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v = 0.f;
+    for (uint i = tid; i < total; i += 256) { float d = x[(ulong)(i / cpg) * p.c + g * cpg + i % cpg] - mean; v += d * d; }
+    v = simd_sum(v);
+    if (lane == 0) red[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float t = red[0] + red[1] + red[2] + red[3] + red[4] + red[5] + red[6] + red[7];
+        st[g] = float2(mean, rsqrt(t / float(total) + p.eps));
+    }
+}
+struct RS { uint c; float eps; };
+kernel void row_stats(device const float* x [[buffer(0)]], device float2* st [[buffer(1)]], constant RS& p [[buffer(2)]],
+                      uint r [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
+    device const float* row = x + (ulong)r * p.c;
+    float s = 0.f;
+    for (uint i = lane; i < p.c; i += 32) s += row[i];
+    float mean = simd_sum(s) / float(p.c);
+    float v = 0.f;
+    for (uint i = lane; i < p.c; i += 32) { float d = row[i] - mean; v += d * d; }
+    v = simd_sum(v) / float(p.c);
+    if (lane == 0) st[r] = float2(mean, rsqrt(v + p.eps));
+}
+// Row softmax of scaled scores in place; columns from `cols` (or after the row, if causal) to `ld`
+// become 0 so the following product ignores the padding.
+struct SM { uint cols; uint ld; float scale; uint causal; };
+kernel void softmax_rows(device float* s [[buffer(0)]], constant SM& p [[buffer(1)]],
+                         uint r [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
+    device float* row = s + (ulong)r * p.ld;
+    uint lim = p.causal != 0 ? min(r + 1, p.cols) : p.cols;
+    float m = -INFINITY;
+    for (uint i = lane; i < lim; i += 32) m = max(m, row[i] * p.scale);
+    m = simd_max(m);
+    float sum = 0.f;
+    for (uint i = lane; i < lim; i += 32) { float e = exp(row[i] * p.scale - m); row[i] = e; sum += e; }
+    float inv = 1.0f / simd_sum(sum);
+    for (uint i = lane; i < p.ld; i += 32) row[i] = i < lim ? row[i] * inv : 0.f;
+}
 "#;
 
 #[repr(C)]
@@ -188,6 +267,10 @@ struct ConvParams {
     ow: u32,
     npix: u32,
     pad: u32,
+    mode: u32,
+    silu: u32,
+    cpg: u32,
+    _p: u32,
 }
 
 #[repr(C)]
@@ -224,6 +307,30 @@ struct Staging {
     x_cap: usize,
     y: Id,
     y_cap: usize,
+    /// Normalization statistics (float2 per group or row) and gamma/beta for fused norms.
+    stats: Grow,
+    gb: Grow,
+    /// Attention operands: per-head padded Q, K, transposed V, the scores of one head, outputs.
+    aq: Grow,
+    ak: Grow,
+    av: Grow,
+    asc: Grow,
+    ao: Grow,
+}
+
+/// A device buffer that only ever grows.
+struct Grow {
+    id: Id,
+    cap: usize,
+}
+
+impl Grow {
+    const fn new() -> Self {
+        Self {
+            id: std::ptr::null_mut(),
+            cap: 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -244,6 +351,10 @@ pub struct MetalBackend {
     pipes: [Id; 3],
     /// Implicit-GEMM convolution pipelines, same order.
     conv_pipes: [Id; 3],
+    gemm_f32: Id,
+    group_stats: Id,
+    row_stats: Id,
+    softmax: Id,
     staging: Mutex<Staging>,
     sels: Sels,
 }
@@ -265,6 +376,7 @@ struct Sels {
     new_buffer_bytes: Sel,
     new_buffer_len: Sel,
     status: Sel,
+    release: Sel,
     pool_push: unsafe extern "C" fn() -> *mut c_void,
     pool_pop: unsafe extern "C" fn(*mut c_void),
 }
@@ -353,6 +465,10 @@ impl MetalBackend {
         };
         let pipes = [pipeline(c"gemm_bf")?, pipeline(c"gemm_q8")?, pipeline(c"gemm_q4")?];
         let conv_pipes = [pipeline(c"conv_bf")?, pipeline(c"conv_q8")?, pipeline(c"conv_q4")?];
+        let gemm_f32 = pipeline(c"gemm_f32")?;
+        let group_stats = pipeline(c"group_stats")?;
+        let row_stats = pipeline(c"row_stats")?;
+        let softmax = pipeline(c"softmax_rows")?;
         let pool_push = unsafe { o.objc.get::<unsafe extern "C" fn() -> *mut c_void>(c"objc_autoreleasePoolPush") }
             .map_err(|e| anyhow!("{e}"))?
             .into_inner_unsafe();
@@ -374,6 +490,7 @@ impl MetalBackend {
             new_buffer_bytes: o.sel(c"newBufferWithBytes:length:options:"),
             new_buffer_len: o.sel(c"newBufferWithLength:options:"),
             status: o.sel(c"status"),
+            release: o.sel(c"release"),
             pool_push,
             pool_pop,
         };
@@ -385,11 +502,22 @@ impl MetalBackend {
             queue,
             pipes,
             conv_pipes,
+            gemm_f32,
+            group_stats,
+            row_stats,
+            softmax,
             staging: Mutex::new(Staging {
                 x: std::ptr::null_mut(),
                 x_cap: 0,
                 y: std::ptr::null_mut(),
                 y_cap: 0,
+                stats: Grow::new(),
+                gb: Grow::new(),
+                aq: Grow::new(),
+                ak: Grow::new(),
+                av: Grow::new(),
+                asc: Grow::new(),
+                ao: Grow::new(),
             }),
             sels,
         })
@@ -423,6 +551,26 @@ impl MetalBackend {
             return None;
         }
         Some(Buf { id, offset_bytes: 0 })
+    }
+
+    /// Makes `g` at least `bytes` long (replaced buffers are released).
+    fn grow(&self, g: &mut Grow, bytes: usize) -> bool {
+        if g.cap >= bytes && !g.id.is_null() {
+            return true;
+        }
+        let new_len: MsgNewBufLen = self.o.msg_send();
+        let void: MsgVoid = self.o.msg_send();
+        let cap = bytes.max(16).div_ceil(PAGE) * PAGE * 2;
+        let id = unsafe { new_len(self.device, self.sels.new_buffer_len, cap, 0) };
+        if id.is_null() {
+            return false;
+        }
+        if !g.id.is_null() {
+            unsafe { void(g.id, self.sels.release) };
+        }
+        g.id = id;
+        g.cap = cap;
+        true
     }
 
     fn ensure_staging(&self, st: &mut Staging, x_bytes: usize, y_bytes: usize) -> bool {
@@ -491,10 +639,19 @@ impl Backend for MetalBackend {
         Some(Box::new(mw))
     }
 
-    fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, job: &mut Job) -> bool {
+    fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {
+        use crate::gpu::NormKind;
         let n_in = g.k * g.k * g.cin;
         let t = g.oh * g.ow;
-        if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(TILE) || x.len() < g.h * g.w * g.cin || job.y.len() < t * job.n_out {
+        let npx = g.h * g.w;
+        if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(TILE) || x.len() < npx * g.cin || job.y.len() < t * job.n_out {
+            return false;
+        }
+        if let Some(n) = norm
+            && (n.gamma.len() != g.cin
+                || n.beta.len() != g.cin
+                || matches!(n.kind, NormKind::Group(gr) if gr == 0 || !g.cin.is_multiple_of(gr)))
+        {
             return false;
         }
         let Some(mw) = job.dev.downcast_ref::<MetalWeight>() else {
@@ -502,14 +659,28 @@ impl Backend for MetalBackend {
         };
         let t_pad = t.div_ceil(TILE) * TILE;
         let mut st = self.staging.lock().unwrap();
-        if !self.ensure_staging(&mut st, g.h * g.w * g.cin * 4, t_pad * job.n_out * 4) {
+        if !self.ensure_staging(&mut st, npx * g.cin * 4, t_pad * job.n_out * 4) {
+            return false;
+        }
+        let n_stats = match norm.map(|n| n.kind) {
+            Some(NormKind::Group(gr)) => gr,
+            Some(NormKind::Layer) => npx,
+            None => 1,
+        };
+        let st = &mut *st;
+        if !self.grow(&mut st.stats, n_stats * 8) || !self.grow(&mut st.gb, 2 * g.cin * 4) {
             return false;
         }
         let contents: MsgPtr = self.o.msg_send();
         let t0 = Instant::now();
         unsafe {
             let xp = contents(st.x, self.sels.contents) as *mut f32;
-            std::ptr::copy_nonoverlapping(x.as_ptr(), xp, g.h * g.w * g.cin);
+            std::ptr::copy_nonoverlapping(x.as_ptr(), xp, npx * g.cin);
+            if let Some(n) = norm {
+                let gp = contents(st.gb.id, self.sels.contents) as *mut f32;
+                std::ptr::copy_nonoverlapping(n.gamma.as_ptr(), gp, g.cin);
+                std::ptr::copy_nonoverlapping(n.beta.as_ptr(), gp.add(g.cin), g.cin);
+            }
         }
         let msg0: Msg0 = self.o.msg_send();
         let set_pipe: MsgSetPipe = self.o.msg_send();
@@ -523,6 +694,72 @@ impl Backend for MetalBackend {
             let pool = (self.sels.pool_push)();
             let cb = msg0(self.queue, self.sels.command_buffer);
             let enc = msg0(cb, self.sels.compute_encoder);
+            // Statistics first; dispatches in one encoder run in order.
+            match norm {
+                Some(
+                    n @ crate::gpu::NormSpec {
+                        kind: NormKind::Group(gr), ..
+                    },
+                ) => {
+                    #[repr(C)]
+                    struct Gs {
+                        n: u32,
+                        c: u32,
+                        groups: u32,
+                        eps: f32,
+                    }
+                    let p = Gs {
+                        n: npx as u32,
+                        c: g.cin as u32,
+                        groups: *gr as u32,
+                        eps: n.eps,
+                    };
+                    set_pipe(enc, self.sels.set_pipeline, self.group_stats);
+                    set_buf(enc, self.sels.set_buffer, st.x, 0, 0);
+                    set_buf(enc, self.sels.set_buffer, st.stats.id, 0, 1);
+                    set_bytes(
+                        enc,
+                        self.sels.set_bytes,
+                        &p as *const Gs as *const c_void,
+                        std::mem::size_of::<Gs>(),
+                        2,
+                    );
+                    dispatch(
+                        enc,
+                        self.sels.dispatch,
+                        &MtlSize { w: *gr, h: 1, d: 1 },
+                        &MtlSize { w: 256, h: 1, d: 1 },
+                    );
+                }
+                Some(n) => {
+                    #[repr(C)]
+                    struct Rs {
+                        c: u32,
+                        eps: f32,
+                    }
+                    let p = Rs {
+                        c: g.cin as u32,
+                        eps: n.eps,
+                    };
+                    set_pipe(enc, self.sels.set_pipeline, self.row_stats);
+                    set_buf(enc, self.sels.set_buffer, st.x, 0, 0);
+                    set_buf(enc, self.sels.set_buffer, st.stats.id, 0, 1);
+                    set_bytes(
+                        enc,
+                        self.sels.set_bytes,
+                        &p as *const Rs as *const c_void,
+                        std::mem::size_of::<Rs>(),
+                        2,
+                    );
+                    dispatch(
+                        enc,
+                        self.sels.dispatch,
+                        &MtlSize { w: npx, h: 1, d: 1 },
+                        &MtlSize { w: 32, h: 1, d: 1 },
+                    );
+                }
+                None => {}
+            }
             let (fi, elem_bytes, scale_bytes) = format_index(&job.w);
             let params = ConvParams {
                 n_out: job.n_out as u32,
@@ -537,6 +774,17 @@ impl Backend for MetalBackend {
                 ow: g.ow as u32,
                 npix: t as u32,
                 pad: (g.k / 2) as u32,
+                mode: match norm.map(|n| n.kind) {
+                    None => 0,
+                    Some(NormKind::Group(_)) => 1,
+                    Some(NormKind::Layer) => 2,
+                },
+                silu: norm.is_some_and(|n| n.silu) as u32,
+                cpg: match norm.map(|n| n.kind) {
+                    Some(NormKind::Group(gr)) => (g.cin / gr) as u32,
+                    _ => 1,
+                },
+                _p: 0,
             };
             set_pipe(enc, self.sels.set_pipeline, self.conv_pipes[fi]);
             set_buf(enc, self.sels.set_buffer, mw.data.id, 0, 0);
@@ -556,6 +804,8 @@ impl Backend for MetalBackend {
                 std::mem::size_of::<ConvParams>(),
                 4,
             );
+            set_buf(enc, self.sels.set_buffer, st.stats.id, 0, 5);
+            set_buf(enc, self.sels.set_buffer, st.gb.id, 0, 6);
             let groups = MtlSize {
                 w: job.n_out / TILE,
                 h: t_pad / TILE,
@@ -571,6 +821,183 @@ impl Backend for MetalBackend {
             if ok {
                 let yp = contents(st.y, self.sels.contents) as *const f32;
                 std::ptr::copy_nonoverlapping(yp, job.y.as_mut_ptr(), t * job.n_out);
+            }
+            (self.sels.pool_pop)(pool);
+            self.stats.calls.fetch_add(1, Ordering::Relaxed);
+            self.stats.copy_in_ns.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+            self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+            self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            ok
+        }
+    }
+
+    fn attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        tq: usize,
+        tk: usize,
+        heads: usize,
+        dh: usize,
+        causal: bool,
+        out: &mut [f32],
+    ) -> bool {
+        let d = heads * dh;
+        if q.len() < tq * d || k.len() < tk * d || v.len() < tk * d || out.len() < tq * d || tq == 0 || tk == 0 {
+            return false;
+        }
+        // GEMM tiling: out rows (keys, value dims) in multiples of 64, K in multiples of 32.
+        let (dhp, dho, tkp, tqp) = (
+            dh.next_multiple_of(32),
+            dh.next_multiple_of(64),
+            tk.next_multiple_of(64),
+            tq.next_multiple_of(64),
+        );
+        let mut st = self.staging.lock().unwrap();
+        let st = &mut *st;
+        let ok = self.grow(&mut st.aq, heads * tqp * dhp * 4)
+            && self.grow(&mut st.ak, heads * tkp * dhp * 4)
+            && self.grow(&mut st.av, heads * dho * tkp * 4)
+            && self.grow(&mut st.asc, tqp * tkp * 4)
+            && self.grow(&mut st.ao, heads * tqp * dho * 4);
+        if !ok {
+            return false;
+        }
+        let contents: MsgPtr = self.o.msg_send();
+        let t0 = Instant::now();
+        unsafe {
+            // Per-head operands, zero padded (padding contributes nothing to any product).
+            let qp = contents(st.aq.id, self.sels.contents) as *mut f32;
+            let kp = contents(st.ak.id, self.sels.contents) as *mut f32;
+            let vp = contents(st.av.id, self.sels.contents) as *mut f32;
+            std::ptr::write_bytes(qp, 0, heads * tqp * dhp);
+            std::ptr::write_bytes(kp, 0, heads * tkp * dhp);
+            std::ptr::write_bytes(vp, 0, heads * dho * tkp);
+            for h in 0..heads {
+                for i in 0..tq {
+                    std::ptr::copy_nonoverlapping(q.as_ptr().add(i * d + h * dh), qp.add((h * tqp + i) * dhp), dh);
+                }
+                for j in 0..tk {
+                    std::ptr::copy_nonoverlapping(k.as_ptr().add(j * d + h * dh), kp.add((h * tkp + j) * dhp), dh);
+                    for c in 0..dh {
+                        *vp.add((h * dho + c) * tkp + j) = v[j * d + h * dh + c];
+                    }
+                }
+            }
+        }
+        let msg0: Msg0 = self.o.msg_send();
+        let set_pipe: MsgSetPipe = self.o.msg_send();
+        let set_buf: MsgSetBuffer = self.o.msg_send();
+        let set_bytes: MsgSetBytes = self.o.msg_send();
+        let dispatch: MsgDispatch = self.o.msg_send();
+        let void: MsgVoid = self.o.msg_send();
+        let status: MsgU = self.o.msg_send();
+        unsafe {
+            let t1 = Instant::now();
+            let pool = (self.sels.pool_push)();
+            let cb = msg0(self.queue, self.sels.command_buffer);
+            let enc = msg0(cb, self.sels.compute_encoder);
+            #[repr(C)]
+            struct Sm {
+                cols: u32,
+                ld: u32,
+                scale: f32,
+                causal: u32,
+            }
+            let sm = Sm {
+                cols: tk as u32,
+                ld: tkp as u32,
+                scale: 1.0 / (dh as f32).sqrt(),
+                causal: causal as u32,
+            };
+            for h in 0..heads {
+                // Scores: keys as the "weights" ([tkp, dhp]), queries as the input.
+                let p = Params {
+                    n_out: tkp as u32,
+                    n_in: dhp as u32,
+                    w_off: 0,
+                    s_off: 0,
+                };
+                set_pipe(enc, self.sels.set_pipeline, self.gemm_f32);
+                set_buf(enc, self.sels.set_buffer, st.ak.id, h * tkp * dhp * 4, 0);
+                set_buf(enc, self.sels.set_buffer, st.ak.id, 0, 1);
+                set_buf(enc, self.sels.set_buffer, st.aq.id, h * tqp * dhp * 4, 2);
+                set_buf(enc, self.sels.set_buffer, st.asc.id, 0, 3);
+                set_bytes(
+                    enc,
+                    self.sels.set_bytes,
+                    &p as *const Params as *const c_void,
+                    std::mem::size_of::<Params>(),
+                    4,
+                );
+                dispatch(
+                    enc,
+                    self.sels.dispatch,
+                    &MtlSize {
+                        w: tkp / TILE,
+                        h: tqp / TILE,
+                        d: 1,
+                    },
+                    &MtlSize { w: 128, h: 1, d: 1 },
+                );
+                set_pipe(enc, self.sels.set_pipeline, self.softmax);
+                set_buf(enc, self.sels.set_buffer, st.asc.id, 0, 0);
+                set_bytes(
+                    enc,
+                    self.sels.set_bytes,
+                    &sm as *const Sm as *const c_void,
+                    std::mem::size_of::<Sm>(),
+                    1,
+                );
+                dispatch(
+                    enc,
+                    self.sels.dispatch,
+                    &MtlSize { w: tqp, h: 1, d: 1 },
+                    &MtlSize { w: 32, h: 1, d: 1 },
+                );
+                // Output: transposed values as the "weights" ([dho, tkp]), probabilities as the input.
+                let p = Params {
+                    n_out: dho as u32,
+                    n_in: tkp as u32,
+                    w_off: 0,
+                    s_off: 0,
+                };
+                set_pipe(enc, self.sels.set_pipeline, self.gemm_f32);
+                set_buf(enc, self.sels.set_buffer, st.av.id, h * dho * tkp * 4, 0);
+                set_buf(enc, self.sels.set_buffer, st.av.id, 0, 1);
+                set_buf(enc, self.sels.set_buffer, st.asc.id, 0, 2);
+                set_buf(enc, self.sels.set_buffer, st.ao.id, h * tqp * dho * 4, 3);
+                set_bytes(
+                    enc,
+                    self.sels.set_bytes,
+                    &p as *const Params as *const c_void,
+                    std::mem::size_of::<Params>(),
+                    4,
+                );
+                dispatch(
+                    enc,
+                    self.sels.dispatch,
+                    &MtlSize {
+                        w: dho / TILE,
+                        h: tqp / TILE,
+                        d: 1,
+                    },
+                    &MtlSize { w: 128, h: 1, d: 1 },
+                );
+            }
+            void(enc, self.sels.end_encoding);
+            void(cb, self.sels.commit);
+            void(cb, self.sels.wait);
+            let ok = status(cb, self.sels.status) == 4;
+            let t2 = Instant::now();
+            if ok {
+                let op = contents(st.ao.id, self.sels.contents) as *const f32;
+                for h in 0..heads {
+                    for i in 0..tq {
+                        std::ptr::copy_nonoverlapping(op.add((h * tqp + i) * dho), out.as_mut_ptr().add(i * d + h * dh), dh);
+                    }
+                }
             }
             (self.sels.pool_pop)(pool);
             self.stats.calls.fetch_add(1, Ordering::Relaxed);

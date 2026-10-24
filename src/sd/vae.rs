@@ -1,6 +1,6 @@
 //! The VAE decoder (diffusers `AutoencoderKL.decode`): latents back to RGB at 8x the resolution.
 
-use super::ops::{Conv, GroupNorm, Linear, Tensors, attention, upsample2x};
+use super::ops::{Conv, GroupNorm, Linear, Pre, Tensors, attention, upsample2x};
 use super::unet::Resnet;
 use crate::kernels::add_inplace;
 use anyhow::Result;
@@ -92,9 +92,17 @@ impl VaeDecoder {
         let (mut x, mut h, mut w) = self.conv_in.forward(&z, h, w, 1);
         x = self.mid1.forward(&x, h, w, None);
         let n = h * w;
-        let mut y = x.clone();
-        self.attn.norm.apply(&mut y, n, false);
-        let (q, k, v) = (self.attn.q.forward(&y, n), self.attn.k.forward(&y, n), self.attn.v.forward(&y, n));
+        let pre = Pre::Group(&self.attn.norm, false);
+        let (q, k, v) = if self.attn.q.on_device(n) {
+            (
+                self.attn.q.forward_pre(&x, n, pre),
+                self.attn.k.forward_pre(&x, n, pre),
+                self.attn.v.forward_pre(&x, n, pre),
+            )
+        } else {
+            let y = pre.apply(&x, n);
+            (self.attn.q.forward(&y, n), self.attn.k.forward(&y, n), self.attn.v.forward(&y, n))
+        };
         let c = self.attn.q.n_out;
         let a = attention(&q, &k, &v, n, n, 1, c, false);
         add_inplace(&mut x, &self.attn.o.forward(&a, n));
@@ -111,7 +119,6 @@ impl VaeDecoder {
                 x = u.forward(&up, h, w, 1).0;
             }
         }
-        self.norm_out.apply(&mut x, h * w, true);
-        (self.conv_out.forward(&x, h, w, 1).0, h, w)
+        (self.conv_out.forward_pre(&x, h, w, 1, Pre::Group(&self.norm_out, true)).0, h, w)
     }
 }
