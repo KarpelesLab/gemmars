@@ -164,7 +164,8 @@ pub struct ClipText {
 }
 
 impl ClipText {
-    pub fn load(dir: &Path, weights: &Path) -> Result<Self> {
+    /// `dir` holds `config.json`; `t` is the opened weight file (with any LoRA updates attached).
+    pub fn load(dir: &Path, t: Tensors) -> Result<Self> {
         let cfg: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
         let hidden = cfg["hidden_size"].as_u64().context("hidden_size")? as usize;
         let heads = cfg["num_attention_heads"].as_u64().context("num_attention_heads")? as usize;
@@ -175,7 +176,6 @@ impl ClipText {
             "gelu" => Act::Gelu,
             other => bail!("text encoder activation {other} is not supported"),
         };
-        let t = Tensors::open(weights)?;
         let p = "text_model.";
         let te = format!("{p}embeddings.token_embedding.weight");
         let tok = match t.f16_bits(&te)? {

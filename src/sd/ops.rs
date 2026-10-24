@@ -54,9 +54,11 @@ pub mod timing {
     pub const LN: usize = 5;
 }
 
-/// One safetensors file of a diffusers component (`unet/`, `vae/`, `text_encoder/`).
+/// One safetensors file of a diffusers component (`unet/`, `vae/`, `text_encoder/`), with the
+/// LoRA updates to merge into its weights as they are read.
 pub struct Tensors {
     st: SafeTensors,
+    lora: Option<super::lora::Patches>,
 }
 
 impl Tensors {
@@ -64,7 +66,21 @@ impl Tensors {
         // Mapped where the platform can: every weight is converted on load anyway.
         Ok(Self {
             st: SafeTensors::open(path, cfg!(target_arch = "wasm32"))?,
+            lora: None,
         })
+    }
+
+    /// Merges these LoRA updates into the weights read from now on.
+    pub fn set_lora(&mut self, p: Option<super::lora::Patches>) {
+        self.lora = p;
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.st.names()
+    }
+
+    pub fn metadata(&self, key: &str) -> Option<&str> {
+        self.st.metadata(key)
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -75,11 +91,11 @@ impl Tensors {
         Ok(self.st.info(name).with_context(|| format!("missing tensor {name}"))?.shape.clone())
     }
 
-    /// A tensor as f32, whatever its stored float type.
+    /// A tensor as f32, whatever its stored float type, with any LoRA updates merged in.
     pub fn f32(&self, name: &str) -> Result<Vec<f32>> {
         let info = self.st.info(name).with_context(|| format!("missing tensor {name}"))?;
         let b = self.st.bytes_cow(name)?;
-        Ok(match info.dtype.as_str() {
+        let mut v: Vec<f32> = match info.dtype.as_str() {
             "F16" => b.as_chunks::<2>().0.iter().map(|c| half::f16::from_le_bytes(*c).to_f32()).collect(),
             "BF16" => b
                 .as_chunks::<2>()
@@ -89,13 +105,17 @@ impl Tensors {
                 .collect(),
             "F32" => b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect(),
             other => bail!("tensor {name}: unsupported dtype {other}"),
-        })
+        };
+        if let Some(p) = &self.lora {
+            p.apply(name, info.shape.first().copied().unwrap_or(1), &mut v)?;
+        }
+        Ok(v)
     }
 
     /// Raw fp16 bits when the tensor is stored as F16 (lookup tables keep them exact).
     pub fn f16_bits(&self, name: &str) -> Result<Option<Vec<u16>>> {
         let info = self.st.info(name).with_context(|| format!("missing tensor {name}"))?;
-        if info.dtype != "F16" {
+        if info.dtype != "F16" || self.lora.as_ref().is_some_and(|p| p.targets(name)) {
             return Ok(None);
         }
         Ok(Some(

@@ -279,6 +279,11 @@ impl SafeTensors {
         self.tensors.keys()
     }
 
+    /// A `__metadata__` value of the header.
+    pub fn metadata(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
+
     /// Raw bytes of a tensor.
     pub fn bytes(&self, name: &str) -> Result<&[u8]> {
         let t = self.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;

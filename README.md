@@ -181,6 +181,34 @@ upsampling and skip concatenation. `OXINFER_GPU_CHECK=1` recomputes every device
 prints the worst relative error per kind (about 4e-6 for attention, 1e-6 for the fused norms, on
 Metal and WebGPU). SDXL, SD 3 and Flux use different architectures and are not supported.
 
+**LoRA.** `--lora FILE[:SCALE]` (repeatable, scale 1 by default) merges a LoRA into the UNet and
+text-encoder weights at load, `W += scale * alpha / rank * up @ down` in f32 before the bf16
+conversion, so generation runs at the base model's speed (`src/sd/lora.rs`). Convolution LoRAs
+(LoCon: a `[rank, in, 3, 3]` down and a `[out, rank, 1, 1]` up) are merged the same way. Both
+common layouts are read: kohya / A1111 (`lora_unet_down_blocks_0_..._to_q.lora_down.weight`,
+`.alpha`, `lora_te_text_model_...`) and diffusers / PEFT (`unet.<module>.lora_A.weight`, `.lora.down`,
+`text_encoder.`, with the alpha from the `lora_adapter_metadata` header). Keys that match no weight
+of the model, and LyCORIS kinds other than plain LoRA / LoCon (LoHa, LoKr, DoRA), are skipped and
+reported; a file that matches nothing, or whose shapes belong to another base model, is an error.
+`FILE` may also be a Hugging Face path, `org/name/file.safetensors` (or `org/name` when the repo
+holds one safetensors file), fetched into the cache like models; or download it yourself:
+
+```sh
+curl -L -o lcm-lora.safetensors \
+    https://huggingface.co/latent-consistency/lcm-lora-sdv1-5/resolve/main/pytorch_lora_weights.safetensors
+./target/release/oxinfer --model models/sd-v1-5 --lora lcm-lora.safetensors \
+    --steps 4 --guidance 1 --sampler euler -p "a red fox in the snow" -o fox.png
+./target/release/oxinfer --model models/sd-v1-5 --lora KoRo8888/ufotable_artstyle_locon_v1:0.8 \
+    -p "a girl standing in a forest, anime screencap" -o forest.png
+```
+
+Against diffusers' `load_lora_weights` + `fuse_lora` (`tools/ref_sd.py --lora`, bf16 weights on
+both sides), on SD 1.5: LCM-LoRA (kohya keys, 278 UNet modules including convolutions), 4 Euler
+steps, 79.6 dB; the ufotable LoCon (kohya, 278 UNet + 72 text-encoder modules) at 0.8, 20 steps
+at guidance 7.5, 78.4 dB, and the same file re-saved by diffusers in the PEFT layout gives the
+identical image; both together (LCM 1.0 + ufotable 0.6), 82.3 dB. Scale 0 reproduces the base
+model bit for bit. LoRAs apply on the command line only for now; the browser build loads none.
+
 ## Image and audio input
 
 ```sh

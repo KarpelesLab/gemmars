@@ -9,6 +9,10 @@ from the same directory, and the reference stages as ref_*.bin.
   python tools/ref_sd.py models/sd-turbo OUT "a red fox" --steps 1 --guidance 0
   OXINFER_SD_DUMP=OUT oxinfer --model models/sd-turbo -p "a red fox" --steps 1 --guidance 0 --sampler euler
   python tools/ref_sd.py --compare OUT
+
+With --lora FILE[:SCALE] (repeatable), the LoRA files are loaded with diffusers'
+load_lora_weights (needs peft) and fused into the weights before any bf16 rounding, as oxinfer
+merges them at load.
 """
 import argparse, os, sys
 import numpy as np
@@ -49,6 +53,7 @@ def main():
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--compare", metavar="DIR")
+    ap.add_argument("--lora", action="append", default=[], metavar="FILE[:SCALE]", help="LoRA to fuse (repeatable)")
     ap.add_argument("--bf16-weights", action="store_true", help="round matmul/conv weights to bf16 as oxinfer stores them (isolates implementation error)")
     a = ap.parse_args()
     if a.compare:
@@ -66,6 +71,26 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(a.model, subfolder="unet", **kw).eval()
     vae = AutoencoderKL.from_pretrained(a.model, subfolder="vae", **kw).eval()
     sched = EulerDiscreteScheduler.from_pretrained(a.model, subfolder="scheduler")
+    if a.lora:
+        from diffusers import StableDiffusionPipeline
+        pipe = StableDiffusionPipeline(vae=vae, text_encoder=te, tokenizer=tok, unet=unet, scheduler=sched,
+                                       safety_checker=None, feature_extractor=None, requires_safety_checker=False)
+        names, scales = [], []
+        for i, spec in enumerate(a.lora):
+            path, scale = spec, 1.0
+            head, _, tail = spec.rpartition(":")
+            if head:
+                try:
+                    path, scale = head, float(tail)
+                except ValueError:
+                    pass
+            pipe.load_lora_weights(os.path.dirname(path) or ".", weight_name=os.path.basename(path), adapter_name=f"l{i}")
+            names.append(f"l{i}")
+            scales.append(scale)
+        pipe.set_adapters(names, adapter_weights=scales)
+        pipe.fuse_lora(adapter_names=names, lora_scale=1.0)
+        pipe.unload_lora_weights()
+        te, unet = pipe.text_encoder.eval(), pipe.unet.eval()
     if a.bf16_weights:
         # oxinfer keeps Linear/Conv weights in bf16 (biases, norms and embeddings stay exact).
         for m in (te, unet, vae):

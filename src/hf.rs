@@ -40,6 +40,54 @@ pub fn resolve(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// A single file: a local path is used as is; otherwise `spec` is `org/name/path/in/repo` (or
+/// `org/name` when the repo holds exactly one safetensors file), fetched into the repo's cache
+/// directory. For LoRA files and other single-file downloads.
+pub fn resolve_file(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let p = Path::new(spec);
+    if p.is_file() {
+        return Ok(p.to_path_buf());
+    }
+    let parts: Vec<&str> = spec.split('/').collect();
+    if parts.len() < 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
+        bail!("{spec}: not an existing file and not a HuggingFace path of the form org/name/file");
+    }
+    let repo = format!("{}/{}", parts[0], parts[1]);
+    let list = listing(&repo)?;
+    let name = if parts.len() > 2 {
+        parts[2..].join("/")
+    } else {
+        let mut st: Vec<&String> = list.keys().filter(|k| k.ends_with(".safetensors")).collect();
+        st.sort();
+        match st.as_slice() {
+            [one] => one.to_string(),
+            [] => bail!("{repo}: no safetensors file in the repository"),
+            many => bail!(
+                "{repo} has several safetensors files; name one as {repo}/FILE: {}",
+                many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        }
+    };
+    let (size, src) = list.get(&name).with_context(|| format!("{repo}: no file {name}"))?;
+    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
+    let dir = root.join(repo.replace('/', "--"));
+    fetch_file(&repo, &dir, &name, *size, src, 1, 1)?;
+    Ok(dir.join(name))
+}
+
+/// Percent-encodes a repository path for a URL (keeps `/` and unreserved characters).
+fn url_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 fn token() -> Option<String> {
     std::env::var("HF_TOKEN")
         .ok()
@@ -165,7 +213,7 @@ fn list_hf(repo: &str) -> Result<Listing> {
         .siblings
         .into_iter()
         .map(|s| {
-            let url = format!("https://huggingface.co/{repo}/resolve/main/{}", s.rfilename);
+            let url = format!("https://huggingface.co/{repo}/resolve/main/{}", url_path(&s.rfilename));
             (s.rfilename, (s.size, Source::Url(url)))
         })
         .collect())

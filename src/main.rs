@@ -53,6 +53,7 @@ struct Args {
     negative: String,
     size: Option<(usize, usize)>,
     sampler: Option<String>,
+    loras: Vec<oxinfer::sd::lora::LoraSpec>,
     device: platform::DevicePref,
     devices: bool,
     embed: bool,
@@ -109,6 +110,8 @@ fn usage() -> ! {
          \x20 --size WxH           image size, multiples of 64 (default the model's)\n\
          \x20 --sampler NAME       euler or euler_a (default euler_a)\n\
          \x20 --seed N             noise seed (default 42)\n\
+         \x20 --lora FILE[:SCALE]  merge a LoRA (kohya or diffusers safetensors; repeatable; scale 1);\n\
+         \x20                      FILE may be org/repo/file.safetensors on Hugging Face\n\
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
@@ -163,6 +166,7 @@ fn parse_args() -> Result<Args> {
         negative: String::new(),
         size: None,
         sampler: None,
+        loras: Vec::new(),
         device: platform::DevicePref::Auto,
         devices: false,
         embed: false,
@@ -221,6 +225,7 @@ fn parse_args() -> Result<Args> {
             "--guidance" | "--cfg" => a.guidance = Some(val()?.parse()?),
             "--negative" => a.negative = val()?,
             "--sampler" => a.sampler = Some(val()?),
+            "--lora" => a.loras.push(oxinfer::sd::lora::LoraSpec::parse(&val()?)?),
             "--size" => {
                 let v = val()?;
                 let (w, h) = v
@@ -743,6 +748,24 @@ fn resolve_model(spec: &str, cache_dir: Option<&std::path::Path>) -> Result<Path
     }
 }
 
+/// Resolves a file spec: a local path, or (with the `hf` feature) `org/repo/path/in/repo`.
+fn resolve_file(spec: &str, cache_dir: Option<&std::path::Path>) -> Result<PathBuf> {
+    #[cfg(feature = "hf")]
+    {
+        hf::resolve_file(spec, cache_dir)
+    }
+    #[cfg(not(feature = "hf"))]
+    {
+        let _ = cache_dir;
+        let p = PathBuf::from(spec);
+        if p.is_file() {
+            Ok(p)
+        } else {
+            bail!("{spec}: no such file (built without the `hf` feature, so repo files cannot be fetched)")
+        }
+    }
+}
+
 /// Writes the tensors the loader used, quantized as loaded, plus the config and tokenizer files.
 fn save_quantized(src: &Path, out: &Path, files: &safetensors::ModelFiles, quant: Quant) -> Result<()> {
     if out.exists() && std::fs::canonicalize(out)? == std::fs::canonicalize(src)? {
@@ -797,6 +820,9 @@ fn main() -> Result<()> {
     if let Some(d) = &args.draft {
         let spec = d.to_string_lossy().to_string();
         args.draft = Some(resolve_model(&spec, args.cache_dir.as_deref())?);
+    }
+    for l in &mut args.loras {
+        l.path = resolve_file(&l.path.to_string_lossy(), args.cache_dir.as_deref())?;
     }
     if args.download_only {
         eprintln!("[model at {}]", args.model.display());
@@ -903,7 +929,7 @@ fn continue_with_tools<M: TextLm>(
 fn run_image(args: &Args) -> Result<()> {
     use oxinfer::sd::{Params, Pipeline, sched::Sampler};
     let t0 = Instant::now();
-    let pipe = Pipeline::load(&args.model)?;
+    let pipe = Pipeline::load_with_loras(&args.model, &args.loras, &mut |line| eprintln!("{line}"))?;
     eprintln!(
         "[loaded diffusion pipeline in {:.2}s{}]",
         t0.elapsed().as_secs_f64(),

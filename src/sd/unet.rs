@@ -216,7 +216,8 @@ fn count(t: &Tensors, f: impl Fn(usize) -> String) -> usize {
 }
 
 impl Unet {
-    pub fn load(dir: &Path, weights: &Path) -> Result<Self> {
+    /// `dir` holds `config.json`; `t` is the opened weight file (with any LoRA updates attached).
+    pub fn load(dir: &Path, t: Tensors) -> Result<Self> {
         let cfg: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
         let n_blocks = cfg["block_out_channels"].as_array().context("block_out_channels")?.len();
         // diffusers names the head count `attention_head_dim` for these models (int or per block).
@@ -236,7 +237,6 @@ impl Unet {
                 bail!("UNet {k} = {} is not supported (SDXL-style conditioning)", cfg[k]);
             }
         }
-        let t = Tensors::open(weights)?;
         let mut downs = Vec::with_capacity(n_blocks);
         for i in 0..n_blocks {
             let p = format!("down_blocks.{i}");

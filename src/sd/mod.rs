@@ -5,6 +5,7 @@
 //! SIMD kernels on every CPU and the GPU backends (Metal, CUDA, WebGPU) when one is active.
 
 pub mod clip;
+pub mod lora;
 pub mod ops;
 pub mod sched;
 pub mod unet;
@@ -94,6 +95,12 @@ fn dump_raw(name: &str, x: &[f32]) {
 
 impl Pipeline {
     pub fn load(dir: &Path) -> Result<Self> {
+        Self::load_with_loras(dir, &[], &mut |_| {})
+    }
+
+    /// Loads the pipeline with LoRA files merged into the UNet and text-encoder weights;
+    /// `report` receives one summary line per LoRA file.
+    pub fn load_with_loras(dir: &Path, loras: &[lora::LoraSpec], report: &mut dyn FnMut(&str)) -> Result<Self> {
         if !is_diffusers(dir) {
             bail!("{} is not a diffusers pipeline (no model_index.json)", dir.display());
         }
@@ -105,8 +112,20 @@ impl Pipeline {
         let te = dir.join("text_encoder");
         let un = dir.join("unet");
         let va = dir.join("vae");
-        let text = clip::ClipText::load(&te, &weights(&te, "model")?)?;
-        let unet = unet::Unet::load(&un, &weights(&un, "diffusion_pytorch_model")?)?;
+        let mut te_t = ops::Tensors::open(&weights(&te, "model")?)?;
+        let mut un_t = ops::Tensors::open(&weights(&un, "diffusion_pytorch_model")?)?;
+        let set = std::sync::Arc::new(lora::Loras::open(loras)?);
+        if !set.is_empty() {
+            te_t.set_lora(set.resolve(lora::Part::Text, &te_t)?);
+            un_t.set_lora(set.resolve(lora::Part::Unet, &un_t)?);
+        }
+        let text = clip::ClipText::load(&te, te_t)?;
+        let unet = unet::Unet::load(&un, un_t)?;
+        if !set.is_empty() {
+            for line in set.report()? {
+                report(&line);
+            }
+        }
         if unet.cross_dim != text.hidden {
             bail!(
                 "text encoder width {} does not match the UNet's cross-attention width {}",
