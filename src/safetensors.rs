@@ -849,6 +849,15 @@ impl ModelFiles {
     }
 
     /// A header metadata value (from the first shard that has it).
+    /// A ggml-quantized tensor (GGUF): its type and raw blocks.
+    pub fn ggml(&self, name: &str) -> Option<Result<(crate::ggml::GgmlType, &[u8])>> {
+        let t = self.info(name)?.ggml?;
+        Some((|| {
+            let kind = crate::ggml::GgmlType::from_id(t).with_context(|| format!("tensor {name}: ggml type {t} is not supported"))?;
+            Ok((kind, self.bytes(name)?))
+        })())
+    }
+
     pub fn metadata(&self, key: &str) -> Option<&str> {
         self.shards.iter().find_map(|s| s.metadata.get(key).map(|v| v.as_str()))
     }
@@ -921,6 +930,9 @@ impl ModelFiles {
     #[allow(clippy::type_complexity)]
     pub fn write_quantized(&self, dir: &Path, metadata: &[(&str, &str)]) -> Result<Vec<(PathBuf, u64)>> {
         use crate::quant::QBLOCK;
+        if self.metadata("format") == Some("gguf") {
+            bail!("--save-quantized does not convert GGUF files; load them directly instead");
+        }
         if self.is_mlx() {
             bail!("--save-quantized does not convert MLX checkpoints; load them directly instead");
         }

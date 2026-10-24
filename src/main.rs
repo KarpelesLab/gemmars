@@ -1186,12 +1186,16 @@ fn run_qwen(args: Args) -> Result<()> {
     let fmt = chat::QwenChat::for_model(&args.model);
     let eos = chat::with_turn_end(fmt, &tok, eos);
     eprintln!(
-        "[loaded Qwen: {} layers, hidden {}, {:.1} GB checkpoint ({}), {:?} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
+        "[loaded Qwen: {} layers, hidden {}, {:.1} GB checkpoint ({}), {} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
         model.cfg.num_hidden_layers,
         model.cfg.hidden_size,
         files.total_bytes() as f64 / 1e9,
         if args.mmap { "mmap" } else { "in RAM" },
-        model.quant,
+        if files.metadata("format") == Some("gguf") {
+            "GGUF".to_string()
+        } else {
+            format!("{:?}", model.quant)
+        },
         model.streamed_bytes() as f64 / 1e9,
         pool::threads(),
         t0.elapsed().as_secs_f64()

@@ -202,6 +202,10 @@ impl<'a> Table<'a> {
     /// otherwise bf16, recording `store_as` for `--save-quantized`.
     pub fn load(files: &'a ModelFiles, full: &str, rows: usize, cols: usize, store_as: Quant) -> Result<Self> {
         files.note_use(full, false, true);
+        if let Some(g) = files.ggml(full) {
+            let (kind, bytes) = g?;
+            return Table::from_gguf(kind, bytes, rows, cols).with_context(|| format!("tensor {full}"));
+        }
         for kind in [QKind::Q8, QKind::Q4] {
             let (qn, sn) = (format!("{full}.{}", kind.suffix()), format!("{full}.{}s", kind.suffix()));
             if let (Some((qf, q_off)), Some((sf, s_off))) = (files.host_tensor(&qn), files.host_tensor(&sn)) {
@@ -259,6 +263,11 @@ impl<'a> Table<'a> {
 /// present (zero-copy), otherwise bf16 quantized to `q` at load (and recorded for `--save-quantized`).
 pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize, q: Quant) -> Result<Lin<'a>> {
     files.note_use(full, true, false);
+    // GGUF: used in its own format whatever `q` asks for.
+    if let Some(g) = files.ggml(full) {
+        let (kind, bytes) = g?;
+        return Lin::from_gguf(kind, bytes, n_out, n_in).with_context(|| format!("tensor {full}"));
+    }
     // SAFETY: the matrix borrows `files` for 'a, which outlives every model holding it.
     if let Some(st) = unsafe { files.quantized(full, n_out, n_in)? } {
         return Ok(match st {
@@ -291,6 +300,16 @@ pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize
 /// shape `[n_exp, n_out * n_in]`); pre-quantized experts are borrowed views of the stored matrix.
 pub fn load_lin_experts<'a>(files: &'a ModelFiles, full: &str, n_exp: usize, n_out: usize, n_in: usize, q: Quant) -> Result<Vec<Lin<'a>>> {
     files.note_use(full, true, false);
+    if let Some(g) = files.ggml(full) {
+        let (kind, bytes) = g?;
+        if !bytes.len().is_multiple_of(n_exp) {
+            bail!("tensor {full}: {} bytes for {n_exp} experts", bytes.len());
+        }
+        return bytes
+            .chunks(bytes.len() / n_exp)
+            .map(|b| Lin::from_gguf(kind, b, n_out, n_in).with_context(|| format!("tensor {full}")))
+            .collect();
+    }
     let (rows, bpr) = (n_out, n_in / crate::quant::QBLOCK);
     // SAFETY: the stored matrix borrows `files` for 'a (zero-copy), and so do its per-expert views.
     if let Some(st) = unsafe { files.quantized(full, n_exp, n_out * n_in)? } {
