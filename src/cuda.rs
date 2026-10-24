@@ -98,6 +98,12 @@ __device__ __forceinline__ void load8(Q8W w, unsigned int n_in, unsigned int row
     const signed char* p = w.q + (size_t)row * n_in + b * 32 + k0;
     for (int i = 0; i < 8; i++) out[i] = (float)p[i] * d;
 }
+struct F32W { const float* w; };
+__device__ __forceinline__ void load8(F32W w, unsigned int n_in, unsigned int row, unsigned int b, unsigned int k0, float* out) {
+    const float4* p = (const float4*)(w.w + (size_t)row * n_in + b * 32 + k0);
+    float4 a = p[0], c = p[1];
+    out[0] = a.x; out[1] = a.y; out[2] = a.z; out[3] = a.w; out[4] = c.x; out[5] = c.y; out[6] = c.z; out[7] = c.w;
+}
 __device__ __forceinline__ void load8(BfW w, unsigned int n_in, unsigned int row, unsigned int b, unsigned int k0, float* out) {
     const unsigned short* p = w.w + (size_t)row * n_in + b * 32 + k0;
     for (int i = 0; i < 8; i++) out[i] = bf16f(p[i]);
@@ -114,9 +120,11 @@ struct XDense {
 };
 // Convolution as an implicit GEMM: K runs over (ky, kx, ci) with cin % 32 == 0, so block b is one
 // tap's contiguous channel slice of the input pixel (zeros outside the image).
-struct ConvP { unsigned int h, w, cin, k, stride, ow, npix, pad; };
+// mode: 0 plain, 1 group norm (stats per group of cpg channels), 2 layer norm (per input pixel);
+// st holds (mean, 1/std), gb holds gamma[cin] then beta[cin].
+struct ConvP { unsigned int h, w, cin, k, stride, ow, npix, pad, mode, silu, cpg, _p; };
 struct XConv {
-    const float* x; ConvP p;
+    const float* x; ConvP p; const float2* st; const float* gb;
     __device__ __forceinline__ void load8(unsigned int tok, unsigned int b, unsigned int k0, float* out) const {
         unsigned int kk = b * 32, tap = kk / p.cin, ci0 = kk - tap * p.cin;
         int ky = (int)(tap / p.k), kx = (int)(tap % p.k);
@@ -126,6 +134,15 @@ struct XConv {
             const float4* s = (const float4*)(x + ((size_t)iy * p.w + ix) * p.cin + ci0 + k0);
             float4 a = s[0], c = s[1];
             out[0] = a.x; out[1] = a.y; out[2] = a.z; out[3] = a.w; out[4] = c.x; out[5] = c.y; out[6] = c.z; out[7] = c.w;
+            if (p.mode != 0) {
+                unsigned int pin = (unsigned int)iy * p.w + (unsigned int)ix;
+                for (int i = 0; i < 8; i++) {
+                    unsigned int ch = ci0 + k0 + i;
+                    float2 m = p.mode == 1 ? st[ch / p.cpg] : st[pin];
+                    float yv = (out[i] - m.x) * m.y * gb[ch] + gb[p.cin + ch];
+                    out[i] = p.silu ? yv / (1.f + __expf(-yv)) : yv;
+                }
+            }
         } else {
             for (int i = 0; i < 8; i++) out[i] = 0.f;
         }
@@ -174,14 +191,66 @@ extern "C" __global__ void gemm_q8(const signed char* q, const float* s, const f
 extern "C" __global__ void gemm_bf(const unsigned short* wp, const void* unused, const float* x, float* y, unsigned int n_out, unsigned int n_in) {
     BfW w = { wp }; XDense xl = { x, n_in }; gemm_body(w, xl, y, n_out, n_in);
 }
-extern "C" __global__ void conv_q4(const unsigned char* q, const unsigned short* s, const float* x, float* y, unsigned int n_out, unsigned int n_in, ConvP p) {
-    Q4W w = { q, s }; XConv xl = { x, p }; gemm_body(w, xl, y, n_out, n_in);
+extern "C" __global__ void gemm_f32(const float* wp, const void* unused, const float* x, float* y, unsigned int n_out, unsigned int n_in) {
+    F32W w = { wp }; XDense xl = { x, n_in }; gemm_body(w, xl, y, n_out, n_in);
 }
-extern "C" __global__ void conv_q8(const signed char* q, const float* s, const float* x, float* y, unsigned int n_out, unsigned int n_in, ConvP p) {
-    Q8W w = { q, s }; XConv xl = { x, p }; gemm_body(w, xl, y, n_out, n_in);
+extern "C" __global__ void conv_q4(const unsigned char* q, const unsigned short* s, const float* x, float* y, unsigned int n_out, unsigned int n_in, ConvP p, const float2* st, const float* gb) {
+    Q4W w = { q, s }; XConv xl = { x, p, st, gb }; gemm_body(w, xl, y, n_out, n_in);
 }
-extern "C" __global__ void conv_bf(const unsigned short* wp, const void* unused, const float* x, float* y, unsigned int n_out, unsigned int n_in, ConvP p) {
-    BfW w = { wp }; XConv xl = { x, p }; gemm_body(w, xl, y, n_out, n_in);
+extern "C" __global__ void conv_q8(const signed char* q, const float* s, const float* x, float* y, unsigned int n_out, unsigned int n_in, ConvP p, const float2* st, const float* gb) {
+    Q8W w = { q, s }; XConv xl = { x, p, st, gb }; gemm_body(w, xl, y, n_out, n_in);
+}
+extern "C" __global__ void conv_bf(const unsigned short* wp, const void* unused, const float* x, float* y, unsigned int n_out, unsigned int n_in, ConvP p, const float2* st, const float* gb) {
+    BfW w = { wp }; XConv xl = { x, p, st, gb }; gemm_body(w, xl, y, n_out, n_in);
+}
+
+// ---- normalization statistics and softmax (two passes: mean, then mean squared deviation) ----
+__device__ __forceinline__ float warp_sum(float v) { for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o); return v; }
+__device__ __forceinline__ float warp_max(float v) { for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o)); return v; }
+__device__ __forceinline__ float block_sum256(float v, float* red) {
+    red[threadIdx.x] = v;
+    __syncthreads();
+    for (unsigned int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o]; __syncthreads(); }
+    float t = red[0];
+    __syncthreads();
+    return t;
+}
+// One 256-thread block per group.
+extern "C" __global__ void group_stats(const float* x, float2* st, unsigned int n, unsigned int c, unsigned int groups, float eps) {
+    __shared__ float red[256];
+    unsigned int g = blockIdx.x, cpg = c / groups;
+    size_t total = (size_t)n * cpg;
+    float s = 0.f;
+    for (size_t i = threadIdx.x; i < total; i += 256) s += x[(i / cpg) * c + g * cpg + i % cpg];
+    float mean = block_sum256(s, red) / (float)total;
+    float v = 0.f;
+    for (size_t i = threadIdx.x; i < total; i += 256) { float d = x[(i / cpg) * c + g * cpg + i % cpg] - mean; v += d * d; }
+    float var = block_sum256(v, red) / (float)total;
+    if (threadIdx.x == 0) st[g] = make_float2(mean, rsqrtf(var + eps));
+}
+// One warp per row.
+extern "C" __global__ void row_stats(const float* x, float2* st, unsigned int c, float eps) {
+    const float* row = x + (size_t)blockIdx.x * c;
+    float s = 0.f;
+    for (unsigned int i = threadIdx.x; i < c; i += 32) s += row[i];
+    float mean = warp_sum(s) / (float)c;
+    float v = 0.f;
+    for (unsigned int i = threadIdx.x; i < c; i += 32) { float d = row[i] - mean; v += d * d; }
+    float var = warp_sum(v) / (float)c;
+    if (threadIdx.x == 0) st[blockIdx.x] = make_float2(mean, rsqrtf(var + eps));
+}
+// Row softmax of scaled scores in place, one warp per row; padding columns become 0.
+extern "C" __global__ void softmax_rows(float* s, unsigned int cols, unsigned int ld, float scale, unsigned int causal) {
+    unsigned int r = blockIdx.x;
+    float* row = s + (size_t)r * ld;
+    unsigned int lim = causal ? min(r + 1, cols) : cols;
+    float m = -INFINITY;
+    for (unsigned int i = threadIdx.x; i < lim; i += 32) m = fmaxf(m, row[i] * scale);
+    m = warp_max(m);
+    float sum = 0.f;
+    for (unsigned int i = threadIdx.x; i < lim; i += 32) { float e = expf(row[i] * scale - m); row[i] = e; sum += e; }
+    float inv = 1.f / warp_sum(sum);
+    for (unsigned int i = threadIdx.x; i < ld; i += 32) row[i] = i < lim ? row[i] * inv : 0.f;
 }
 "#;
 
@@ -195,6 +264,15 @@ struct Staging {
     x_cap: usize,
     y: u64,
     y_cap: usize,
+    /// Fused-norm statistics and gamma/beta; attention operands (Q, K, transposed V, one head's
+    /// scores, outputs). Each is (device pointer, capacity in bytes).
+    stats: (u64, usize),
+    gb: (u64, usize),
+    aq: (u64, usize),
+    ak: (u64, usize),
+    av: (u64, usize),
+    asc: (u64, usize),
+    ao: (u64, usize),
 }
 
 #[derive(Default)]
@@ -212,6 +290,8 @@ pub struct CudaBackend {
     funcs: [*mut c_void; 3],
     /// Implicit-GEMM convolutions, same order.
     conv_funcs: [*mut c_void; 3],
+    /// gemm_f32, group_stats, row_stats, softmax_rows.
+    aux_funcs: [*mut c_void; 4],
     staging: Mutex<Staging>,
     stats: Stats,
     name: String,
@@ -293,6 +373,14 @@ impl CudaBackend {
                 "cuModuleGetFunction",
             )?;
         }
+        let mut aux_funcs = [std::ptr::null_mut(); 4];
+        for (i, fname) in [c"gemm_f32", c"group_stats", c"row_stats", c"softmax_rows"].iter().enumerate() {
+            check(
+                &cu,
+                unsafe { cu.cuModuleGetFunction(&mut aux_funcs[i], module, fname.as_ptr()) },
+                "cuModuleGetFunction",
+            )?;
+        }
         let mut conv_funcs = [std::ptr::null_mut(); 3];
         for (i, fname) in [c"conv_bf", c"conv_q8", c"conv_q4"].iter().enumerate() {
             check(
@@ -306,11 +394,19 @@ impl CudaBackend {
             _module: module,
             funcs,
             conv_funcs,
+            aux_funcs,
             staging: Mutex::new(Staging {
                 x: 0,
                 x_cap: 0,
                 y: 0,
                 y_cap: 0,
+                stats: (0, 0),
+                gb: (0, 0),
+                aq: (0, 0),
+                ak: (0, 0),
+                av: (0, 0),
+                asc: (0, 0),
+                ao: (0, 0),
             }),
             stats: Stats::default(),
             name: format!("cuda (sm_{major}{minor})"),
@@ -333,6 +429,55 @@ impl CudaBackend {
             return None;
         }
         Some(d)
+    }
+
+    /// Makes a device buffer at least `need` bytes long.
+    fn grow(&self, b: &mut (u64, usize), need: usize) -> bool {
+        if b.1 >= need && b.0 != 0 {
+            return true;
+        }
+        if b.0 != 0 {
+            unsafe { self.cu.cuMemFree_v2(b.0) };
+            *b = (0, 0);
+        }
+        let cap = need.max(256) * 2;
+        if unsafe { self.cu.cuMemAlloc_v2(&mut b.0, cap) } != 0 {
+            b.0 = 0;
+            return false;
+        }
+        b.1 = cap;
+        true
+    }
+
+    /// Launches `f` on the default stream; `params` point at each kernel argument.
+    fn launch(&self, f: *mut c_void, grid: (u32, u32), block: u32, params: &mut [*mut c_void]) -> bool {
+        let rc = unsafe {
+            self.cu.cuLaunchKernel(
+                f,
+                grid.0,
+                grid.1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            let _ = self.check(rc, "cuLaunchKernel").map_err(|e| eprintln!("[cuda: {e}]"));
+        }
+        rc == 0
+    }
+
+    fn htod<T>(&self, dst: u64, src: &[T]) -> bool {
+        unsafe {
+            self.cu
+                .cuMemcpyHtoD_v2(dst, src.as_ptr() as *const c_void, std::mem::size_of_val(src))
+                == 0
+        }
     }
 
     fn ensure_staging(&self, st: &mut Staging, x_bytes: usize, y_bytes: usize) -> bool {
@@ -430,12 +575,18 @@ impl Backend for CudaBackend {
     }
 
     fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {
-        if norm.is_some() {
-            return false;
-        }
+        use crate::gpu::NormKind;
         let n_in = g.k * g.k * g.cin;
         let t = g.oh * g.ow;
-        if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(TILE) || x.len() < g.h * g.w * g.cin || job.y.len() < t * job.n_out {
+        let npx = g.h * g.w;
+        if !g.cin.is_multiple_of(32) || !job.n_out.is_multiple_of(TILE) || x.len() < npx * g.cin || job.y.len() < t * job.n_out {
+            return false;
+        }
+        if let Some(n) = norm
+            && (n.gamma.len() != g.cin
+                || n.beta.len() != g.cin
+                || matches!(n.kind, NormKind::Group(gr) if gr == 0 || !g.cin.is_multiple_of(gr)))
+        {
             return false;
         }
         let Some(cw) = job.dev.downcast_ref::<CudaWeightBox>() else {
@@ -444,14 +595,60 @@ impl Backend for CudaBackend {
         let cw = &cw.0;
         let t_pad = t.div_ceil(TILE) * TILE;
         let mut st = self.staging.lock().unwrap();
-        if !self.ensure_staging(&mut st, g.h * g.w * g.cin * 4, t_pad * job.n_out * 4) {
+        let st = &mut *st;
+        if !self.ensure_staging(st, npx * g.cin * 4, t_pad * job.n_out * 4) {
+            return false;
+        }
+        let n_stats = match norm.map(|n| n.kind) {
+            Some(NormKind::Group(gr)) => gr,
+            Some(NormKind::Layer) => npx,
+            None => 1,
+        };
+        if !self.grow(&mut st.stats, n_stats * 8) || !self.grow(&mut st.gb, 2 * g.cin * 4) {
             return false;
         }
         let t0 = Instant::now();
-        if unsafe { self.cu.cuMemcpyHtoD_v2(st.x, x.as_ptr() as *const c_void, g.h * g.w * g.cin * 4) } != 0 {
+        if !self.htod(st.x, &x[..npx * g.cin]) {
             return false;
         }
+        if let Some(n) = norm {
+            let gb: Vec<f32> = n.gamma.iter().chain(n.beta).copied().collect();
+            if !self.htod(st.gb.0, &gb) {
+                return false;
+            }
+        }
         let t1 = Instant::now();
+        // Statistics first; launches on one stream run in order.
+        if let Some(n) = norm {
+            let (mut px, mut sp, mut eps) = (st.x, st.stats.0, n.eps);
+            let ok = match n.kind {
+                NormKind::Group(gr) => {
+                    let (mut nn, mut cc, mut gg) = (npx as u32, g.cin as u32, gr as u32);
+                    let mut p: [*mut c_void; 6] = [
+                        &mut px as *mut u64 as *mut c_void,
+                        &mut sp as *mut u64 as *mut c_void,
+                        &mut nn as *mut u32 as *mut c_void,
+                        &mut cc as *mut u32 as *mut c_void,
+                        &mut gg as *mut u32 as *mut c_void,
+                        &mut eps as *mut f32 as *mut c_void,
+                    ];
+                    self.launch(self.aux_funcs[1], (gr as u32, 1), 256, &mut p)
+                }
+                NormKind::Layer => {
+                    let mut cc = g.cin as u32;
+                    let mut p: [*mut c_void; 4] = [
+                        &mut px as *mut u64 as *mut c_void,
+                        &mut sp as *mut u64 as *mut c_void,
+                        &mut cc as *mut u32 as *mut c_void,
+                        &mut eps as *mut f32 as *mut c_void,
+                    ];
+                    self.launch(self.aux_funcs[2], (npx as u32, 1), 32, &mut p)
+                }
+            };
+            if !ok {
+                return false;
+            }
+        }
         let fi = match job.w {
             WeightRef::Bf16(_) => 0,
             WeightRef::Q8(_) => 1,
@@ -467,6 +664,10 @@ impl Backend for CudaBackend {
             ow: u32,
             npix: u32,
             pad: u32,
+            mode: u32,
+            silu: u32,
+            cpg: u32,
+            _p: u32,
         }
         let mut p = ConvP {
             h: g.h as u32,
@@ -477,10 +678,21 @@ impl Backend for CudaBackend {
             ow: g.ow as u32,
             npix: t as u32,
             pad: (g.k / 2) as u32,
+            mode: match norm.map(|n| n.kind) {
+                None => 0,
+                Some(NormKind::Group(_)) => 1,
+                Some(NormKind::Layer) => 2,
+            },
+            silu: norm.is_some_and(|n| n.silu) as u32,
+            cpg: match norm.map(|n| n.kind) {
+                Some(NormKind::Group(gr)) => (g.cin / gr) as u32,
+                _ => 1,
+            },
+            _p: 0,
         };
-        let (mut p_w, mut p_s, mut p_x, mut p_y) = (cw.data, cw.scales, st.x, st.y);
+        let (mut p_w, mut p_s, mut p_x, mut p_y, mut p_st, mut p_gb) = (cw.data, cw.scales, st.x, st.y, st.stats.0, st.gb.0);
         let (mut n_out, mut n_in_u) = (job.n_out as u32, n_in as u32);
-        let mut params: [*mut c_void; 7] = [
+        let mut params: [*mut c_void; 9] = [
             &mut p_w as *mut u64 as *mut c_void,
             &mut p_s as *mut u64 as *mut c_void,
             &mut p_x as *mut u64 as *mut c_void,
@@ -488,24 +700,15 @@ impl Backend for CudaBackend {
             &mut n_out as *mut u32 as *mut c_void,
             &mut n_in_u as *mut u32 as *mut c_void,
             &mut p as *mut ConvP as *mut c_void,
+            &mut p_st as *mut u64 as *mut c_void,
+            &mut p_gb as *mut u64 as *mut c_void,
         ];
-        let rc = unsafe {
-            self.cu.cuLaunchKernel(
-                self.conv_funcs[fi],
-                (job.n_out / TILE) as u32,
-                (t_pad / TILE) as u32,
-                1,
-                256,
-                1,
-                1,
-                0,
-                std::ptr::null_mut(),
-                params.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
-        };
-        if rc != 0 {
-            let _ = self.check(rc, "cuLaunchKernel").map_err(|e| eprintln!("[cuda: {e}]"));
+        if !self.launch(
+            self.conv_funcs[fi],
+            ((job.n_out / TILE) as u32, (t_pad / TILE) as u32),
+            256,
+            &mut params,
+        ) {
             return false;
         }
         if unsafe { self.cu.cuCtxSynchronize() } != 0 {
@@ -514,6 +717,125 @@ impl Backend for CudaBackend {
         let t2 = Instant::now();
         if unsafe { self.cu.cuMemcpyDtoH_v2(job.y.as_mut_ptr() as *mut c_void, st.y, t * job.n_out * 4) } != 0 {
             return false;
+        }
+        self.stats.calls.fetch_add(1, Ordering::Relaxed);
+        self.stats.copy_in_ns.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+        self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+        self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        true
+    }
+
+    fn attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        tq: usize,
+        tk: usize,
+        heads: usize,
+        dh: usize,
+        causal: bool,
+        out: &mut [f32],
+    ) -> bool {
+        let d = heads * dh;
+        if q.len() < tq * d || k.len() < tk * d || v.len() < tk * d || out.len() < tq * d || tq == 0 || tk == 0 {
+            return false;
+        }
+        let (dhp, dho, tkp, tqp) = (
+            dh.next_multiple_of(32),
+            dh.next_multiple_of(64),
+            tk.next_multiple_of(64),
+            tq.next_multiple_of(64),
+        );
+        // Per-head operands, zero padded (padding contributes nothing to any product).
+        let mut qh = vec![0f32; heads * tqp * dhp];
+        let mut kh = vec![0f32; heads * tkp * dhp];
+        let mut vt = vec![0f32; heads * dho * tkp];
+        for h in 0..heads {
+            for i in 0..tq {
+                qh[(h * tqp + i) * dhp..][..dh].copy_from_slice(&q[i * d + h * dh..][..dh]);
+            }
+            for j in 0..tk {
+                kh[(h * tkp + j) * dhp..][..dh].copy_from_slice(&k[j * d + h * dh..][..dh]);
+                for c in 0..dh {
+                    vt[(h * dho + c) * tkp + j] = v[j * d + h * dh + c];
+                }
+            }
+        }
+        let mut st = self.staging.lock().unwrap();
+        let st = &mut *st;
+        let ok = self.grow(&mut st.aq, qh.len() * 4)
+            && self.grow(&mut st.ak, kh.len() * 4)
+            && self.grow(&mut st.av, vt.len() * 4)
+            && self.grow(&mut st.asc, tqp * tkp * 4)
+            && self.grow(&mut st.ao, heads * tqp * dho * 4);
+        if !ok {
+            return false;
+        }
+        let t0 = Instant::now();
+        if !self.htod(st.aq.0, &qh) || !self.htod(st.ak.0, &kh) || !self.htod(st.av.0, &vt) {
+            return false;
+        }
+        let t1 = Instant::now();
+        let (mut cols, mut ld, mut scale, mut causal_u) = (tk as u32, tkp as u32, 1.0 / (dh as f32).sqrt(), causal as u32);
+        for h in 0..heads {
+            // Scores: keys as the "weights" ([tkp, dhp]), queries as the input.
+            let (mut w, mut un, mut x, mut y) = (
+                st.ak.0 + (h * tkp * dhp * 4) as u64,
+                0u64,
+                st.aq.0 + (h * tqp * dhp * 4) as u64,
+                st.asc.0,
+            );
+            let (mut no, mut ni) = (tkp as u32, dhp as u32);
+            let mut p: [*mut c_void; 6] = [
+                &mut w as *mut u64 as *mut c_void,
+                &mut un as *mut u64 as *mut c_void,
+                &mut x as *mut u64 as *mut c_void,
+                &mut y as *mut u64 as *mut c_void,
+                &mut no as *mut u32 as *mut c_void,
+                &mut ni as *mut u32 as *mut c_void,
+            ];
+            if !self.launch(self.aux_funcs[0], ((tkp / TILE) as u32, (tqp / TILE) as u32), 256, &mut p) {
+                return false;
+            }
+            let mut sp = st.asc.0;
+            let mut ps: [*mut c_void; 5] = [
+                &mut sp as *mut u64 as *mut c_void,
+                &mut cols as *mut u32 as *mut c_void,
+                &mut ld as *mut u32 as *mut c_void,
+                &mut scale as *mut f32 as *mut c_void,
+                &mut causal_u as *mut u32 as *mut c_void,
+            ];
+            if !self.launch(self.aux_funcs[3], (tqp as u32, 1), 32, &mut ps) {
+                return false;
+            }
+            // Output: transposed values as the "weights" ([dho, tkp]), probabilities as the input.
+            let (mut w, mut x, mut y) = (st.av.0 + (h * dho * tkp * 4) as u64, st.asc.0, st.ao.0 + (h * tqp * dho * 4) as u64);
+            let (mut no, mut ni) = (dho as u32, tkp as u32);
+            let mut p: [*mut c_void; 6] = [
+                &mut w as *mut u64 as *mut c_void,
+                &mut un as *mut u64 as *mut c_void,
+                &mut x as *mut u64 as *mut c_void,
+                &mut y as *mut u64 as *mut c_void,
+                &mut no as *mut u32 as *mut c_void,
+                &mut ni as *mut u32 as *mut c_void,
+            ];
+            if !self.launch(self.aux_funcs[0], ((dho / TILE) as u32, (tqp / TILE) as u32), 256, &mut p) {
+                return false;
+            }
+        }
+        if unsafe { self.cu.cuCtxSynchronize() } != 0 {
+            return false;
+        }
+        let t2 = Instant::now();
+        let mut o = vec![0f32; heads * tqp * dho];
+        if unsafe { self.cu.cuMemcpyDtoH_v2(o.as_mut_ptr() as *mut c_void, st.ao.0, o.len() * 4) } != 0 {
+            return false;
+        }
+        for h in 0..heads {
+            for i in 0..tq {
+                out[i * d + h * dh..][..dh].copy_from_slice(&o[(h * tqp + i) * dho..][..dh]);
+            }
         }
         self.stats.calls.fetch_add(1, Ordering::Relaxed);
         self.stats.copy_in_ns.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
