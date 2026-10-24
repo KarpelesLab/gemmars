@@ -98,8 +98,9 @@ Any BERT, RoBERTa or XLM-RoBERTa sentence-transformers model should work the sam
 the three above, all-MiniLM-L6-v2, paraphrase-multilingual-MiniLM-L12-v2, bge-small-en-v1.5,
 multilingual-e5-small and mxbai-embed-large-v1 were checked (cosine >= 0.99999 to the reference).
 E5 models expect a `query: ` / `passage: ` prefix in the text itself (they define no prompts).
-MPNet (all-mpnet-base-v2), ModernBERT, NomicBERT and Qwen2-based embedders are other
-architectures and are not supported yet.
+MPNet (all-mpnet-base-v2: BERT plus a shared T5-style relative position bias) is supported too,
+cosine >= 0.999991 to the reference (0.999996 against bf16-rounded reference weights).
+ModernBERT, NomicBERT and Qwen2-based embedders are other architectures and are not supported yet.
 
 Two details that are easy to get wrong: transformers halves EmbeddingGemma's sliding window for
 bidirectional attention (512 in the config means keys less than 257 positions away on either

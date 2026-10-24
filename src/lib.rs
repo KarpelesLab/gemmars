@@ -25,6 +25,7 @@ pub mod media;
 pub mod metal;
 pub mod mm_config;
 pub mod model;
+pub mod mpnet;
 pub mod platform;
 pub mod png;
 pub mod pool;

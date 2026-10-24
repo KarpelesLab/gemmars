@@ -56,20 +56,20 @@ pub fn is_bert(model_type: &str) -> bool {
     matches!(model_type, "bert" | "roberta" | "xlm-roberta" | "camembert")
 }
 
-struct LayerNorm {
+pub(crate) struct LayerNorm {
     w: Vec<f32>,
     b: Vec<f32>,
 }
 
 impl LayerNorm {
-    fn load(files: &ModelFiles, p: &str, h: usize) -> Result<Self> {
+    pub(crate) fn load(files: &ModelFiles, p: &str, h: usize) -> Result<Self> {
         let (w, b) = (files.f32(&format!("{p}.weight"))?, files.f32(&format!("{p}.bias"))?);
         if w.len() != h || b.len() != h {
             bail!("{p}: expected {h} values");
         }
         Ok(Self { w, b })
     }
-    fn apply_rows(&self, x: &mut [f32], eps: f32) {
+    pub(crate) fn apply_rows(&self, x: &mut [f32], eps: f32) {
         let h = self.w.len();
         for_chunks(x, h, x.len() > 4 * h, |_, r| {
             let mean = r.iter().sum::<f32>() / h as f32;
@@ -83,15 +83,15 @@ impl LayerNorm {
 }
 
 /// A linear layer with bias.
-struct Dense<'a> {
-    w: Lin<'a>,
+pub(crate) struct Dense<'a> {
+    pub(crate) w: Lin<'a>,
     b: Vec<f32>,
     n_out: usize,
     n_in: usize,
 }
 
 impl<'a> Dense<'a> {
-    fn load(files: &'a ModelFiles, p: &str, n_out: usize, n_in: usize, q: Quant) -> Result<Self> {
+    pub(crate) fn load(files: &'a ModelFiles, p: &str, n_out: usize, n_in: usize, q: Quant) -> Result<Self> {
         Ok(Self {
             w: load_lin(files, &format!("{p}.weight"), n_out, n_in, q)?,
             b: files.f32(&format!("{p}.bias"))?,
@@ -99,10 +99,10 @@ impl<'a> Dense<'a> {
             n_in,
         })
     }
-    fn add_bias(&self, y: &mut [f32]) {
+    pub(crate) fn add_bias(&self, y: &mut [f32]) {
         for_chunks(y, self.n_out, y.len() > 4 * self.n_out, |_, r| add_inplace(r, &self.b));
     }
-    fn forward(&self, x: &[f32], t: usize, y: &mut [f32]) {
+    pub(crate) fn forward(&self, x: &[f32], t: usize, y: &mut [f32]) {
         linear(&self.w, self.n_out, self.n_in, x, t, y);
         self.add_bias(y);
     }
@@ -131,7 +131,7 @@ pub struct BertModel<'a> {
 
 /// Exact GELU, `x * Phi(x)`, with erf from Abramowitz & Stegun 7.1.26 (error < 1.5e-7).
 #[inline]
-fn gelu_erf(x: f32) -> f32 {
+pub(crate) fn gelu_erf(x: f32) -> f32 {
     let z = x * std::f32::consts::FRAC_1_SQRT_2;
     let a = z.abs();
     let t = 1.0 / (1.0 + 0.327_591_1 * a);

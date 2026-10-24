@@ -7,6 +7,7 @@
 use crate::bert::{BertConfig, BertModel};
 use crate::config::{QwenConfig, TextConfig};
 use crate::model::{Model, Quant};
+use crate::mpnet::{MpnetConfig, MpnetModel};
 use crate::qwen::QwenModel;
 use crate::safetensors::{ModelFiles, SafeTensors};
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,6 +18,7 @@ enum Backbone<'a> {
     Gemma(Box<Model<'a>>),
     Qwen(Box<QwenModel<'a>>),
     Bert(Box<BertModel<'a>>),
+    Mpnet(Box<MpnetModel<'a>>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +155,8 @@ impl<'a> Embedder<'a> {
             Backbone::Gemma(Box::new(Model::load(TextConfig::load(dir)?, files, quant)?))
         } else if crate::bert::is_bert(&model_type) {
             Backbone::Bert(Box::new(BertModel::load(BertConfig::load(dir)?, files, quant)?))
+        } else if model_type == "mpnet" {
+            Backbone::Mpnet(Box::new(MpnetModel::load(MpnetConfig::load(dir)?, files, quant)?))
         } else {
             bail!("model_type {model_type} is not supported for embeddings");
         };
@@ -160,6 +164,7 @@ impl<'a> Embedder<'a> {
             Backbone::Gemma(m) => m.cfg.hidden_size,
             Backbone::Qwen(m) => m.cfg.hidden_size,
             Backbone::Bert(m) => m.cfg.hidden_size,
+            Backbone::Mpnet(m) => m.cfg.hidden_size,
         };
 
         // Modules after the transformer, in order.
@@ -285,6 +290,7 @@ impl<'a> Embedder<'a> {
             (None, Backbone::Gemma(m)) => m.cfg.hidden_size,
             (None, Backbone::Qwen(m)) => m.cfg.hidden_size,
             (None, Backbone::Bert(m)) => m.cfg.hidden_size,
+            (None, Backbone::Mpnet(m)) => m.cfg.hidden_size,
         }
     }
 
@@ -312,6 +318,7 @@ impl<'a> Embedder<'a> {
                 m.forward_hidden_mm(&mut s, ids, &[])
             }
             Backbone::Bert(m) => m.forward(ids),
+            Backbone::Mpnet(m) => m.forward(ids),
         }
     }
 
