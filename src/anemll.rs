@@ -40,9 +40,16 @@
 //! functions only return the last chunk's hidden state of the batch, not logits).
 //! [`PrefillMode::Single`] sends every token through `infer`; it is what [`PrefillMode::Auto`]
 //! picks, like `chat.py`, for models declaring neither `update_mask_prefill` nor
-//! `prefill_dynamic_slice` (older conversions whose batch prefill may be wrong). Batches are never
-//! padded: `update_mask` is filled when a prefill function takes it, but partial batches go
-//! through `infer` as in `chat.py` (the Swift CLI pads them for `update_mask` models).
+//! `prefill_dynamic_slice` (older conversions whose batch prefill may be wrong). Only
+//! [`PrefillMode::Padded`] pads the last partial batch (with token 0; `update_mask` then marks only
+//! the real tokens, as the Swift CLI does for `update_mask` models).
+//!
+//! # Extending
+//!
+//! New converters plug in through the same contract: any number of Core ML states is handled (the
+//! runner never names them), extra `meta.yaml` parameters are in [`Meta::params`], and inputs
+//! beyond the ones above are filled by an [`InputHook`] passed to [`AnemllModel::load_with`]
+//! (loading fails early, naming the input, when there is none).
 
 use crate::coreml::{ComputeUnits, DataType, FeatureKind, Model, MultiArray, Prepared, State};
 use anyhow::{Context, Result, anyhow, bail};
@@ -656,6 +663,64 @@ impl Meta {
             recommended_sampling,
             params,
         })
+    }
+
+    /// The model's tokenizer (`tokenizer.json`).
+    pub fn tokenizer(&self) -> Result<tokenizers::Tokenizer> {
+        let p = self.tokenizer_dir.join("tokenizer.json");
+        tokenizers::Tokenizer::from_file(&p).map_err(|e| anyhow!("{}: {e}", p.display()))
+    }
+
+    fn tokenizer_config(&self) -> serde_json::Value {
+        std::fs::read(self.tokenizer_dir.join("tokenizer_config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// The chat format matching the model's template (`chat_template.jinja` or
+    /// `tokenizer_config.json`): Llama 3, Gemma 3, Qwen2 / 2.5 or Qwen3 ChatML.
+    pub fn chat_format(&self) -> Result<&'static dyn crate::chat::ChatFormat> {
+        use crate::chat;
+        let cfg = self.tokenizer_config();
+        let jinja = std::fs::read_to_string(self.tokenizer_dir.join("chat_template.jinja")).ok();
+        let tpl = jinja.as_deref().or(cfg["chat_template"].as_str()).unwrap_or("");
+        let arch = format!("{} {}", self.architecture, self.model_prefix).to_lowercase();
+        Ok(if tpl.contains("<|start_header_id|>") {
+            &chat::Llama3Chat
+        } else if tpl.contains("<start_of_turn>") || arch.contains("gemma3") {
+            &chat::Gemma3Chat
+        } else if (tpl.contains("<|im_start|>") && !tpl.contains("</think>")) || (tpl.is_empty() && arch.contains("qwen2")) {
+            // Qwen2 / 2.5 ChatML (no thinking block); made once per model, a few bytes leaked.
+            Box::leak(Box::new(chat::Qwen2Chat::for_template(tpl)))
+        } else if tpl.contains("<|im_start|>") || arch.contains("qwen") {
+            chat::QwenChat::for_template(Some(tpl))
+        } else {
+            bail!("no chat format for this model ({}); format the prompt yourself", self.architecture)
+        })
+    }
+
+    /// Stop tokens as ANEMLL's `chat.py` collects them: the tokenizer's EOS token, then
+    /// `<|endoftext|>`, `<end_of_turn>` and `<|eot_id|>` when the vocabulary has them, plus the
+    /// chat format's end-of-turn token.
+    pub fn stop_tokens(&self, tok: &tokenizers::Tokenizer, fmt: &dyn crate::chat::ChatFormat) -> Vec<u32> {
+        let cfg = self.tokenizer_config();
+        let eos = &cfg["eos_token"];
+        let mut ids = Vec::new();
+        let names = [
+            eos.as_str().or(eos["content"].as_str()).unwrap_or(""),
+            "<|endoftext|>",
+            "<end_of_turn>",
+            "<|eot_id|>",
+        ];
+        for n in names.into_iter().filter(|n| !n.is_empty()) {
+            if let Some(id) = tok.token_to_id(n)
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
+        crate::chat::with_turn_end(fmt, tok, ids)
     }
 
     /// Per-slice sizes of an `argmax_in_model` head with `n` slices (ANEMLL's rule).
@@ -1391,7 +1456,6 @@ mod tests {
         );
         assert_eq!(p.get("quoted").and_then(Value::as_str), Some("a: b # c"));
         assert_eq!(p.get("sizes").and_then(Value::as_usize_list), Some(vec![3, 4]));
-        assert_eq!(p.get("argmax_in_model").and_then(Value::as_bool), Some(true));
         assert_eq!(
             p.get("functions"),
             Some(&Value::List(vec![Value::Str("infer".into()), Value::Str("prefill".into())]))

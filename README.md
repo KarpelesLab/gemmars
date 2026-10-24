@@ -44,6 +44,7 @@ identical tokens.
 | BAAI/bge-small-en-v1.5, intfloat/multilingual-e5-small, mixedbread-ai/mxbai-embed-large-v1 | 33M-335M | 0.13-1.3 GB | embeddings (BERT / XLM-R); match sentence-transformers |
 | stabilityai/sd-turbo | 1.3B | 2.6 GB (fp16) | text-to-image in one step; matches diffusers (see Image generation) |
 | stable-diffusion-v1-5/stable-diffusion-v1-5 (and SD 1.x / 2.x fine-tunes) | 1.1B | 2.0 GB (fp16) | text-to-image; matches diffusers |
+| anemll/* (ANEMLL Core ML: Qwen3, Qwen2.5, Gemma 3, Llama 3.2, ...) | 0.27B-1.7B tested | 0.3-1.5 GB (LUT6) | Apple Neural Engine via Core ML; same tokens as ANEMLL's runtime (see [Core ML](#core-ml--apple-neural-engine)) |
 
 ### Qwen3.5 / Qwen3.8
 
@@ -559,6 +560,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 | Platform | Compute | Status |
 |---|---|---|
 | Apple Silicon (macOS, iOS) | NEON kernels + Metal GEMM for prefill | measured, bit-identical logits to the CPU path; iOS: runs in the Simulator (CPU and Metal; `ios/`) |
+| Apple Neural Engine (macOS 15 / iOS 18) | Core ML, for ANEMLL-converted models | measured on macOS; builds for iOS; see [Core ML](#core-ml--apple-neural-engine) |
 | x86-64 (Linux, Windows, macOS) | AVX2 + FMA kernels (bf16, Q8 via `maddubs`, Q4), scalar fallback below AVX2 | compiles for all three; the kernel tests pass on the scalar fallback under Rosetta (which exposes no AVX), so the AVX2 kernels themselves are not yet executed anywhere |
 | Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled GEMM (`cuda.rs`) | compile-checked only, not yet run on NVIDIA hardware |
 | Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |
@@ -675,6 +677,101 @@ Feature flags: `media` (oxideav image/audio decoding), `hf` (HuggingFace fetchin
 meaningful for `wasm32-unknown-unknown`); `--no-default-features` gives the plain CPU build.
 Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex backend.
 
+### Core ML / Apple Neural Engine
+
+Models converted by [ANEMLL](https://github.com/Anemll/Anemll) (the `anemll/*` repos on Hugging
+Face: Qwen3, Qwen2.5, Gemma 3, Llama 3.2, VibeThinker, ...) are pre-compiled Core ML packages with
+fixed shapes and a stateful KV cache, laid out for the Neural Engine. oxinfer runs them through
+Core ML itself (`coreml.rs`: `CoreML.framework` via the Objective-C runtime and `dlsym`, nothing
+linked), following ANEMLL's runtime contract (`anemll.rs`: `meta.yaml`, chunked / monolithic /
+split-rotate layouts, batch prefill, causal masks, Gemma 3 sliding-window rotate functions, split
+LM head or argmax in the model). Needs macOS 15 / iOS 18 on Apple Silicon (stateful and
+multifunction models); the module also builds for `aarch64-apple-ios`.
+
+```sh
+oxinfer --model anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4 --prompt "Why is the sky blue?"
+oxinfer --model anemll/anemll-google-gemma-3-1b-it-ctx4096_0.3.5 --chat
+oxinfer --model DIR --coreml-units cpu      # ane (default: CPU + Neural Engine) | all | gpu | cpu
+oxinfer --model DIR --coreml-prefill pad    # auto (default) | batch | pad | single
+```
+
+The whole repository is fetched (the `.mlmodelc` directories, tokenizer, `meta.yaml`); the first
+load of a model compiles it for the device (30 s for Qwen3-0.6B, 2 min for Gemma-3-1B with its four
+functions), later loads take 0.3-1 s. Prompt formatting, sampling, `--chat`, `--think`, `--system`,
+`--raw`, `--max-tokens`, `--dump-logits` and `--print-prompt` work as with the native paths, but
+models converted with `argmax_in_model` (the Gemma 3 and Llama repos above) return only their top
+token: generation is greedy and there are no logits to dump. The context is fixed at conversion
+(`ctx512` etc.); a longer prompt is an error and generation stops when the cache is full. The same
+API is in the library (`oxinfer::anemll::AnemllModel::{load, prefill, step}`, see
+`examples/anemll.rs`).
+
+**Verified** against ANEMLL's own runtime (`tests/chat.py` with coremltools 9): same prompt tokens,
+same greedy tokens, and bit-identical logits where the model has them:
+
+| Repo (anemll/...) | Layout | Checked |
+|---|---|---|
+| anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4 | 1 chunk | 60 + 100 tokens, logits identical, both prefill modes |
+| anemll-Qwen-Qwen3-1.7B-ctx2048_0.3.5 | 2 chunks | 300 tokens, logits identical |
+| anemll-WeiboAI-VibeThinker-1.5B-ctx2048_0.3.5 | 4 chunks (Qwen2.5) | 300 tokens, logits identical |
+| anemll-google-gemma-3-1b-it-ctx4096_0.3.5 | 1 chunk, sliding window 512, argmax | 901-token prompt + 3150 tokens (to 4051 of 4096, across the window) |
+| anemll-meta-llama-Llama-3.2-1B-Instruct-ctx1024_0.3.5 | 1 chunk, argmax | 300 tokens |
+| anemll-Qwen-Qwen2.5-0.5B-Instruct-ctx2048-monolithic_0.3.5 | monolithic | 300 tokens, logits identical, both prefill modes |
+| anemll-google-gemma-3-270m-it-ctx512-monolithic_0.3.5 | monolithic, argmax | 250 tokens, both prefill modes |
+
+Prefill modes: full batches (64 tokens) go through the `prefill` functions and the rest through
+`infer`, token by token, as in ANEMLL. `auto` does this only when `meta.yaml` declares
+`prefill_dynamic_slice` or `update_mask_prefill` and otherwise feeds every token through `infer`, as
+`chat.py` does: the batch prefill of older conversions can be wrong (the Gemma 3 270m monolithic
+repo above produces garbage with it, in `chat.py` too, while Qwen3-0.6B 0.3.4 gives bit-identical
+logits either way). `pad` also runs the last partial batch through `prefill`, padded: the
+prediction is not bit-identical any more (greedy outputs diverged after 70 and 162 tokens on Llama
+and Qwen2.5, stayed identical on Qwen3 and Gemma 3) but short prompts no longer pay one Neural
+Engine call per token.
+
+Compute plans (`MLComputePlan`) put 99.7-100% of the estimated cost of the `infer` functions on
+the Neural Engine (2333 of 2340 ops for Qwen3-0.6B; the embedding lookups run on the CPU, and the
+Gemma 3 argmax head is half CPU).
+
+Measured on the M5 Max (macOS 26), 227-250-token prompt, 200 generated tokens, best of 2-3 runs
+(the machine was shared):
+
+| Model (Neural Engine) | Prefill (auto) | Prefill (pad) | Decode | Decode, back to back with `chat.py` | RSS | CPU time |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B ctx512 | 128 tok/s (715 batched) | 3630 tok/s | 106 tok/s | 114 vs 104 tok/s | 205 MB | 0.5 s |
+| Gemma-3-1B ctx4096 | 483 tok/s (3250 at 901 tokens) | 2720 tok/s | 69 tok/s | 70 vs 64 tok/s | 630 MB | 1.5 s |
+| Llama-3.2-1B ctx1024 | 284 tok/s | 2270 tok/s | 60 tok/s | 52 vs 51 tok/s | 170 MB | 0.5 s |
+| Qwen2.5-0.5B monolithic ctx2048 | 358 tok/s | 2120 tok/s | 90 tok/s | 77 vs 75 tok/s | 170 MB | 0.5 s |
+| Gemma-3-270m monolithic ctx512 | 261 tok/s | (wrong output) | 263 tok/s | 233 vs 221 tok/s | 560 MB | 0.8 s |
+
+Decode slows down as the context fills (Gemma-3-1B: 67 tok/s averaged over 4050 tokens). Other
+compute units on the same Core ML models, and oxinfer's own kernels on the original checkpoints
+(`Qwen/Qwen3-0.6B`, `unsloth/gemma-3-1b-it` = google/gemma-3-1b-it):
+
+| | Qwen3-0.6B prefill | decode | RSS | Gemma-3-1B prefill | decode | RSS |
+|---|---|---|---|---|---|---|
+| Core ML `ane` (CPU + Neural Engine) | 715 tok/s | 106 tok/s | 0.2 GB | 483 tok/s | 70 tok/s | 0.6 GB |
+| Core ML `cpu` | 329 tok/s | 48 tok/s | 2.2 GB | 207 tok/s | 22 tok/s | 3.9 GB |
+| Core ML `gpu` (CPU + GPU) | 28 tok/s | 21 tok/s | 8.6 GB | 18 tok/s | 14 tok/s | 14.2 GB |
+| Core ML `all` | 26 tok/s | 21 tok/s | 8.6 GB | 15 tok/s | 17 tok/s | 14.2 GB |
+| oxinfer CPU bf16 / q8 / q4 | 817 / 783 / 751 tok/s | 135 / 174 / 265 tok/s | 1.7-2.4 GB | 515 / 532 / 477 tok/s | 79 / 146 / 216 tok/s | 2.4-3.5 GB |
+| oxinfer Metal prefill, bf16 / q4 | 891 / 901 tok/s | 137 / 259 tok/s | 1.7-2.1 GB | 782 / 760 tok/s | 82 / 228 tok/s | 2.4-3.0 GB |
+
+On this chip the CPU cores are faster than the Neural Engine for these small models (and the
+ANEMLL conversions use 6-bit palettized weights, so quality is not equal either). What the Neural
+Engine buys is everything else: the generation above takes 0.5 s of CPU time against 13.6 s for
+oxinfer's Q4 CPU path (1.3 s wall on 18 threads), the CPU and GPU stay free, and the process stays
+at 0.2-0.7 GB resident, less than the weights themselves (0.8 GB for Qwen3-0.6B with its fp16
+embedding table): the Neural Engine's copy of the compiled model is not counted in the process.
+The `gpu` and `all` units expand the palettized weights (8-14 GB resident) and are slow; use the
+native Metal path for the GPU instead. Over a 4050-token Gemma-3-1B generation the RSS stays flat
+(680 MB at the start, 570 MB at the end): every prediction runs in its own autorelease pool and the
+input / output arrays are allocated once per model.
+
+Speed comes from wiring the parts together once at load: each part's output (an IOSurface-backed
+fp16 `MLMultiArray`, what the Neural Engine writes directly) is bound as the next part's input in a
+prepared feature provider, so a token only writes its id, position and mask row into existing
+arrays and runs the chain; decode runs 2-10% faster than `chat.py` on the same models.
+
 ## How it works
 
 - `safetensors.rs`: parses the header, exposes bf16 tensors as `&[u16]` (single file or sharded).
@@ -708,6 +805,9 @@ Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex bac
   global attention with proportional RoPE on 512-dim global heads, KV-cache sharing for the top layers,
   gated-GELU MLP, post-norms, per-layer scalars, tied softcapped LM head.
 - `chat.rs`, `sampler.rs`, `main.rs`: chat template, greedy / top-k / top-p sampling, streaming CLI.
+- `coreml.rs`, `anemll.rs`: Core ML through the Objective-C runtime (models, functions, states,
+  multi-arrays, IOSurface buffers) and the ANEMLL model runner (`meta.yaml`, prefill / infer
+  protocol, sliding-window rotation, split or argmax LM head); `anemll_cli.rs`: its CLI driver.
 
 ## Verifying against the reference
 

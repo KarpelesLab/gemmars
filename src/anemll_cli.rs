@@ -5,63 +5,13 @@
 use crate::{Args, Printer, report, system_prompt};
 use anyhow::{Context, Result, bail};
 use oxinfer::anemll::{AnemllModel, Meta, Next, Options, PrefillMode};
-use oxinfer::chat::{self, ChatFormat};
+use oxinfer::chat::ChatFormat;
 use oxinfer::coreml::ComputeUnits;
 use oxinfer::sampler::Sampler;
 use std::io::{BufRead, Read};
 use std::path::Path;
 use std::time::Instant;
 use tokenizers::Tokenizer;
-
-/// The chat format matching the model's template (`chat_template.jinja` or
-/// `tokenizer_config.json`).
-fn chat_format(meta: &Meta) -> Result<&'static dyn ChatFormat> {
-    let cfg: serde_json::Value = std::fs::read(meta.tokenizer_dir.join("tokenizer_config.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let jinja = std::fs::read_to_string(meta.tokenizer_dir.join("chat_template.jinja")).ok();
-    let tpl = jinja.as_deref().or(cfg["chat_template"].as_str()).unwrap_or("");
-    let arch = format!("{} {}", meta.architecture, meta.model_prefix).to_lowercase();
-    Ok(if tpl.contains("<|start_header_id|>") {
-        &chat::Llama3Chat
-    } else if tpl.contains("<start_of_turn>") || arch.contains("gemma3") {
-        &chat::Gemma3Chat
-    } else if (tpl.contains("<|im_start|>") && !tpl.contains("</think>")) || (tpl.is_empty() && arch.contains("qwen2")) {
-        // Qwen2 / 2.5 ChatML (no thinking block); one per process, so leaking it is fine.
-        Box::leak(Box::new(chat::Qwen2Chat::for_template(tpl)))
-    } else if tpl.contains("<|im_start|>") || arch.contains("qwen") {
-        chat::QwenChat::for_template(Some(tpl))
-    } else {
-        bail!("no chat format for this model ({}); use --raw", meta.architecture)
-    })
-}
-
-/// Stop tokens as ANEMLL's `chat.py` collects them: the tokenizer's EOS token, then
-/// `<|endoftext|>`, `<end_of_turn>` and `<|eot_id|>` when the vocabulary has them, plus the chat
-/// format's end-of-turn token.
-fn stop_ids(meta: &Meta, tok: &Tokenizer, fmt: &dyn ChatFormat) -> Vec<u32> {
-    let cfg: serde_json::Value = std::fs::read(meta.tokenizer_dir.join("tokenizer_config.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let eos = &cfg["eos_token"];
-    let mut ids = Vec::new();
-    let names = [
-        eos.as_str().or(eos["content"].as_str()).unwrap_or(""),
-        "<|endoftext|>",
-        "<end_of_turn>",
-        "<|eot_id|>",
-    ];
-    for n in names {
-        if let Some(id) = tok.token_to_id(n).filter(|_| !n.is_empty())
-            && !ids.contains(&id)
-        {
-            ids.push(id);
-        }
-    }
-    chat::with_turn_end(fmt, tok, ids)
-}
 
 fn units(args: &Args) -> Result<ComputeUnits> {
     if let Some(u) = &args.coreml_units {
@@ -136,8 +86,8 @@ pub fn detect(dir: &Path) -> bool {
 
 pub fn run(args: &Args) -> Result<()> {
     let meta = Meta::load(&args.model)?;
-    let tok = Tokenizer::from_file(meta.tokenizer_dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    let fmt = chat_format(&meta)?;
+    let tok = meta.tokenizer()?;
+    let fmt = meta.chat_format()?;
     let encode = |text: &str| -> Result<Vec<u32>> {
         let enc = tok.encode(text, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         Ok(enc.get_ids().to_vec())
@@ -207,6 +157,9 @@ pub fn run(args: &Args) -> Result<()> {
         },
         if m.rotation() { "; sliding-window rotation" } else { "" }
     );
+    if m.options.prefill != PrefillMode::Single && !(meta.update_mask_prefill || meta.prefill_dynamic_slice) {
+        eprintln!("[warning: meta.yaml declares no batch prefill support; check the output against --coreml-prefill single]");
+    }
     if args.profile {
         eprint!("{}", m.describe());
     }
@@ -218,7 +171,7 @@ pub fn run(args: &Args) -> Result<()> {
             eprintln!("[argmax_in_model: the model returns only its top token, so generation is greedy]");
         }
     }
-    let eos = stop_ids(&meta, &tok, fmt);
+    let eos = meta.stop_tokens(&tok, fmt);
     let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
 
     if args.chat {
