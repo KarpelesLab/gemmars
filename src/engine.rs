@@ -25,6 +25,15 @@
 //! a Gemma 4 assistant model ([`EngineOptions::draft`], greedy). Images and audio for Gemma 4
 //! with the `media` feature ([`Engine::send_with`]).
 //!
+//! Core ML models (on Apple Silicon macOS / iOS with the `gpu` feature): an ANEMLL-format
+//! directory (`meta.yaml` + `.mlmodelc` parts, from ANEMLL or `tools/coreml_convert.py`: Qwen3,
+//! Qwen3.5 / 3.6 / 3.8 dense, Gemma 4 E2B / E4B, Gemma 3, Llama 3) runs on the Neural Engine
+//! through `crate::anemll`, behind the same API. [`EngineOptions::coreml_units`] and
+//! [`EngineOptions::coreml_prefill`] choose where and how; the context length is fixed by the
+//! conversion ([`CoreMlInfo::context_length`]); [`ModelInfo::coreml`] is set for these models.
+//! Not available for them: attachments, speculative decoding, streaming, [`Engine::files`]
+//! (empty).
+//!
 //! # Threads and concurrency
 //! An [`Engine`] is `Send`: load it on one thread and use it from another. Its methods take
 //! `&mut self`, so one engine runs one generation at a time; [`CancelHandle`] is the only part
@@ -100,6 +109,102 @@ pub struct EngineOptions {
     /// MTP then drafts up to 8 tokens with a cost-aware length. Keys `stream` (on with the
     /// defaults), `cache_budget_gb`, `resident_mb`, `prefetch_mb`, `flash_mbps`.
     pub stream: Option<crate::stream::StreamOptions>,
+    /// Core ML models: where Core ML may run them. Default (None): the Neural Engine, or the
+    /// CPU / GPU when `device` asks for it. Key `coreml_units` (`auto`, `ane`, `all`, `gpu`,
+    /// `cpu`).
+    pub coreml_units: Option<CoreMlUnits>,
+    /// Core ML models: how prompts are fed. Key `coreml_prefill` (`auto`, `batch`, `pad`,
+    /// `single`).
+    pub coreml_prefill: CoreMlPrefill,
+}
+
+/// Where Core ML runs a model ([`EngineOptions::coreml_units`]; Core ML's `MLComputeUnits`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreMlUnits {
+    /// CPU and Neural Engine (`ane`).
+    Ane,
+    /// Any device Core ML picks (`all`).
+    All,
+    /// CPU and GPU (`gpu`).
+    Gpu,
+    /// CPU only (`cpu`; Core ML returns NaN for some stateful fp16 graphs there).
+    Cpu,
+}
+
+impl CoreMlUnits {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "ane" | "neural-engine" | "cpu-ane" => Self::Ane,
+            "all" => Self::All,
+            "gpu" | "cpu-gpu" => Self::Gpu,
+            "cpu" => Self::Cpu,
+            _ => return None,
+        })
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ane => "ane",
+            Self::All => "all",
+            Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+        }
+    }
+}
+
+/// How a Core ML model is fed prompts ([`EngineOptions::coreml_prefill`]; `PrefillMode` of
+/// `crate::anemll` on Apple targets).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoreMlPrefill {
+    /// What the model's `meta.yaml` supports (`auto`).
+    #[default]
+    Auto,
+    /// Full batches through `prefill`, the rest token by token (`batch`).
+    Batch,
+    /// As `Batch` with the last partial batch padded; same as `Batch` for recurrent models
+    /// (`pad`).
+    Pad,
+    /// Every token through `infer` (`single`).
+    Single,
+}
+
+impl CoreMlPrefill {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "auto" => Self::Auto,
+            "batch" | "batched" => Self::Batch,
+            "pad" | "padded" => Self::Pad,
+            "single" => Self::Single,
+            _ => return None,
+        })
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Batch => "batch",
+            Self::Pad => "pad",
+            Self::Single => "single",
+        }
+    }
+}
+
+/// A loaded Core ML model ([`ModelInfo::coreml`]).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct CoreMlInfo {
+    pub units: CoreMlUnits,
+    /// The prefill mode in use (`auto` resolved).
+    pub prefill: CoreMlPrefill,
+    /// `model_info.architecture` of `meta.yaml` (`qwen3`, `qwen3_5`, `gemma4`, ...).
+    pub architecture: String,
+    /// Maximum tokens in the conversation (fixed by the conversion).
+    pub context_length: usize,
+    /// Tokens per `prefill` call.
+    pub batch_size: usize,
+    /// Decoder chunks (separate Core ML models).
+    pub chunks: usize,
+    /// Recurrent state (Qwen3.5 Gated DeltaNet): every token is fed exactly once and the
+    /// conversation cannot be rewound (a reset starts a new state).
+    pub recurrent: bool,
 }
 
 impl Default for EngineOptions {
@@ -119,6 +224,8 @@ impl Default for EngineOptions {
             draft_tokens: None,
             cache_dir: None,
             stream: None,
+            coreml_units: None,
+            coreml_prefill: CoreMlPrefill::Auto,
         }
     }
 }
@@ -161,6 +268,8 @@ impl EngineOptions {
         "resident_mb",
         "prefetch_mb",
         "flash_mbps",
+        "coreml_units",
+        "coreml_prefill",
     ];
 
     /// Sets an option by name (see the field docs for the keys). Unknown keys are errors.
@@ -203,6 +312,16 @@ impl EngineOptions {
                     "prefetch_mb" => st.prefetch_bytes = (v * (1u64 << 20) as f64) as u64,
                     _ => st.flash_bytes_per_sec = Some(v * 1e6),
                 }
+            }
+            "coreml_units" => {
+                self.coreml_units = match value {
+                    "" | "auto" => None,
+                    v => Some(CoreMlUnits::parse(v).with_context(|| format!("coreml_units: unknown value {v:?} (auto|ane|all|gpu|cpu)"))?),
+                }
+            }
+            "coreml_prefill" => {
+                self.coreml_prefill = CoreMlPrefill::parse(value)
+                    .with_context(|| format!("coreml_prefill: unknown value {value:?} (auto|batch|pad|single)"))?
             }
             _ => bail!("unknown option {key:?} (known: {})", Self::KEYS.join(", ")),
         }
@@ -336,6 +455,8 @@ pub enum Family {
     Gemma4,
     Gemma3,
     Qwen,
+    /// Llama 3 (Core ML models only).
+    Llama,
 }
 
 /// Speculative decoding in use.
@@ -359,19 +480,22 @@ pub struct ModelInfo {
     pub layers: usize,
     pub hidden_size: usize,
     pub vocab_size: usize,
-    /// Precision of the streamed weights.
+    /// Precision of the streamed weights (Core ML models: `Bf16`, meaningless there).
     pub quant: Quant,
-    /// Checkpoint format: "gguf", "mlx", "oxinfer" (pre-quantized) or "safetensors".
+    /// Checkpoint format: "gguf", "mlx", "oxinfer" (pre-quantized), "safetensors" or "coreml".
     pub format: &'static str,
     pub checkpoint_bytes: u64,
     /// Weight bytes read per decoded token.
     pub streamed_bytes: usize,
-    /// "cpu" or the GPU backend's name (used for prefill matmuls).
+    /// "cpu" or the GPU backend's name (used for prefill matmuls); `coreml-<units>` for Core ML.
     pub device: String,
+    /// CPU worker threads (0 for Core ML models, which do not use the pool).
     pub threads: usize,
     pub mmap: bool,
     pub speculative: Speculative,
     pub load_secs: f64,
+    /// Set for Core ML models.
+    pub coreml: Option<CoreMlInfo>,
 }
 
 /// Stops the running (or next) generation of an engine from any thread.
@@ -433,7 +557,13 @@ enum Lm {
     QwenMtp {
         dec: Box<MtpDecoder<'static>>,
     },
+    #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+    CoreMl(Box<coreml_lm::CoreMlLm>),
 }
+
+#[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+#[path = "engine_coreml.rs"]
+mod coreml_lm;
 
 impl Lm {
     fn context_len(&self) -> usize {
@@ -441,6 +571,8 @@ impl Lm {
             Lm::Gemma { sess, .. } => sess.pos,
             Lm::Qwen { sess, .. } => sess.pos,
             Lm::QwenMtp { dec } => dec.sess.pos,
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            Lm::CoreMl(c) => c.context_len(),
         }
     }
     fn reset(&mut self) {
@@ -451,6 +583,8 @@ impl Lm {
                 let opts = dec.opts.clone();
                 **dec = MtpDecoder::new(dec.model(), dec.mtp(), opts);
             }
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            Lm::CoreMl(c) => c.reset(),
         }
     }
 }
@@ -509,6 +643,9 @@ impl Engine {
             .as_deref()
             .map(|s| resolve_model(s, opts.cache_dir.as_deref()))
             .transpose()?;
+        if is_coreml_dir(&dir) {
+            return Self::load_coreml(dir, opts, t0);
+        }
         if let Some(t) = opts.threads {
             pool::configure(t);
         }
@@ -578,6 +715,7 @@ impl Engine {
                 };
                 (lm, fmt, info.0, info.1, info.2, info.3, info.4)
             }
+            Family::Llama => bail!("Llama checkpoints run as Core ML models only"),
             Family::Qwen => {
                 let mut model = QwenModel::load(config::QwenConfig::load(&dir)?, files, opts.quant)?;
                 let fmt: &'static (dyn ChatFormat + Sync) = chat::QwenChat::for_model(&dir);
@@ -669,6 +807,7 @@ impl Engine {
             mmap: opts.mmap,
             speculative,
             load_secs: t0.elapsed().as_secs_f64(),
+            coreml: None,
         };
         let sampling = SamplingParams::default();
         Ok(Engine {
@@ -692,6 +831,63 @@ impl Engine {
             streamer,
             _arena: arena,
         })
+    }
+
+    /// A Core ML model directory (see the module docs).
+    #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+    fn load_coreml(dir: PathBuf, opts: &EngineOptions, t0: Instant) -> Result<Engine> {
+        let l = coreml_lm::load(&dir, opts)?;
+        let ctx = l.info.context_length;
+        let info = ModelInfo {
+            path: dir,
+            model_type: l.meta.architecture.clone(),
+            family: l.family,
+            layers: l.layers,
+            hidden_size: l.hidden_size,
+            vocab_size: l.vocab_size,
+            quant: Quant::Bf16,
+            format: "coreml",
+            checkpoint_bytes: l.bytes,
+            streamed_bytes: 0,
+            device: format!("coreml-{}", l.info.units.as_str()),
+            threads: 0,
+            mmap: false,
+            speculative: Speculative::None,
+            load_secs: t0.elapsed().as_secs_f64(),
+            coreml: Some(l.info),
+        };
+        let mut arena = Arena(Vec::new());
+        let files = arena.keep(ModelFiles::empty());
+        let sampling = SamplingParams::default();
+        Ok(Engine {
+            lm: Lm::CoreMl(Box::new(l.lm)),
+            tok: l.tok,
+            fmt: l.fmt,
+            stop: l.stop,
+            sampler: sampler_for(&sampling),
+            sampling,
+            config: ChatConfig::default(),
+            info,
+            files,
+            prefill_chunk: 0,
+            // The conversion fixes the context.
+            max_context: Some(opts.max_context.map_or(ctx, |m| m.min(ctx))),
+            draft_tokens: 0,
+            turns: 0,
+            unfed: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            stats: Stats::default(),
+            streamer: None,
+            _arena: arena,
+        })
+    }
+
+    #[cfg(not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")))]
+    fn load_coreml(dir: PathBuf, _opts: &EngineOptions, _t0: Instant) -> Result<Engine> {
+        bail!(
+            "{}: a Core ML model; these run on Apple Silicon macOS / iOS (built with the `gpu` feature)",
+            dir.display()
+        )
     }
 
     /// The weight streamer when loaded with [`EngineOptions::stream`]: per-step IO statistics
@@ -798,8 +994,8 @@ impl Engine {
         let (mm_text, feats) = if images.is_empty() && audios.is_empty() {
             (String::new(), Vec::new())
         } else {
-            if self.info.family != Family::Gemma4 {
-                bail!("image and audio inputs are supported for Gemma 4 only");
+            if self.info.family != Family::Gemma4 || self.info.coreml.is_some() {
+                bail!("image and audio inputs are supported for Gemma 4 only (not with Core ML)");
             }
             let req = mm::MmRequest {
                 model: &self.info.path,
@@ -827,7 +1023,8 @@ impl Engine {
     /// Feeds `prompt` as is (no chat template; `<bos>` first for Gemma in an empty context) and
     /// generates a continuation. Call [`Engine::reset`] first for a fresh context.
     pub fn complete(&mut self, prompt: &str, on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
-        let text = if self.context_len() == 0 && self.unfed.is_none() && self.info.family != Family::Qwen {
+        let gemma = matches!(self.info.family, Family::Gemma4 | Family::Gemma3);
+        let text = if self.context_len() == 0 && self.unfed.is_none() && gemma {
             format!("<bos>{prompt}")
         } else {
             prompt.to_string()
@@ -876,7 +1073,8 @@ struct PendingTurn {
 
 impl PendingTurn {
     fn finish(self, e: &mut Engine, on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
-        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        // Core ML models do not use the thread pool.
+        let _run = e.info.coreml.is_none().then(|| RUN.lock().unwrap_or_else(|p| p.into_inner()));
         let PendingTurn { ids, overrides, think } = self;
         let Engine {
             lm,
@@ -982,6 +1180,17 @@ impl PendingTurn {
                     d
                 }
             }
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            Lm::CoreMl(c) => {
+                let next = c.prefill(&ids)?;
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(c.context_len());
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    c.decode(next, sampler, stop, max, &mut cb)?
+                }
+            }
         };
         // Flush text held back for an incomplete character.
         let shown = match d.tokens.last() {
@@ -1027,6 +1236,22 @@ impl PendingTurn {
 
 fn sampler_for(s: &SamplingParams) -> Sampler {
     Sampler::new(s.temperature, s.top_k, s.top_p, s.seed)
+}
+
+/// Whether `dir` is a Core ML (ANEMLL-format) model directory: `meta.yaml` next to `.mlmodelc`
+/// parts (checked on every platform, so other targets can say why it does not load).
+fn is_coreml_dir(dir: &Path) -> bool {
+    #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+    {
+        coreml_lm::detect(dir)
+    }
+    #[cfg(not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")))]
+    {
+        dir.join("meta.yaml").is_file()
+            && std::fs::read_dir(dir)
+                .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".mlmodelc")))
+                .unwrap_or(false)
+    }
 }
 
 /// Resolves a model spec to a local checkpoint: a directory or GGUF file, or (with the `hf`
@@ -1144,11 +1369,26 @@ mod tests {
         assert_eq!(o.max_context, None);
         assert!(o.set("nope", "1").is_err());
         assert!(o.set("mmap", "maybe").is_err());
+        o.set("coreml_units", "ane").unwrap();
+        o.set("coreml_prefill", "single").unwrap();
+        assert_eq!((o.coreml_units, o.coreml_prefill), (Some(CoreMlUnits::Ane), CoreMlPrefill::Single));
+        o.set("coreml_units", "auto").unwrap();
+        assert_eq!(o.coreml_units, None);
+        assert!(o.set("coreml_units", "npu").is_err());
+        assert!(o.set("coreml_prefill", "fast").is_err());
+        for u in [CoreMlUnits::Ane, CoreMlUnits::All, CoreMlUnits::Gpu, CoreMlUnits::Cpu] {
+            assert_eq!(CoreMlUnits::parse(u.as_str()), Some(u));
+        }
+        for m in [CoreMlPrefill::Auto, CoreMlPrefill::Batch, CoreMlPrefill::Pad, CoreMlPrefill::Single] {
+            assert_eq!(CoreMlPrefill::parse(m.as_str()), Some(m));
+        }
         for k in EngineOptions::KEYS {
             // Every advertised key is accepted with some value.
             let v = match *k {
                 "quant" => "q8",
                 "device" => "cpu",
+                "coreml_units" => "gpu",
+                "coreml_prefill" => "pad",
                 "mtp_from" | "draft" | "cache_dir" => "x",
                 _ => "1",
             };

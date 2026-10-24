@@ -406,7 +406,9 @@ println!("\n{:.1} tok/s, {:.0}% drafts accepted", reply.stats.decode_tok_s(), 10
 ```
 
 `examples/chat.rs` is a complete chat. Wrap `Engine::load` in `oxinfer::hf::with_progress` for
-download progress and cancellation. The lower-level pieces the CLI is built from are public too:
+download progress and cancellation. Core ML packages (below) load through the same
+`Engine::load` on macOS / iOS, with the options `coreml_units` (`ane`, `all`, `gpu`, `cpu`) and
+`coreml_prefill` (`auto`, `batch`, `pad`, `single`); `engine.info().coreml` describes them. The lower-level pieces the CLI is built from are public too:
 `oxinfer::generate` (decoding loops with per-token callbacks, MTP and drafter speculative
 decoding, streaming detokenization) and the model, session and sampler types. A C API over the
 engine (`capi` feature, `include/oxinfer.h`) and a SwiftUI test app for iOS are in `ios/`
@@ -800,8 +802,10 @@ fixed shapes and a stateful KV cache, laid out for the Neural Engine. oxinfer ru
 Core ML itself (`coreml.rs`: `CoreML.framework` via the Objective-C runtime and `dlsym`, nothing
 linked), following ANEMLL's runtime contract (`anemll.rs`: `meta.yaml`, chunked / monolithic /
 split-rotate layouts, batch prefill, causal masks, Gemma 3 sliding-window rotate functions, split
-LM head or argmax in the model). Needs macOS 15 / iOS 18 on Apple Silicon (stateful and
-multifunction models); the module also builds for `aarch64-apple-ios`.
+LM head or argmax in the model), and the extensions of oxinfer's own converter (below): Qwen3.5
+recurrent states, Gemma 4 per-layer inputs and two caches. Needs macOS 15 / iOS 18 on Apple
+Silicon (stateful and multifunction models); the module also builds for `aarch64-apple-ios`, and
+`oxinfer::engine::Engine` loads these models like any other.
 
 ```sh
 oxinfer --model anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4 --prompt "Why is the sky blue?"
@@ -896,8 +900,8 @@ weights and a Core ML state, a 16-way split LM head, the tokenizer files). Qwen3
 unchanged under ANEMLL's own `chat.py`; Qwen3.5 / 3.6 / 3.8 dense models (Gated DeltaNet
 recurrent state kept as Core ML states, chunked delta rule in the prefill function) and Gemma 4
 E2B / E4B (per-layer embeddings, KV sharing, local and global caches) extend the format as
-described in [docs/coreml-format.md](docs/coreml-format.md) (oxinfer's Core ML runtime above
-runs the ANEMLL layouts; the Qwen3.5 and Gemma 4 extensions are not loaded by it yet). Weights are 6-bit LUT-palettized by default (ANEMLL's recommended setting);
+described in [docs/coreml-format.md](docs/coreml-format.md); oxinfer's Core ML runtime above
+runs all of them. Weights are 6-bit LUT-palettized by default (ANEMLL's recommended setting);
 `tools/coreml_check.py` runs a package with coremltools, compares it with transformers in float32
 over a few hundred teacher-forced tokens, benchmarks it and lists which ops land on the ANE.
 
@@ -934,6 +938,32 @@ the rows it reads, while a palettized table would be decompressed at load time (
 packages too), so it only shows what the ANE saves. On a Max-class Mac, oxinfer's own CPU path
 decodes faster (Qwen3.5-0.8B Q8: 184 tok/s); what the Neural Engine brings is prefill throughput
 and power, with the CPU and GPU left free.
+
+The same packages through oxinfer (`oxinfer --model out/qwen35`, or `Engine::load`): the logits
+are bit-identical to coremltools' predictions of the package with `coreml_check.py`'s call
+sequence (300 teacher-forced positions of the 135-token prompt, also with the prompt cut to 128
+tokens so it ends on a batch boundary, and token-by-token prefill), greedy generation is identical
+token for token, and so are three-turn chats through `Engine` replayed by the Python driver (the
+Qwen3.5 state carried across turns: logit cosine 0.9975 against transformers over the whole
+conversation, as for one prompt). The runtime follows the format's rules: every token fed exactly
+once, the prediction from the call that processed the last one (`prefill`'s last-token output on a
+batch boundary), no padded batches into the recurrent state, a reset makes a new state. For the
+transformer packages `auto` pads the last partial batch, which here gives the same logits as
+feeding those tokens one by one. M5 Max, Neural Engine, 227-231-token prompt + 200 tokens,
+best of 4 with another job using 13 CPU cores (runs varied by 5-15%; the coremltools driver
+measured under the same load is within that noise of oxinfer):
+
+| Package | Load (cached / first) | Prefill | Decode | RSS | CPU time |
+|---|---|---|---|---|---|
+| Qwen3-0.6B LUT6 | 0.3 s / 46 s | 3070 tok/s | 95 tok/s | 215 MB | 0.6 s |
+| Qwen3.5-0.8B LUT6 | 0.4 s / 90 s | 650 tok/s (3430 on a 256-token prompt) | 95 tok/s | 235 MB | 0.8 s |
+| Gemma 4 E2B LUT6 | 0.5 s / 100 s | 1030 tok/s | 35 tok/s | 595 MB | 1.6 s |
+| Gemma 4 E4B LUT6 | 0.9 s / 180 s | 546 tok/s | 19.6 tok/s | 620 MB | 2.3 s |
+
+Qwen3.5 prefill is slower on prompts that do not fill whole batches: the remainder (39 of 231
+tokens here, and all of a short chat turn) goes through `infer` at decode speed, since padding
+would enter the recurrent state. The first load compiles the model for the Neural Engine
+(cached by Core ML until another process loads the package with other settings).
 
 ## How it works
 

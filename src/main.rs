@@ -152,7 +152,8 @@ fn usage() -> ! {
          \n\
          ANEMLL Core ML models (a meta.yaml folder; macOS 15 / iOS 18, Apple Neural Engine):\n\
          \x20 --coreml-units U     ane (CPU + Neural Engine, default) | all | gpu (CPU + GPU) | cpu\n\
-         \x20 --coreml-prefill M   auto (default: batch if meta.yaml allows it, else single) | batch |\n\
+         \x20 --coreml-prefill M   auto (default: batch if meta.yaml allows it, else single; pad for\n\
+         \x20                      tools/coreml_convert.py packages without recurrent state) | batch |\n\
          \x20                      pad (batch + padded last batch: fastest, not bit-exact) | single\n\
          \n\
          embeddings (sentence-transformers models are detected; --embed forces it):\n\

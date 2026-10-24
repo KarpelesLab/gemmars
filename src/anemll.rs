@@ -44,6 +44,19 @@
 //! [`PrefillMode::Padded`] pads the last partial batch (with token 0; `update_mask` then marks only
 //! the real tokens, as the Swift CLI does for `update_mask` models).
 //!
+//! Packages written by oxinfer's converter (`tools/coreml_convert.py`, contract in
+//! `docs/coreml-format.md`) extend this:
+//! - `prefill_last_token_output`: the last chunk's `prefill` returns the final-normed hidden state
+//!   of the batch's last token, so every prompt token is fed exactly once: full batches, then the
+//!   rest through `infer`, the prediction from the call that processed the last token (the LM
+//!   head runs on the `prefill` output when the prompt ends on a batch boundary);
+//! - `recurrent_state` (Qwen3.5 / 3.6 / 3.8 dense: Gated DeltaNet and convolution states next to
+//!   the KV cache): the same, and never a padded batch (`prefill_full_batches_only`). The state
+//!   cannot be rewound: [`AnemllModel::reset`] starts a new one, and a conversation continues it;
+//! - Gemma 4: the embeddings model's second output `per_layer_inputs` is wired to the input of
+//!   that name of every chunk (generally: an input another part outputs is bound to that output),
+//!   with separate local / global KV-cache states.
+//!
 //! # Extending
 //!
 //! New converters plug in through the same contract: any number of Core ML states is handled (the
@@ -453,6 +466,15 @@ pub struct Meta {
     pub sliding_window: Option<usize>,
     pub update_mask_prefill: bool,
     pub prefill_dynamic_slice: bool,
+    /// The last chunk's `prefill` returns the final-normed hidden state of the batch's last token
+    /// (oxinfer's converter, docs/coreml-format.md): the prompt is then fed exactly once, the LM
+    /// head reading that output when the prompt ends on a batch boundary.
+    pub prefill_last_token_output: bool,
+    /// States that cannot be rewound (Qwen3.5 Gated DeltaNet): every token is fed exactly once,
+    /// in order.
+    pub recurrent_state: bool,
+    /// `prefill` only takes full batches of real tokens (no padding).
+    pub prefill_full_batches_only: bool,
     pub split_rotate: bool,
     /// Resolved model paths (empty for the parts a layout does not have).
     pub embeddings: PathBuf,
@@ -654,6 +676,9 @@ impl Meta {
             sliding_window,
             update_mask_prefill: p("update_mask_prefill").and_then(yaml::Value::as_bool).unwrap_or(false),
             prefill_dynamic_slice: p("prefill_dynamic_slice").and_then(yaml::Value::as_bool).unwrap_or(false),
+            prefill_last_token_output: p("prefill_last_token_output").and_then(yaml::Value::as_bool).unwrap_or(false),
+            recurrent_state: p("recurrent_state").and_then(yaml::Value::as_bool).unwrap_or(false),
+            prefill_full_batches_only: p("prefill_full_batches_only").and_then(yaml::Value::as_bool).unwrap_or(false),
             split_rotate,
             embeddings,
             lm_head,
@@ -679,8 +704,8 @@ impl Meta {
     }
 
     /// The chat format matching the model's template (`chat_template.jinja` or
-    /// `tokenizer_config.json`): Llama 3, Gemma 3, Qwen2 / 2.5 or Qwen3 ChatML.
-    pub fn chat_format(&self) -> Result<&'static dyn crate::chat::ChatFormat> {
+    /// `tokenizer_config.json`): Llama 3, Gemma 4, Gemma 3, Qwen2 / 2.5 or Qwen3 ChatML.
+    pub fn chat_format(&self) -> Result<&'static (dyn crate::chat::ChatFormat + Sync)> {
         use crate::chat;
         let cfg = self.tokenizer_config();
         let jinja = std::fs::read_to_string(self.tokenizer_dir.join("chat_template.jinja")).ok();
@@ -688,6 +713,8 @@ impl Meta {
         let arch = format!("{} {}", self.architecture, self.model_prefix).to_lowercase();
         Ok(if tpl.contains("<|start_header_id|>") {
             &chat::Llama3Chat
+        } else if tpl.contains("<|turn>") || (tpl.is_empty() && arch.contains("gemma4")) {
+            &chat::GemmaChat
         } else if tpl.contains("<start_of_turn>") || arch.contains("gemma3") {
             &chat::Gemma3Chat
         } else if (tpl.contains("<|im_start|>") && !tpl.contains("</think>")) || (tpl.is_empty() && arch.contains("qwen2")) {
@@ -759,13 +786,16 @@ pub enum PrefillMode {
     /// `Batched` when `meta.yaml` declares `update_mask_prefill` or `prefill_dynamic_slice`,
     /// else `Single` (as ANEMLL's `chat.py`: the batch prefill of older conversions can be
     /// wrong, e.g. `anemll-google-gemma-3-270m-it-ctx512-monolithic_0.3.5` produces garbage).
+    /// `Padded` for packages of oxinfer's converter (`prefill_last_token_output`) without
+    /// recurrent state.
     Auto,
     /// Full batches through the `prefill` functions, the rest token by token.
     Batched,
     /// As `Batched`, with the last partial batch padded (outside rotate mode): one prediction
     /// instead of up to `batch_size - 1`, much faster for short prompts, but the KV entries of
     /// those tokens differ from ANEMLL's runtimes in fp16 rounding (the Swift CLI does the same
-    /// for `update_mask` models).
+    /// for `update_mask` models). Same as `Batched` for recurrent models (`recurrent_state`,
+    /// `prefill_full_batches_only`), whose state would absorb the padding.
     Padded,
     /// Every token through `infer`. Slow (decode speed).
     Single,
@@ -846,8 +876,21 @@ struct Step {
 struct Plan {
     tokens: usize,
     steps: Vec<Step>,
+    /// Whether the last step is the separate LM head (skipped by KV-only calls).
+    has_head: bool,
     /// Output arrays of the last step (LM head or monolithic model): (name, array index).
     out: Vec<(String, usize)>,
+}
+
+impl Plan {
+    fn empty() -> Plan {
+        Plan {
+            tokens: 0,
+            steps: Vec::new(),
+            has_head: false,
+            out: Vec::new(),
+        }
+    }
 }
 
 /// Loading / prediction timings and counts.
@@ -878,6 +921,11 @@ pub struct AnemllModel {
     pos: usize,
     /// Whether the rotate functions are used from `sliding_window` on.
     rotation: bool,
+    /// Every prompt token is fed exactly once (no re-run of the last one): packages with
+    /// `prefill_last_token_output` or `recurrent_state`.
+    exact: bool,
+    /// The plan whose head outputs hold the latest prediction.
+    head_plan: PlanKind,
     hook: Option<Box<dyn InputHook>>,
     pub stats: Stats,
 }
@@ -957,9 +1005,22 @@ impl AnemllModel {
         }
         // Rotation needs both rotate functions in every chunk.
         let rotation = want_rotation && chunks.iter().all(|c| c.infer_rotate.is_some() && c.prefill_rotate.is_some());
+        let exact = meta.prefill_last_token_output || meta.recurrent_state;
+        if meta.recurrent_state && rotation {
+            bail!(
+                "{}: recurrent states cannot be combined with sliding-window rotation",
+                dir.display()
+            );
+        }
         let mut options = options;
         if options.prefill == PrefillMode::Auto {
-            options.prefill = if meta.update_mask_prefill || meta.prefill_dynamic_slice {
+            let no_pad = meta.recurrent_state || meta.prefill_full_batches_only;
+            options.prefill = if meta.prefill_last_token_output && meta.prefill_dynamic_slice && !no_pad {
+                // oxinfer's converter: padding the last partial batch gives the same logits as
+                // feeding those tokens through `infer` (verified bit-identical on Qwen3 and
+                // Gemma 4 E2B / E4B) at a fraction of the calls.
+                PrefillMode::Padded
+            } else if meta.update_mask_prefill || meta.prefill_dynamic_slice {
                 PrefillMode::Batched
             } else {
                 PrefillMode::Single
@@ -974,21 +1035,15 @@ impl AnemllModel {
             lm_head,
             arrays: Vec::new(),
             shared: Vec::new(),
-            infer_plan: Plan {
-                tokens: 0,
-                steps: Vec::new(),
-                out: Vec::new(),
-            },
-            prefill_plan: Plan {
-                tokens: 0,
-                steps: Vec::new(),
-                out: Vec::new(),
-            },
+            infer_plan: Plan::empty(),
+            prefill_plan: Plan::empty(),
             infer_rotate_plan: None,
             prefill_rotate_plan: None,
             states: Vec::new(),
             pos: 0,
             rotation,
+            exact,
+            head_plan: PlanKind::Infer,
             hook,
             stats: Stats::default(),
         };
@@ -996,7 +1051,8 @@ impl AnemllModel {
         m.make_states()?;
         let b = m.meta.batch_size;
         m.infer_plan = m.plan(|c| Some(c.infer), 1, true)?;
-        m.prefill_plan = m.plan(|c| Some(c.prefill), b, false)?;
+        // With `prefill_last_token_output` the last chunk's prefill output feeds the LM head.
+        m.prefill_plan = m.plan(|c| Some(c.prefill), b, m.meta.prefill_last_token_output)?;
         if m.rotation {
             m.infer_rotate_plan = Some(m.plan(|c| c.infer_rotate, 1, true)?);
             m.prefill_rotate_plan = Some(m.plan(|c| c.prefill_rotate, b, false)?);
@@ -1043,9 +1099,11 @@ impl AnemllModel {
         if self.hook.is_some() {
             return Ok(());
         }
+        // Inputs another part produces (Gemma 4's `per_layer_inputs`) are wired by name.
+        let produced = |name: &str| self.funcs.iter().any(|f| f.model.output(name).is_some());
         for f in &self.funcs {
             for d in &f.model.inputs {
-                if d.kind == FeatureKind::MultiArray && !KNOWN_INPUTS.contains(&d.name.as_str()) {
+                if d.kind == FeatureKind::MultiArray && !KNOWN_INPUTS.contains(&d.name.as_str()) && !produced(&d.name) {
                     bail!(
                         "{} takes an input `{}` {:?} this runner does not know (load with an InputHook)",
                         f.name,
@@ -1089,6 +1147,8 @@ impl AnemllModel {
         }
         let mut steps = Vec::new();
         let mut prev: Option<usize> = None;
+        // Outputs of earlier steps other than the hidden-state chain, by name.
+        let mut produced: Vec<(String, usize)> = Vec::new();
         let mut out = Vec::new();
         for (k, &(fi, state)) in chain.iter().enumerate() {
             let fname = self.funcs[fi].name.clone();
@@ -1119,6 +1179,17 @@ impl AnemllModel {
                         let l = d.shape.get(2).copied().unwrap_or(self.meta.context_length);
                         self.shared_input("update_mask", vec![1, 1, l, t], DataType::F16)?
                     }
+                    other if produced.iter().any(|(n, _)| n == other) => {
+                        let p = produced.iter().find(|(n, _)| n == other).map(|&(_, i)| i).unwrap_or_default();
+                        if !d.shape.is_empty() && self.arrays[p].shape != d.shape {
+                            bail!(
+                                "{fname}: input {other} {:?} does not match the output {:?} of an earlier part",
+                                d.shape,
+                                self.arrays[p].shape
+                            );
+                        }
+                        p
+                    }
                     other => {
                         self.arrays.push(MultiArray::new(&d.shape, d.dtype.unwrap_or(DataType::F16))?);
                         hooked.push((other.to_string(), self.arrays.len() - 1));
@@ -1127,16 +1198,24 @@ impl AnemllModel {
                 };
                 bound.push((d.name.clone(), idx));
             }
-            // Output backings. The embeddings' output shape is flexible: take the next part's.
+            // Output backings. The embeddings' output shapes are flexible: take the next part's
+            // `hidden_states` input, or for other outputs the first later input of that name.
             let outputs = self.funcs[fi].model.outputs.clone();
             let next_in = chain
                 .get(k + 1)
                 .and_then(|&(nf, _)| self.funcs[nf].model.input("hidden_states").map(|d| d.shape.clone()));
+            let later_in = |name: &str| {
+                chain[k + 1..]
+                    .iter()
+                    .find_map(|&(nf, _)| self.funcs[nf].model.input(name).map(|d| d.shape.clone()))
+                    .filter(|s| !s.is_empty())
+            };
             let mut backs: Vec<(String, usize)> = Vec::new();
             for d in outputs.iter().filter(|d| d.kind == FeatureKind::MultiArray) {
                 let shape = if d.shape.is_empty() {
                     match (&next_in, d.name.as_str()) {
                         (Some(s), "hidden_states") if s.len() == 3 => vec![1, t, s[2]],
+                        (_, name) if name != "hidden_states" && later_in(name).is_some() => later_in(name).unwrap_or_default(),
                         _ => bail!("{fname}: output {} has no fixed shape", d.name),
                     }
                 } else {
@@ -1149,6 +1228,12 @@ impl AnemllModel {
                 .iter()
                 .find(|(n, _)| n == "output_hidden_states" || n == "hidden_states")
                 .map(|&(_, i)| i);
+            produced.extend(
+                backs
+                    .iter()
+                    .filter(|(n, _)| n != "output_hidden_states" && n != "hidden_states")
+                    .cloned(),
+            );
             let ins: Vec<(&str, &MultiArray)> = bound.iter().map(|(n, i)| (n.as_str(), &self.arrays[*i])).collect();
             let outs: Vec<(&str, &MultiArray)> = backs.iter().map(|(n, i)| (n.as_str(), &self.arrays[*i])).collect();
             let prep = self.funcs[fi].model.prepare(&ins, &outs)?;
@@ -1162,7 +1247,13 @@ impl AnemllModel {
                 hooked,
             });
         }
-        Ok(Plan { tokens: t, steps, out })
+        let has_head = head && self.lm_head.is_some();
+        Ok(Plan {
+            tokens: t,
+            steps,
+            has_head,
+            out,
+        })
     }
 
     /// Tokens currently in the KV cache.
@@ -1229,10 +1320,53 @@ impl AnemllModel {
                 self.meta.context_length
             );
         }
+        if self.exact {
+            return self.prefill_exact(tokens, start);
+        }
         self.write_kv(tokens, start)?;
         // ANEMLL runs the last prompt token once more through `infer` for its prediction.
         self.pos = end - 1;
         self.step(last)
+    }
+
+    /// Prefill feeding every token exactly once (docs/coreml-format.md): full batches through
+    /// `prefill` (ending on the last token only when its output feeds the head), the rest through
+    /// `infer`, the prediction from the call that processed the last token.
+    fn prefill_exact(&mut self, tokens: &[u32], start: usize) -> Result<Next> {
+        let b = self.meta.batch_size;
+        let end = start + tokens.len();
+        let tok = |p: usize| &tokens[p - start..];
+        let last_out = self.prefill_plan.has_head;
+        let mut p = start;
+        if self.options.prefill != PrefillMode::Single {
+            while p + b <= end && (last_out || p + b < end) {
+                let head = p + b == end;
+                self.fill(&tok(p)[..b], p, b);
+                self.exec(PlanKind::Prefill, p, !head)?;
+                p += b;
+            }
+            if p == end {
+                self.pos = end;
+                return self.read_head();
+            }
+            // A padded batch for all but the last token, unless padding would enter a state that
+            // cannot be rewound.
+            let no_pad = self.meta.recurrent_state || self.meta.prefill_full_batches_only;
+            if self.options.prefill == PrefillMode::Padded && !no_pad && p + 1 < end && p + b <= self.meta.context_length {
+                let mut ids = tok(p)[..end - 1 - p].to_vec();
+                let valid = ids.len();
+                ids.resize(b, 0);
+                self.fill(&ids, p, valid);
+                self.exec(PlanKind::Prefill, p, true)?;
+                p = end - 1;
+            }
+        }
+        while p + 1 < end {
+            self.single(tok(p)[0], p, false)?;
+            p += 1;
+        }
+        self.pos = end - 1;
+        self.step(tokens[tokens.len() - 1])
     }
 
     /// Feeds one token at the current position and returns the prediction for the next one.
@@ -1345,8 +1479,11 @@ impl AnemllModel {
             PlanKind::Prefill => &self.prefill_plan,
             PlanKind::PrefillRotate => self.prefill_rotate_plan.as_ref().context("no prefill_rotate")?,
         };
-        let n =
-            plan.steps.len() - usize::from(skip_head && self.lm_head.is_some() && matches!(which, PlanKind::Infer | PlanKind::InferRotate));
+        let n = plan.steps.len() - usize::from(skip_head && plan.has_head);
+        // Monolithic `infer*` functions are their own head.
+        if n == plan.steps.len() && (plan.has_head || matches!(which, PlanKind::Infer | PlanKind::InferRotate)) {
+            self.head_plan = which;
+        }
         for step in &plan.steps[..n] {
             if !step.hooked.is_empty() {
                 let hook = self.hook.as_mut().context("input hook")?;
@@ -1382,10 +1519,10 @@ impl AnemllModel {
 
     /// Logits or argmax from the head outputs of the last `infer` step.
     fn read_head(&self) -> Result<Next> {
-        let plan = if self.use_rotate(self.pos.saturating_sub(1)) {
-            self.infer_rotate_plan.as_ref().unwrap_or(&self.infer_plan)
-        } else {
-            &self.infer_plan
+        let plan = match self.head_plan {
+            PlanKind::Prefill => &self.prefill_plan,
+            PlanKind::InferRotate => self.infer_rotate_plan.as_ref().unwrap_or(&self.infer_plan),
+            _ => &self.infer_plan,
         };
         let get = |name: &str| plan.out.iter().find(|(n, _)| n == name).map(|&(_, i)| &self.arrays[i]);
         if let (Some(idx), Some(val)) = (get("argmax_idx"), get("argmax_val")) {

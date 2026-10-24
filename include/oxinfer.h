@@ -71,6 +71,9 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *   draft=PATH|REPO      Gemma 4 assistant (drafter) model for speculative decoding (greedy)
  *   draft_tokens=N       max draft tokens per round (default 3 with MTP, 6 with a drafter)
  *   cache_dir=PATH       where repo ids are downloaded
+ *   coreml_units=auto|ane|all|gpu|cpu   Core ML models (ANEMLL format, Apple only): compute
+ *                        units (default auto: the Neural Engine, or cpu/gpu following device)
+ *   coreml_prefill=auto|batch|pad|single  Core ML models: how prompts are fed (default auto)
  * Returns NULL on error. */
 OxiEngine *oxi_engine_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 
@@ -103,7 +106,7 @@ int oxi_engine_reset(OxiEngine *engine);
 void oxi_engine_cancel(const OxiEngine *engine);
 
 /* Model information as a JSON object (path, model_type, family, layers, quant, format, device,
- * threads, speculative, load_secs, ...). */
+ * threads, speculative, load_secs, coreml (null, or units, prefill, context_length, ...), ...). */
 char *oxi_engine_info_json(OxiEngine *engine);
 
 /* Statistics of the last turn as a JSON object: prompt_tokens, prefill_secs, prefill_tok_s,

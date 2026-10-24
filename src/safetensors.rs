@@ -472,6 +472,18 @@ pub enum Stored {
 }
 
 impl ModelFiles {
+    /// No tensors (models whose weights are not safetensors, e.g. Core ML packages).
+    pub fn empty() -> Self {
+        Self {
+            shards: Vec::new(),
+            index: HashMap::new(),
+            touched: Mutex::new(BTreeMap::new()),
+            uses: Mutex::new(HashMap::new()),
+            dequantized: Mutex::new(HashMap::new()),
+            copies: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// Opens the checkpoint in directory `dir` (safetensors, sharded or not, or
     /// `pytorch_model.bin`), or a single GGUF file.
     pub fn open(dir: &Path, in_memory: bool) -> Result<Self> {

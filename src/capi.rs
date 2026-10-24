@@ -312,6 +312,15 @@ pub unsafe extern "C" fn oxi_engine_info_json(e: *mut OxiEngine) -> *mut c_char 
             "mmap": i.mmap,
             "speculative": format!("{:?}", i.speculative),
             "load_secs": i.load_secs,
+            "coreml": i.coreml.as_ref().map(|c| serde_json::json!({
+                "units": c.units.as_str(),
+                "prefill": c.prefill.as_str(),
+                "architecture": c.architecture,
+                "context_length": c.context_length,
+                "batch_size": c.batch_size,
+                "chunks": c.chunks,
+                "recurrent": c.recurrent,
+            })),
         });
         Ok(out_string(v.to_string()))
     })
