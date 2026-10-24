@@ -1,5 +1,14 @@
 # oxinfer
 
+[![CI](https://github.com/KarpelesLab/oxinfer/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/oxinfer/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/oxinfer.svg)](https://crates.io/crates/oxinfer)
+[![docs.rs](https://img.shields.io/docsrs/oxinfer)](https://docs.rs/oxinfer)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**[Try it in your browser](https://karpeleslab.github.io/oxinfer/)**: Qwen 3.5 0.8B downloads from
+Hugging Face and runs in the tab, with WebGPU when the browser has it. Early days: the crate is
+at 0.0.0 and the API and file formats may still change.
+
 Local LLM inference in pure Rust: Gemma 4 (text, images, audio) and Qwen 3.5 / 3.8 today, more
 model families as they come. No BLAS, no ML framework: weights are read straight out of the
 HuggingFace safetensors files and every operation (matmuls, attention, norms, RoPE, sampling) is
@@ -278,8 +287,10 @@ always read into memory.
 
 The `web` feature (`src/web/`) turns the library into a plain C-ABI wasm module, no bindgen;
 `cargo build-web` builds it as a `cdylib` for `wasm32-unknown-unknown` (the crate type is given on
-the command line, so native builds never link a shared library). `web/` holds the JavaScript host
-`web/oxinfer.js`, the page `web/index.html` and the dev tools; it is not a crate. The host registers the model files in the module's in-memory filesystem (streamed straight from
+the command line, so native builds never link a shared library). `web/` is the site deployed to
+[GitHub Pages](https://karpeleslab.github.io/oxinfer/) by `.github/workflows/pages.yml`: a Vue 3 +
+Vite app around the JavaScript host `web/src/lib/oxinfer.js`; it is not a crate. Downloads go to
+the browser's Cache Storage, so a model is fetched once per browser. The host registers the model files in the module's in-memory filesystem (streamed straight from
 `fetch` or a local folder into module memory) and drives a chat session token by token.
 
 GPU work goes the other way round: the module imports `gpu_upload` / `gpu_matmul`, which the
@@ -291,10 +302,13 @@ Promise Integration, Chrome 137+). Without JSPI or WebGPU the same page runs on 
 WebGL is not used: it has no compute shaders.
 
 ```sh
-cargo build-web                                                     # target/wasm32-unknown-unknown/release/oxinfer.wasm
-deno run --allow-net --allow-read web/serve.ts ~/.cache/oxinfer/hub   # http://localhost:8080/, models at /models/<dir>
+cd web
+npm install
+npm run wasm                                       # cargo build-web, copied to public/oxinfer.wasm
+npm run smoke                                      # the JS <-> wasm bridge, headless (Node)
+OXINFER_MODELS=~/.cache/oxinfer/hub npm run dev    # local folders load as "./models/<folder>"
 # or from Deno directly (Deno has WebGPU, but its readback polls every ~14 ms, so --cpu is as fast there):
-deno run --allow-read --allow-env web/run.mjs --model models/gemma-4-E4B-it-q4 --cpu -p "Hello"
+deno run --allow-read --allow-env scripts/run.mjs --model ../models/gemma-4-E4B-it-q4 --cpu -p "Hello"
 ```
 
 Point the page (or `run.mjs`) at a pre-quantized checkpoint (`--save-quantized`, see above): it
@@ -324,7 +338,7 @@ from the wasm build match the native binary on the same file:
 
 Limits: decode is single-threaded CPU and bandwidth-bound (one core streams ~10 GB/s of Q4
 weights), and stays off the GPU for the same reasons as on Metal. Weights in module memory must
-fit in 4 GiB, and no single file can exceed 2 GiB. `web/test_gemm.mjs` checks the WGSL kernels
+fit in 4 GiB, and no single file can exceed 2 GiB. `web/scripts/test_gemm.mjs` checks the WGSL kernels
 against a JavaScript reference.
 
 Feature flags: `media` (oxideav image/audio decoding), `hf` (HuggingFace fetching), `gpu`
@@ -340,7 +354,7 @@ Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex bac
   CUDA driver API, Vulkan loader), all through `dlsym`; `gpu.rs`: the `Backend` trait the linear layers
   dispatch through and the registry; `metal.rs`, `cuda.rs`: the backends with their shader sources.
 - `fsx.rs`, `clock.rs`: file access and monotonic time behind one interface, so the loaders run on a
-  real filesystem or on the browser's in-memory table; `web/` (feature `web`): the browser module's
+  real filesystem or on the browser's in-memory table; `src/web/` (feature `web`): the browser module's
   C-ABI exports and the WebGPU backend calling back into the host; `web/` at the root: the
   JavaScript host and page.
 - `kernels.rs`: NEON kernels (`kernels_x86.rs`, `kernels_wasm.rs`: the AVX2 and simd128 equivalents, selected by `build.rs` through the `has_simd` cfg). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher

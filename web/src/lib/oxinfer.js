@@ -143,8 +143,10 @@ export class WebGpuHost {
     const device = await adapter.requestDevice({ requiredLimits });
     device.lost.then((info) => log(`[webgpu: device lost: ${info.message}]`));
     const info = adapter.info || {};
-    log(`[webgpu: ${info.description || info.device || info.vendor || 'adapter'}; max binding ${(device.limits.maxStorageBufferBindingSize / 2 ** 30).toFixed(1)} GiB]`);
-    return new WebGpuHost(device, adapter);
+    const host = new WebGpuHost(device, adapter);
+    host.name = info.description || info.device || [info.vendor, info.architecture].filter(Boolean).join(' ') || 'GPU';
+    log(`[webgpu: ${host.name}; max binding ${(device.limits.maxStorageBufferBindingSize / 2 ** 30).toFixed(1)} GiB]`);
+    return host;
   }
 
   pipeline(kind) {

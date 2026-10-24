@@ -1,0 +1,82 @@
+name: Deploy browser demo
+
+# Builds the browser module (the crate's `web` feature) and the Vue site in web/, and publishes
+# them to GitHub Pages. A change to the library or the site triggers a redeploy.
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'web/**'
+      - 'src/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; newer pushes supersede in-flight ones.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: wasm-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build oxinfer.wasm (web feature, cdylib)
+        run: |
+          cargo build-web
+          cp target/wasm32-unknown-unknown/release/oxinfer.wasm web/public/oxinfer.wasm
+          ls -la web/public/oxinfer.wasm
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install, validate, build
+        working-directory: web
+        run: |
+          npm ci
+          npm run smoke   # the JS <-> wasm bridge works and reports errors
+          npm run build
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

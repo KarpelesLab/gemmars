@@ -1,0 +1,84 @@
+:root {
+  --paper: #eef2f1;
+  --surface: #f7f9f8;
+  --ink: #1b2a33;
+  --muted: #5b6b70;
+  --line: #c7d3d0;
+  --verdigris: #2f8f80;
+  --verdigris-deep: #23655c;
+  --copper: #b8733e;
+  --error: #b4443b;
+  --display: 'Bricolage Grotesque Variable', 'Avenir Next', system-ui, sans-serif;
+  --text: 'Atkinson Hyperlegible Next Variable', system-ui, sans-serif;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #15232a;
+    --surface: #1b2c33;
+    --ink: #e3ecea;
+    --muted: #9db0ad;
+    --line: #2c3e44;
+    --verdigris: #5cc2b0;
+    --verdigris-deep: #8fd8cb;
+    --copper: #d9965f;
+    --error: #e07a70;
+    color-scheme: dark;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--text);
+  font-size: 17px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--verdigris-deep);
+  text-underline-offset: 0.15em;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--verdigris);
+  outline-offset: 2px;
+}
+
+code {
+  font-size: 0.9em;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 0.25em;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+@media (max-width: 760px) {
+  #app {
+    height: auto;
+    min-height: 100dvh;
+  }
+}

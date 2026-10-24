@@ -1,3 +1,6 @@
 models/
 target/
 *.safetensors
+web/node_modules/
+web/dist/
+web/public/oxinfer.wasm

@@ -1,0 +1,23 @@
+# Keep the GitHub Actions used by the workflows current. Only the
+# `github-actions` ecosystem is enabled: Cargo dependencies are managed
+# by hand (see CHANGELOG / release-plz), and the web/ site's npm
+# lockfile is refreshed deliberately alongside site changes.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      # One PR for all action bumps per week rather than one per action.
+      actions:
+        patterns:
+          - "*"
+    ignore:
+      # `dtolnay/rust-toolchain@<version>` selects the Rust toolchain by its
+      # tag, so Dependabot would "upgrade" the MSRV job's `@1.95` to whatever
+      # the newest tag is (it bumped it to a non-existent `@1.120` once).
+      # The MSRV pin follows `rust-version` in Cargo.toml and is bumped by
+      # hand; `@stable` / `@nightly` are moving tags and need no updates.
+      - dependency-name: "dtolnay/rust-toolchain"

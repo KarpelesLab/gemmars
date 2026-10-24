@@ -1,7 +1,18 @@
 [package]
 name = "oxinfer"
-version = "0.1.0"
+# 0.x while the API and the on-disk pre-quantized format may still change.
+version = "0.0.0"
 edition = "2024"
+rust-version = "1.95"
+description = "Local LLM inference in pure Rust (Gemma 4, Qwen 3.5/3.8): SIMD CPU kernels everywhere, GPUs detected at run time, and a WebAssembly + WebGPU browser build."
+repository = "https://github.com/KarpelesLab/oxinfer"
+homepage = "https://karpeleslab.github.io/oxinfer/"
+license = "MIT"
+readme = "README.md"
+keywords = ["llm", "inference", "gemma", "qwen", "wasm"]
+categories = ["science", "wasm", "command-line-utilities"]
+# Keep model weights, the web app, the reference-check scripts and CI config out of the .crate.
+exclude = ["/models", "/web", "/tools", "/.github", "*.safetensors"]
 
 [lib]
 name = "oxinfer"
