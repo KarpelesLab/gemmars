@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/KarpelesLab/oxinfer/compare/v0.0.2...v0.0.3) - 2026-10-24
+
+### Other
+
+- MLX checkpoints, the mirror, Gemma 3 and Qwen3; Qwen3 tool-call test
+- convolution weights are channels-last; permute them for the Gemma 4 audio tower
+- MLX models and the ATOnline mirror
+- CUDA and WebGPU: affine Q4 GEMMs for MLX weights
+- affine Q4 GEMM for MLX weights; vectorized bf16 dot fallback
+- MLX checkpoints, the ATOnline mirror, Qwen3 and Gemma 3
+
 ## [0.0.2](https://github.com/KarpelesLab/oxinfer/compare/v0.0.1...v0.0.2) - 2026-10-24
 
 ### Other
