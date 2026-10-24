@@ -39,6 +39,8 @@ identical tokens.
 | google/embeddinggemma-300m | 0.3B | 1.2 GB (fp32) | embeddings; matches sentence-transformers (see [Embeddings](#embeddings)) |
 | Qwen/Qwen3-Embedding-0.6B | 0.6B | 1.2 GB | embeddings; matches sentence-transformers |
 | BAAI/bge-m3 | 0.6B | 2.3 GB (fp32, `pytorch_model.bin`) | dense, sparse and ColBERT embeddings; matches the reference |
+| sentence-transformers/all-MiniLM-L6-v2, paraphrase-multilingual-MiniLM-L12-v2 | 23M / 118M | 90 / 470 MB | embeddings (BERT); match sentence-transformers |
+| BAAI/bge-small-en-v1.5, intfloat/multilingual-e5-small, mixedbread-ai/mxbai-embed-large-v1 | 33M-335M | 0.13-1.3 GB | embeddings (BERT / XLM-R); match sentence-transformers |
 | stabilityai/sd-turbo | 1.3B | 2.6 GB (fp16) | text-to-image in one step; matches diffusers (see Image generation) |
 | stable-diffusion-v1-5/stable-diffusion-v1-5 (and SD 1.x / 2.x fine-tunes) | 1.1B | 2.0 GB (fp16) | text-to-image; matches diffusers |
 
@@ -91,6 +93,13 @@ bf16-rounded matrices; against a reference using the same rounding the vectors a
 have a mean cosine of 0.9995 to the fp32 reference, but one token drops to 0.40. That text is
 unusually sensitive: the reference itself in fp16 already drops a token to 0.89. The sparse
 weights select the same tokens, with weights within 0.013.
+
+Any BERT, RoBERTa or XLM-RoBERTa sentence-transformers model should work the same way; besides
+the three above, all-MiniLM-L6-v2, paraphrase-multilingual-MiniLM-L12-v2, bge-small-en-v1.5,
+multilingual-e5-small and mxbai-embed-large-v1 were checked (cosine >= 0.99999 to the reference).
+E5 models expect a `query: ` / `passage: ` prefix in the text itself (they define no prompts).
+MPNet (all-mpnet-base-v2), ModernBERT, NomicBERT and Qwen2-based embedders are other
+architectures and are not supported yet.
 
 Two details that are easy to get wrong: transformers halves EmbeddingGemma's sliding window for
 bidirectional attention (512 in the config means keys less than 257 positions away on either
