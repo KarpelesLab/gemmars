@@ -227,6 +227,34 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         .filter(|f| list.contains_key(**f))
         .map(|f| f.to_string())
         .collect();
+    // sentence-transformers layout (embedding models): the module list, the prompts, and each
+    // module's folder (pooling, dense projections); BGE-M3's sparse and multi-vector heads.
+    if let Some((size, src)) = list.get("modules.json") {
+        fetch_file(repo, dir, "modules.json", *size, src, 0, 0)?;
+        let modules: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("modules.json"))?)?;
+        for f in [
+            "config_sentence_transformers.json",
+            "sentence_bert_config.json",
+            "sparse_linear.pt",
+            "colbert_linear.pt",
+        ] {
+            if list.contains_key(f) {
+                files.push(f.into());
+            }
+        }
+        for m in modules.as_array().into_iter().flatten() {
+            let path = m["path"].as_str().unwrap_or_default();
+            if path.is_empty() {
+                continue;
+            }
+            for f in ["config.json", "model.safetensors", "pytorch_model.bin"] {
+                let name = format!("{path}/{f}");
+                if list.contains_key(&name) && !(f == "pytorch_model.bin" && list.contains_key(&format!("{path}/model.safetensors"))) {
+                    files.push(name);
+                }
+            }
+        }
+    }
     if list.contains_key("model.safetensors") {
         files.push("model.safetensors".into());
     } else if let Some((size, src)) = list.get("model.safetensors.index.json") {
@@ -241,8 +269,10 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         shards.sort();
         shards.dedup();
         files.extend(shards);
+    } else if list.contains_key("pytorch_model.bin") {
+        files.push("pytorch_model.bin".into());
     } else {
-        bail!("{repo}: no safetensors weights found");
+        bail!("{repo}: no safetensors or pytorch_model.bin weights found");
     }
     let count = files.len();
     for (i, f) in files.iter().enumerate() {
@@ -305,6 +335,9 @@ fn progress_line(label: &str, done: u64, total: Option<u64>, secs: f64) -> Strin
 fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, src: &Source, index: usize, count: usize) -> Result<()> {
     use std::io::IsTerminal;
     let path = dir.join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
     if let Ok(md) = std::fs::metadata(&path)
         && md.len() > 0
         && expected.is_none_or(|s| s == md.len())

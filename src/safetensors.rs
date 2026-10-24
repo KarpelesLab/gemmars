@@ -195,6 +195,27 @@ impl SafeTensors {
         if mmap.len() < 8 {
             bail!("{}: file too small", path.display());
         }
+        if crate::torch::is_torch_zip(&mmap) {
+            let tensors = crate::torch::read_tensors(&mmap)
+                .with_context(|| format!("{}: read PyTorch checkpoint", path.display()))?
+                .into_iter()
+                .map(|(name, t)| {
+                    let info = TensorInfo {
+                        dtype: t.dtype.to_string(),
+                        shape: t.shape,
+                        start: t.start,
+                        end: t.end,
+                        mlx: None,
+                    };
+                    (name, info)
+                })
+                .collect();
+            return Ok(Self {
+                mmap,
+                tensors,
+                metadata: HashMap::new(),
+            });
+        }
         let n = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
         if 8 + n > mmap.len() {
             bail!("{}: header length {} exceeds file", path.display(), n);
@@ -388,8 +409,11 @@ impl ModelFiles {
         let single = dir.join("model.safetensors");
         let idx = dir.join("model.safetensors.index.json");
         let mut files: Vec<PathBuf> = Vec::new();
+        let torch = dir.join("pytorch_model.bin");
         if crate::fsx::exists(&single) {
             files.push(single);
+        } else if !crate::fsx::exists(&idx) && crate::fsx::exists(&torch) {
+            files.push(torch);
         } else if crate::fsx::exists(&idx) {
             let v: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&idx)?)?;
             let map = v["weight_map"].as_object().context("weight_map")?;
@@ -398,7 +422,7 @@ impl ModelFiles {
             names.dedup();
             files.extend(names.into_iter().map(|n| dir.join(n)));
         } else {
-            bail!("no model.safetensors or index found in {}", dir.display());
+            bail!("no model.safetensors, index or pytorch_model.bin found in {}", dir.display());
         }
         let mut shards = Vec::with_capacity(files.len());
         for p in &files {
@@ -587,6 +611,33 @@ impl ModelFiles {
         }
         let sh = &self.shards[i];
         let host = matches!(sh.mmap, Storage::Host(_));
+        if info.dtype == "F32" || info.dtype == "F16" {
+            // fp32 / fp16 checkpoints (PyTorch files, sentence-transformers heads): a bf16 copy.
+            let mut cache = self.dequantized.lock().unwrap();
+            if !cache.contains_key(name) {
+                let b = self.copy(name)?;
+                let v: PageVec<u16> = match info.dtype.as_str() {
+                    "F32" => {
+                        let mut v = PageVec::<u16>::zeroed(b.len() / 4);
+                        for (o, c) in v.iter_mut().zip(b.as_chunks::<4>().0) {
+                            *o = half::bf16::from_f32(f32::from_le_bytes(*c)).to_bits();
+                        }
+                        v
+                    }
+                    _ => {
+                        let mut v = PageVec::<u16>::zeroed(b.len() / 2);
+                        for (o, c) in v.iter_mut().zip(b.as_chunks::<2>().0) {
+                            *o = half::bf16::from_f32(half::f16::from_le_bytes(*c).to_f32()).to_bits();
+                        }
+                        v
+                    }
+                };
+                cache.insert(name.to_string(), v);
+            }
+            let v = &cache[name];
+            // SAFETY: as in `mlx_bf16`.
+            return Ok(unsafe { std::slice::from_raw_parts(v.as_ptr(), v.len()) });
+        }
         if info.dtype == "BF16" && (host || !(sh.mmap.as_ptr() as usize + info.start).is_multiple_of(2)) {
             // In a host-kept shard, or unaligned in a mapped file (MLX headers have any length):
             // read an aligned copy.
@@ -636,6 +687,26 @@ impl ModelFiles {
             return self.copy(name);
         }
         self.raw(name)
+    }
+
+    /// Tensor `name` as f32, whatever its float dtype (small vectors: norms, biases).
+    pub fn f32(&self, name: &str) -> Result<Vec<f32>> {
+        let info = self.info(name).with_context(|| format!("missing tensor {name}"))?;
+        if info.mlx.is_some() {
+            return Ok(self.bf16(name)?.iter().map(|&v| crate::kernels::bf16_to_f32(v)).collect());
+        }
+        let b = self.bytes(name)?;
+        Ok(match info.dtype.as_str() {
+            "F32" => b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect(),
+            "BF16" => b
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| crate::kernels::bf16_to_f32(u16::from_le_bytes(*c)))
+                .collect(),
+            "F16" => b.as_chunks::<2>().0.iter().map(|c| half::f16::from_le_bytes(*c).to_f32()).collect(),
+            d => bail!("tensor {name} has dtype {d}, expected a float type"),
+        })
     }
 
     /// An 8-byte-aligned copy of tensor `name`'s bytes, kept for the lifetime of `self`.

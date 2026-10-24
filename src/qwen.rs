@@ -83,6 +83,8 @@ impl<'a> QwenModel<'a> {
             "model.language_model."
         } else if has("model.embed_tokens.weight") {
             "model."
+        } else if has("embed_tokens.weight") {
+            "" // a bare text model (embedding checkpoints)
         } else {
             bail!("cannot find embed_tokens in checkpoint");
         };

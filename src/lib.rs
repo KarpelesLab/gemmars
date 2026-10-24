@@ -6,12 +6,14 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod audio;
+pub mod bert;
 pub mod chat;
 pub mod clock;
 pub mod config;
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
 pub mod cuda;
 pub mod drafter;
+pub mod embed;
 pub mod fsx;
 pub mod gpu;
 #[cfg(feature = "hf")]
@@ -33,6 +35,7 @@ pub mod safetensors;
 pub mod sampler;
 pub mod sd;
 pub mod tools;
+pub mod torch;
 pub mod vision;
 #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]
 pub mod web;

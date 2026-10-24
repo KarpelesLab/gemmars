@@ -85,6 +85,10 @@ pub struct TextConfig {
     pub rope_local_base_freq: Option<f64>,
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
+    /// Encoder use (EmbeddingGemma): every position attends both ways (within the window on
+    /// sliding layers).
+    #[serde(default)]
+    pub use_bidirectional_attention: Option<bool>,
     /// Gemma 3 (set from `model_type`): RMSNorm scales by `1 + weight`, V is not normed, every
     /// layer has the same head dim, and the layer pattern does not force a global last layer.
     #[serde(skip)]
@@ -149,8 +153,17 @@ impl TextConfig {
         }
         let mut cfg: TextConfig = serde_json::from_value(text).context("parse text config")?;
         cfg.gemma3 = gemma3;
+        if gemma3 && cfg.bidirectional() {
+            // As transformers' Gemma3TextConfig: the stored window spans both directions, so each
+            // side sees `window / 2` (keys less than `window / 2 + 1` positions away).
+            cfg.sliding_window = cfg.sliding_window / 2 + 1;
+        }
         cfg.finalize()?;
         Ok(cfg)
+    }
+
+    pub fn bidirectional(&self) -> bool {
+        self.use_bidirectional_attention.unwrap_or(false)
     }
 
     /// Attention scale applied to the queries.

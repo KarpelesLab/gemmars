@@ -36,6 +36,9 @@ identical tokens.
 | mlx-community/gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit | 5.1B / 8.0B | 3.6 / 5.2 GB (MLX 4-bit) | text, images and audio; see [MLX checkpoints](#mlx-checkpoints) |
 | mlx-community/Qwen3-4B-4bit (Qwen3 dense) | 4.0B | 2.3 GB (MLX 4-bit) | text; matches the reference on the same weights (same top 10) |
 | mlx-community/gemma-3-4b-it-4bit (Gemma 3) | 4.3B | 3.4 GB (MLX 4-bit) | text only; matches the reference, also past the 1024-token window |
+| google/embeddinggemma-300m | 0.3B | 1.2 GB (fp32) | embeddings; matches sentence-transformers (see [Embeddings](#embeddings)) |
+| Qwen/Qwen3-Embedding-0.6B | 0.6B | 1.2 GB | embeddings; matches sentence-transformers |
+| BAAI/bge-m3 | 0.6B | 2.3 GB (fp32, `pytorch_model.bin`) | dense, sparse and ColBERT embeddings; matches the reference |
 | stabilityai/sd-turbo | 1.3B | 2.6 GB (fp16) | text-to-image in one step; matches diffusers (see Image generation) |
 | stable-diffusion-v1-5/stable-diffusion-v1-5 (and SD 1.x / 2.x fine-tunes) | 1.1B | 2.0 GB (fp16) | text-to-image; matches diffusers |
 
@@ -53,6 +56,45 @@ Thinking is on by default in the Qwen template; `--think` enables it here (the t
 otherwise the generation prompt closes the think block.
 
 Text, images and audio are supported (E2B/E4B have both towers). Video is not.
+
+## Embeddings
+
+sentence-transformers models are recognised by their `modules.json` and run in embedding mode:
+the backbone (Gemma 3 with bidirectional attention, Qwen3, or a BERT / XLM-RoBERTa encoder in
+`bert.rs`), then the listed modules: pooling (CLS, mean, max, last token), dense projections,
+normalization. Named prompts come from `config_sentence_transformers.json`. Each input line
+gives one JSON array (or `-p TEXT` one):
+
+```sh
+./target/release/oxinfer --model Qwen/Qwen3-Embedding-0.6B --prompt-name query -p "What is the capital of France?"
+printf 'Which planet is the Red Planet?\nMars looks red.\nVenus is the hottest planet.\n' |
+  ./target/release/oxinfer --model google/embeddinggemma-300m --prompt-name query --similarity
+#  1.0000  0.8014  0.5470
+#  ...
+./target/release/oxinfer --model google/embeddinggemma-300m --dim 256 -p "..."   # Matryoshka
+./target/release/oxinfer --model BAAI/bge-m3 --sparse -p "..."     # lexical weights {token: weight}
+./target/release/oxinfer --model BAAI/bge-m3 --colbert -p "..."    # one vector per token
+```
+
+`google/embeddinggemma-300m` is gated on Hugging Face (set `HF_TOKEN`); `unsloth/embeddinggemma-300m`
+is an ungated copy. BGE-M3 ships only a `pytorch_model.bin`: `torch.rs` reads `torch.save`
+archives directly (a zip of raw storages plus a pickled state dict; only the handful of pickle
+opcodes and constructors that state dicts use are understood, and nothing is executed), so the
+same goes for its `sparse_linear.pt` / `colbert_linear.pt` heads.
+
+Checked against sentence-transformers float32 (`tools/ref_embed.py`) on short texts in five
+languages and a ~2000-token one: cosine between our vector and the reference at least 0.99999 for
+EmbeddingGemma (query and document prompts, and at 256 dimensions) and 1 - 1e-6 for
+Qwen3-Embedding; BGE-M3's dense vectors 0.99991 or better. fp32 checkpoints are computed with
+bf16-rounded matrices; against a reference using the same rounding the vectors agree to about
+1e-5, so that is the whole difference. One caveat: on the long text, BGE-M3's ColBERT vectors
+have a mean cosine of 0.9995 to the fp32 reference, but one token drops to 0.40. That text is
+unusually sensitive: the reference itself in fp16 already drops a token to 0.89. The sparse
+weights select the same tokens, with weights within 0.013.
+
+Two details that are easy to get wrong: transformers halves EmbeddingGemma's sliding window for
+bidirectional attention (512 in the config means keys less than 257 positions away on either
+side), and Qwen3-Embedding pools the `<|endoftext|>` token its tokenizer appends.
 
 ## Tool calling
 

@@ -538,6 +538,8 @@ impl<'a> Model<'a> {
             "model.language_model."
         } else if has("model.embed_tokens.weight") {
             "model."
+        } else if has("embed_tokens.weight") {
+            "" // a bare text model (embedding checkpoints)
         } else {
             bail!("cannot find embed_tokens in checkpoint");
         };
@@ -569,9 +571,17 @@ impl<'a> Model<'a> {
         // Tied: lookups and the LM head read the same tensor (one copy in a pre-quantized file).
         let embed = Table::load(files, &format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h, head_quant)?;
         let head = lin_with("embed_tokens.weight", cfg.vocab_size, h, head_quant)?;
+        // Norm weights in f32 straight from the file (fp32 checkpoints keep their precision).
         let off = cfg.norm_offset();
-        let nw = |w: &[u16]| -> Vec<f32> { w.iter().map(|&v| off + bf16_to_f32(v)).collect() };
-        let final_norm = nw(get("norm.weight", &[h])?);
+        let nw = |name: &str, shape: &[usize]| -> Result<Vec<f32>> {
+            let full = format!("{prefix}{name}");
+            let info = files.info(&full).with_context(|| format!("missing tensor {full}"))?;
+            if info.shape != shape {
+                bail!("tensor {full} has shape {:?}, expected {:?}", info.shape, shape);
+            }
+            Ok(files.f32(&full)?.into_iter().map(|v| off + v).collect())
+        };
+        let final_norm = nw("norm.weight", &[h])?;
         let ple = if cfg.has_ple() {
             Some(PleGlobal {
                 embed: Table::load(
@@ -607,7 +617,7 @@ impl<'a> Model<'a> {
                     } else {
                         Some(gl("self_attn.v_proj.weight", n_kv * hd, h)?)
                     },
-                    Some(nw(g("self_attn.k_norm.weight", &[hd])?)),
+                    Some(nw(&format!("{lp}self_attn.k_norm.weight"), &[hd])?),
                 )
             } else {
                 (None, None, None)
@@ -637,12 +647,12 @@ impl<'a> Model<'a> {
                 k,
                 v,
                 o: gl("self_attn.o_proj.weight", h, nh * hd)?,
-                q_norm: nw(g("self_attn.q_norm.weight", &[hd])?),
+                q_norm: nw(&format!("{lp}self_attn.q_norm.weight"), &[hd])?,
                 k_norm,
-                ln_in: nw(g("input_layernorm.weight", &[h])?),
-                ln_post_attn: nw(g("post_attention_layernorm.weight", &[h])?),
-                ln_pre_ffn: nw(g("pre_feedforward_layernorm.weight", &[h])?),
-                ln_post_ffn: nw(g("post_feedforward_layernorm.weight", &[h])?),
+                ln_in: nw(&format!("{lp}input_layernorm.weight"), &[h])?,
+                ln_post_attn: nw(&format!("{lp}post_attention_layernorm.weight"), &[h])?,
+                ln_pre_ffn: nw(&format!("{lp}pre_feedforward_layernorm.weight"), &[h])?,
+                ln_post_ffn: nw(&format!("{lp}post_feedforward_layernorm.weight"), &[h])?,
                 gate: gl("mlp.gate_proj.weight", inter, h)?,
                 up: gl("mlp.up_proj.weight", inter, h)?,
                 down: gl("mlp.down_proj.weight", h, inter)?,
@@ -877,7 +887,7 @@ impl<'a> Model<'a> {
         let cache = sess.caches[layer.kv_src].as_ref().expect("kv source cache");
         let window = if layer.sliding { Some(cfg.sliding_window) } else { None };
         let mut att = vec![0f32; t * nh * hd];
-        attention(&q, cache, nh, t, start, window, &mut att);
+        attention_masked(&q, cache, nh, t, start, window, !cfg.bidirectional(), &mut att);
 
         let mut o = vec![0f32; t * h];
         linear(&layer.o, h, nh * hd, &att, t, &mut o);
@@ -928,6 +938,22 @@ impl<'a> Model<'a> {
 /// Work is split per (token, kv head) so the `rep` query heads sharing a KV head read
 /// each key/value once. When that gives too few tasks (short decode), it splits per head.
 pub(crate) fn attention(q: &[f32], cache: &LayerCache, nh: usize, t: usize, start: usize, window: Option<usize>, out: &mut [f32]) {
+    attention_masked(q, cache, nh, t, start, window, true, out)
+}
+
+/// `attention` with the causal mask optional: bidirectional (encoders, embedding models) lets every
+/// position see the whole cache, or, with a window, the keys less than `window` positions away.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_masked(
+    q: &[f32],
+    cache: &LayerCache,
+    nh: usize,
+    t: usize,
+    start: usize,
+    window: Option<usize>,
+    causal: bool,
+    out: &mut [f32],
+) {
     let _timer = prof::start(Cat::Attention);
     let hd = cache.hd;
     let n_kv = cache.n_kv;
@@ -945,7 +971,11 @@ pub(crate) fn attention(q: &[f32], cache: &LayerCache, nh: usize, t: usize, star
         let h0 = kvh * rep + (rem % groups_per_kv) * group;
         let qpos = start + ti;
         let lo = window.map(|w| (qpos + 1).saturating_sub(w)).unwrap_or(0);
-        let hi = qpos + 1;
+        let hi = match (causal, window) {
+            (true, _) => qpos + 1,
+            (false, Some(w)) => (qpos + w).min(cache.len),
+            (false, None) => cache.len,
+        };
         debug_assert!(hi <= cache.len);
         let n = hi - lo;
         let qbase = (ti * nh + h0) * hd;

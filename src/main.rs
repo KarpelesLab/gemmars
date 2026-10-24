@@ -55,6 +55,12 @@ struct Args {
     sampler: Option<String>,
     device: platform::DevicePref,
     devices: bool,
+    embed: bool,
+    prompt_name: Option<String>,
+    similarity: bool,
+    sparse: bool,
+    colbert: bool,
+    dim: Option<usize>,
 }
 
 fn usage() -> ! {
@@ -106,6 +112,13 @@ fn usage() -> ! {
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
+         \n\
+         embeddings (sentence-transformers models are detected; --embed forces it):\n\
+         \x20 --embed              embed the prompt, or each stdin line: one JSON array per line\n\
+         \x20 --prompt-name NAME   the model's prompt to prepend (e.g. query, document)\n\
+         \x20 --dim N              truncate to N dimensions (Matryoshka) and renormalize\n\
+         \x20 --similarity         print the cosine similarity matrix instead\n\
+         \x20 --sparse, --colbert  BGE-M3 lexical weights / multi-vector embeddings instead\n\
          \x20 --show-tokens        print token ids"
     );
     std::process::exit(2)
@@ -152,6 +165,12 @@ fn parse_args() -> Result<Args> {
         sampler: None,
         device: platform::DevicePref::Auto,
         devices: false,
+        embed: false,
+        prompt_name: None,
+        similarity: false,
+        sparse: false,
+        colbert: false,
+        dim: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -214,6 +233,12 @@ fn parse_args() -> Result<Args> {
                 a.device = platform::DevicePref::parse(&v).with_context(|| format!("unknown device {v} (auto|cpu|cuda|metal|vulkan)"))?;
             }
             "--dump-logits" => a.dump_logits = Some(PathBuf::from(val()?)),
+            "--embed" => a.embed = true,
+            "--prompt-name" => a.prompt_name = Some(val()?),
+            "--similarity" => a.similarity = true,
+            "--sparse" => a.sparse = true,
+            "--colbert" => a.colbert = true,
+            "--dim" => a.dim = Some(val()?.parse()?),
             "--show-tokens" => a.show_tokens = true,
             "-h" | "--help" => usage(),
             _ => {
@@ -796,6 +821,9 @@ fn run(mut args: Args) -> Result<()> {
     if oxinfer::sd::is_diffusers(&args.model) {
         return run_image(&args);
     }
+    if args.embed || oxinfer::embed::is_embedding_model(&args.model) {
+        return run_embed(&args);
+    }
     let model_type = config::model_type(&args.model)?;
     match model_type.as_str() {
         "gemma4" | "gemma4_text" | "gemma3" | "gemma3_text" => run_gemma(args),
@@ -1041,6 +1069,90 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
         prof::report(decode_secs, n);
     }
     continue_with_tools(args, model, &mut sess, tok, eos, fmt, &mut sampler, out)?;
+    Ok(())
+}
+
+/// Embeddings for the prompt or each stdin line.
+fn run_embed(args: &Args) -> Result<()> {
+    let t0 = Instant::now();
+    let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
+    let emb = oxinfer::embed::Embedder::load(&args.model, &files, args.quant)?;
+    eprintln!(
+        "[loaded embedding model: dim {}, {:?} pooling{}{}, max {} tokens, prompts [{}], {:.2}s]",
+        emb.dim(),
+        emb.pooling,
+        if emb.normalize { ", normalized" } else { "" },
+        match (emb.has_sparse(), emb.has_colbert()) {
+            (true, true) => ", sparse + colbert heads",
+            (true, false) => ", sparse head",
+            (false, true) => ", colbert head",
+            _ => "",
+        },
+        emb.max_len,
+        emb.prompts.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", "),
+        t0.elapsed().as_secs_f64()
+    );
+    if (args.sparse && !emb.has_sparse()) || (args.colbert && !emb.has_colbert()) {
+        bail!("this model has no {} head", if args.sparse { "sparse" } else { "colbert" });
+    }
+    let texts: Vec<String> = match &args.prompt {
+        Some(p) => vec![p.clone()],
+        None => std::io::stdin()
+            .lock()
+            .lines()
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|l| !l.trim().is_empty())
+            .collect(),
+    };
+    let fmt = |v: &[f32]| format!("[{}]", v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(","));
+    let t1 = Instant::now();
+    let mut vecs = Vec::with_capacity(texts.len());
+    for text in &texts {
+        let mut e = emb.embed(text, args.prompt_name.as_deref())?;
+        if let Some(d) = args.dim {
+            if d == 0 || d > e.dense.len() {
+                bail!("--dim {d}: the embedding has {} dimensions", e.dense.len());
+            }
+            e.dense.truncate(d);
+            oxinfer::embed::l2_normalize(&mut e.dense);
+        }
+        if args.similarity {
+            vecs.push(e.dense);
+            continue;
+        }
+        let line = if args.sparse {
+            let m: serde_json::Map<String, serde_json::Value> = e
+                .sparse
+                .unwrap()
+                .into_iter()
+                .map(|(id, w)| {
+                    (
+                        emb.tok.id_to_token(id).unwrap_or_else(|| id.to_string()),
+                        serde_json::Value::from(w as f64),
+                    )
+                })
+                .collect();
+            serde_json::Value::Object(m).to_string()
+        } else if args.colbert {
+            format!("[{}]", e.colbert.unwrap().iter().map(|v| fmt(v)).collect::<Vec<_>>().join(","))
+        } else {
+            fmt(&e.dense)
+        };
+        println!("{line}");
+    }
+    if args.similarity {
+        for a in &vecs {
+            println!(
+                "{}",
+                vecs.iter()
+                    .map(|b| format!("{:7.4}", oxinfer::embed::cosine(a, b)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+    eprintln!("[{} texts in {:.2}s]", texts.len(), t1.elapsed().as_secs_f64());
     Ok(())
 }
 
