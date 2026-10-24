@@ -208,7 +208,7 @@ def _plan_copy(path, fn, default, tmp):
 
     MLComputePlan only plans the default function; swapping the function names in model.mil
     (weights symlinked) makes it plan another one."""
-    dst = os.path.join(tmp, f"{fn}.mlmodelc")
+    dst = os.path.join(tmp, f"{os.path.basename(path)[:-9]}_{fn}.mlmodelc")
     os.makedirs(dst)
     for f in os.listdir(path):
         if f != "model.mil":

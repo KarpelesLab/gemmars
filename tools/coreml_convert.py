@@ -15,22 +15,25 @@ load it:
   <prefix>_lm_head[_lutN].mlmodelc             final hidden state -> logits1..logits16 (vocab split)
   tokenizer.json, tokenizer_config.json, ...   copied from the checkpoint
 
-Supported architectures:
-  qwen3    Qwen3 dense (Qwen3ForCausalLM, Qwen3-Embedding checkpoints): same graph as ANEMLL's
-  qwen3_5  Qwen3.5 / 3.6 / 3.8 dense text models: Gated DeltaNet linear attention layers keep
-           their recurrent and convolution state as Core ML states next to the KV cache of the
-           gated full attention layers. See docs/coreml-format.md for the exact contract.
+Supported architectures (docs/coreml-format.md has the exact runtime contract):
+  qwen3    Qwen3 dense: the same graph and I/O as ANEMLL's Qwen3 converter
+  qwen3_5  Qwen3.5 / 3.6 / 3.8 dense text models: the Gated DeltaNet layers keep their recurrent
+           and convolution state as Core ML states next to the KV cache of the gated full
+           attention layers; prefill runs the chunked delta rule on the Neural Engine
+  gemma4   Gemma 4 E2B / E4B text: per-layer embeddings (an extra embeddings output fed to every
+           chunk), KV-shared layers, sliding-window and global caches, logit soft cap
 
 The graph is written for the ANE the way ANEMLL does it: fp16 everywhere, linear layers as 1x1
 convolutions, RMSNorm through layer_norm on [x, -x], 4-D tensors, KV cache updated in place with a
 dynamic slice at `current_pos`, LM head split 16 ways. Weights are palettized (k-means LUT,
 per_grouped_channel with 8 output channels per LUT, as in ANEMLL's released models: 6 bits for the
 decoder layers and the LM head, embeddings unquantized); `infer` and `prefill` see byte-identical
-weights, so the merged package stores them once.
+weights, so the merged package stores them once. Decoder chunks are cut at about equal weight
+size, each below --max-chunk-mb.
 
-Requires: coremltools >= 8 (tested with 9.0 and torch 2.14; coremltools 9.0 needs numpy < 2.3),
-torch, safetensors, numpy, scikit-learn (k-means),
-Xcode command line tools (`xcrun coremlcompiler`). Run on macOS.
+Requires macOS with the Xcode command line tools (`xcrun coremlcompiler`), coremltools >= 8
+(tested: 9.0 with torch 2.14 and numpy 2.2; coremltools 9.0 fails with numpy >= 2.3),
+safetensors, scikit-learn (k-means) and pyyaml for coreml_check.py.
 
 quantization (--ffn-quant / --lmhead-quant / --embed-quant):
   none          fp16
@@ -1135,7 +1138,13 @@ def main():
         help="decoder layers: none|lutN[,G]|int8|int4[,B] (default lut6 = lut6,8, what ANEMLL recommends and ships; lut4 is ~1.5x smaller but loses ~20 points of top-1 agreement on <1B models)",
     )
     ap.add_argument("--lmhead-quant", type=Quant.parse, default=Quant.parse("lut6"), help="LM head (default lut6). int8/int4 are GPU-only, see below")
-    ap.add_argument("--embed-quant", type=Quant.parse, default=Quant.parse("none"), help="embeddings (default none)")
+    ap.add_argument(
+        "--embed-quant",
+        type=Quant.parse,
+        default=Quant.parse("none"),
+        help="embeddings (default none: Core ML memory-maps an fp16 table and pages in the rows it reads, while a "
+        "palettized gather table is decompressed at load time; Gemma 4 E2B with lut4: 87 s and +16.7 GB RSS)",
+    )
     ap.add_argument("--no-quant", action="store_true", help="fp16 everywhere (same as all three = none)")
     ap.add_argument("--split-lm-head", type=int, default=16, help="LM head output splits (default 16)")
     ap.add_argument(

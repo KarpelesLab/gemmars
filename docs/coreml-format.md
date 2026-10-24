@@ -4,8 +4,9 @@
 [ANEMLL](https://github.com/Anemll/Anemll) 0.3.5 (commit `f4ad26d`), so ANEMLL's runtimes
 (`tests/chat.py`, the Swift CLI) and oxinfer's Core ML runtime load them. This document is the
 runtime contract: the files, every model input, output and state, and the call sequence. Plain
-transformer packages (`architecture: qwen3`) need nothing beyond ANEMLL's contract; hybrid
-recurrent ones (`architecture: qwen3_5`) add states and two rules (marked **extension**).
+transformer packages (`architecture: qwen3`) need nothing beyond ANEMLL's contract. Two
+architectures extend it (marked **extension**): `qwen3_5` (hybrid recurrent: more states and two
+calling rules) and `gemma4` (one more embeddings output / decoder input and two KV caches).
 
 `tools/coreml_check.py` is a reference implementation of the runtime side in Python
 (coremltools); it is the code to read when something here is unclear.
@@ -25,8 +26,8 @@ generation_config.json, chat_template.jinja     when the checkpoint has them
 ```
 
 `_lutN` names the palettization bits (`_int8` / `_int4` for linear quantization). The default
-prefix is `qwen` for Qwen3 and `qwen35` for Qwen3.5. All models are ML Programs for iOS 18 /
-macOS 15 or later (Core ML states), fp16 compute.
+prefix is `qwen` for Qwen3, `qwen35` for Qwen3.5 and `gemma4` for Gemma 4. All models are ML
+Programs for iOS 18 / macOS 15 or later (Core ML states), fp16 compute.
 
 ## meta.yaml
 
@@ -34,12 +35,12 @@ macOS 15 or later (Core ML states), fp16 compute.
 model_info:
   name: anemll-Qwen-Qwen3.5-0.8B-ctx512
   version: 0.3.5                 # ANEMLL format version
-  architecture: qwen3_5          # qwen3 | qwen3_5
+  architecture: qwen3_5          # qwen3 | qwen3_5 | gemma4
   parameters:
     context_length: 512          # KV cache length = largest position + 1
     batch_size: 64               # tokens per `prefill` call
     lut_embeddings: none         # palettization bits per part, or none
-    lut_ffn: 4
+    lut_ffn: 6
     lut_ffn_per_channel: 8       # output channels sharing one LUT
     lut_lmhead: 6
     lut_lmhead_per_channel: 8
@@ -47,7 +48,7 @@ model_info:
     model_prefix: qwen35
     embeddings: qwen35_embeddings.mlmodelc
     lm_head: qwen35_lm_head_lut6.mlmodelc
-    ffn: qwen35_FFN_PF_lut4_chunk_01of01.mlmodelc   # first chunk; others: _chunk_02of01 ...
+    ffn: qwen35_FFN_PF_lut6_chunk_01of01.mlmodelc   # first chunk (others: _chunk_02ofNN ...)
     split_lm_head: 16            # number of logits outputs
     vocab_size: 248320
     lm_head_chunk_sizes: [15520, 15520, ...]          # width of logits1..logitsN
@@ -56,10 +57,11 @@ model_info:
     hidden_size: 1024
     num_layers: 24
     recommended_sampling: {do_sample: true, temperature: 0.6, top_p: 0.95, top_k: 20}
-    # --- extensions, only for recurrent architectures (qwen3_5) ---
+    # --- extensions (qwen3_5) ---
     recurrent_state: true        # states that cannot be rewound: feed every token exactly once
     prefill_full_batches_only: true
     gdn_chunk_size: 64           # informational (chunk of the in-graph delta rule)
+    # --- extensions (qwen3_5 and gemma4) ---
     layer_types: [linear, linear, linear, full, ...]
     states:
       - name: model_model_kv_cache_0
@@ -76,6 +78,25 @@ model_info:
         layers: [0, 1, 2, 4, ...]
 ```
 
+For `gemma4` the extension keys are (E2B shown):
+
+```yaml
+    local_attention_window: 512      # informational: applied inside the graph
+    final_logit_softcap: 30.0        # informational: applied inside the LM head
+    per_layer_inputs: 8960           # width of the per_layer_inputs tensor (layers x 256)
+    kv_shared_layers: {15: 13, 16: 14, ...}   # informational: layer -> layer whose K/V it reads
+    layer_types: [sliding, sliding, sliding, sliding, full, ...]
+    states:
+      - name: model_model_kv_cache_local    # sliding-window layers, head_dim 256
+        shape: [12, 2, 512, 256]
+        dtype: float16
+        layers: [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13]
+      - name: model_model_kv_cache_global   # full attention layers, head_dim 512
+        shape: [3, 2, 512, 512]
+        dtype: float16
+        layers: [4, 9, 14]
+```
+
 Keys other runtimes do not know must be ignored. When `quant_ffn` (or `quant_lmhead`,
 `quant_embeddings`) is present, the part uses linear weight quantization (`int8` or `int4,B`)
 instead of a LUT and `lut_*` is `none`; it changes nothing at run time.
@@ -86,8 +107,12 @@ instead of a LUT and `lut_*` is `none`; it changes nothing at run time.
 |---|---|---|---|
 | input | `input_ids` | `[1, 1]` or `[1, batch_size]` (enumerated shapes) | int32 |
 | output | `hidden_states` | `[1, T, hidden_size]` | fp16 |
+| output (**extension**, gemma4) | `per_layer_inputs` | `[1, T, per_layer_inputs]` | fp16 |
 
-A plain table lookup (no scaling).
+A table lookup (Gemma: scaled by `sqrt(hidden_size)`, folded into the table). For Gemma 4 the
+model also computes the per-layer embeddings (PLE): `embed_tokens_per_layer[ids] * sqrt(256)`
+plus the RMS-normed projection of the token embedding, times `1/sqrt(2)`, packed as
+`[layer][256]`; the runtime passes this tensor unchanged to every decoder chunk.
 
 ## LM head model
 
@@ -97,7 +122,8 @@ A plain table lookup (no scaling).
 | outputs | `logits1` ... `logitsN` | `[1, 1, lm_head_chunk_sizes[i]]` | fp16 |
 
 N = `split_lm_head`. The logits of the vocabulary are the concatenation of `logits1..logitsN`
-in order (the first `vocab_size % N` parts are one wider when the split is uneven).
+in order (the first `vocab_size % N` parts are one wider when the split is uneven). Gemma's
+final soft cap (`30 tanh(x / 30)`) is applied inside the model.
 
 ## Decoder chunks
 
@@ -123,6 +149,11 @@ tokens at positions `p .. p+T-1`:
   LM head. The last chunk's `prefill` output is the final-normed hidden state of the **last**
   token of the batch (`prefill_last_token_output: true`); ANEMLL's own packages return an
   unnormalized first-token state there, which runtimes ignore.
+* **extension** (gemma4): every chunk has a fifth input `per_layer_inputs`
+  `[1, T, per_layer_inputs]` fp16, the embeddings model's second output for the same tokens
+  (each chunk reads the slices of its own layers). Sliding-window layers derive their window
+  mask from `position_ids` and `causal_mask` inside the graph (keys at positions
+  `<= p - local_attention_window` are masked), so the runtime passes the plain causal mask.
 
 ### States
 
@@ -143,6 +174,14 @@ every chunk. A fresh state (all zeros) is an empty context.
 * **extension** `model_model_conv_state_0` `[n_linear, K - 1, conv_dim]` fp16: the last `K-1`
   inputs of the causal depthwise convolution of layer `j` (the `in_proj_qkv` outputs, before
   the convolution), oldest first. Time-major on purpose: a trailing axis of 3 makes the ANE fail.
+* **extension** (gemma4) `model_model_kv_cache_local` `[n_local, 2 * n_kv_heads, ctx, 256]` and
+  `model_model_kv_cache_global` `[n_global, 2 * n_kv_heads, ctx, 512]` fp16: one slot per
+  non-shared sliding / full attention layer (in layer order, `layers` in meta.yaml), keys in
+  `[slot, 0:n_kv]`, values in `[slot, n_kv:2 n_kv]` (one slice update per layer: two separate
+  K and V updates with a single KV head fail to compile for the ANE). K is stored after its
+  RMSNorm and RoPE, V after its weightless RMSNorm. The KV-shared layers (the last
+  `num_kv_shared_layers`) write nothing and attend to the slot of `kv_shared_layers[i]`. The
+  caches span the whole context: no ring buffer, the window is a mask.
 
 The names are the Core ML state names (`stateSchema` in the compiled model's `metadata.json`,
 the same as ANEMLL's for the KV cache). Inference only passes the opaque state; the names matter
@@ -216,6 +255,41 @@ native sigmoid is a coarse approximation; the prefill output described above.
     `u = T (beta v)`, `w = T (beta k e^G)`, intra-chunk attention and state update. Every op is
     a matmul or elementwise op, all on the Neural Engine.
 * MoE variants (`num_experts`) are not supported yet.
+
+### gemma4 (Gemma 4 E2B / E4B, text)
+
+* Embeddings scaled by `sqrt(hidden)`; per-layer embeddings as above.
+* Layer: `x += post_attn_norm(attn(input_norm(x)))`,
+  `x += post_ff_norm(mlp(pre_ff_norm(x)))` (GELU-tanh gated MLP, double width on the KV-shared
+  layers when `use_double_wide_mlp`), then
+  `x += post_ple_norm(ple_proj(gelu(ple_gate(x)) * per_layer_input[layer]))`, `x *= layer_scalar`.
+  RMSNorm with a plain weight.
+* Attention: q/k RMSNorm with weight, v RMSNorm without, no `1/sqrt(d)` scaling. Sliding
+  layers: head dim 256, RoPE theta 1e4 on all dims, window 512. Full layers: head dim 512,
+  "proportional" RoPE (theta 1e6, only the first 25% of the frequency pairs rotate).
+* Not supported: `attention_k_eq_v` (12B / 31B), the MoE block (26B-A4B), vision and audio.
+* GELU is written with `x (1 + 0.044715 x^2)` inside the tanh so fp16 does not overflow.
+
+## Neural Engine notes
+
+What the converter does differently from a straightforward port, each found by comparing the
+ANE output with torch:
+
+* Sigmoid / SiLU through `tanh`: the ANE's sigmoid has errors up to ~0.015.
+* Gated DeltaNet state stored as `sqrt(d_k) S`: with the unit `q`, `k` of the reference the
+  products in `q^T S` fall into fp16 subnormals, which the ANE flushes (layer output cosine
+  0.97 instead of 0.9999).
+* No state may have a trailing axis of 3 elements (runtime failure), and every declared state
+  must be read by every function (conversion failure), so chunks read one element of the
+  states they do not use.
+* Only palettized (LUT) weights run correctly: int8 per-channel or per-tensor linear weights
+  compile but compute garbage on the ANE (logit cosine 0.75; 0.9992 on the GPU) and int4
+  per-block weights do not compile. Measured on an M5 Max, macOS 26.
+* Embedding tables stay fp16: Core ML memory-maps them and only pages in the rows a lookup
+  touches (Gemma 4 E2B's 5.5 GB embeddings model: instant load, +40 MB RSS), whereas a
+  palettized gather table is decompressed when the model loads (LUT4: 87 s, +16.7 GB RSS).
+* The CPU_ONLY path of Core ML returns NaN for these stateful fp16 graphs (ANEMLL's own Qwen3
+  release too); CPU_AND_GPU and CPU_AND_NE are correct.
 
 ## Validation
 

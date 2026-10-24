@@ -887,6 +887,54 @@ fp16 `MLMultiArray`, what the Neural Engine writes directly) is bound as the nex
 prepared feature provider, so a token only writes its id, position and mask row into existing
 arrays and runs the chain; decode runs 2-10% faster than `chat.py` on the same models.
 
+#### Converting models
+
+`tools/coreml_convert.py` converts Hugging Face checkpoints into Core ML packages for the
+Neural Engine of iPhones and Macs, in the layout of [ANEMLL](https://github.com/Anemll/Anemll)
+(meta.yaml, an embeddings model, decoder chunks with `infer` and `prefill` functions sharing
+weights and a Core ML state, a 16-way split LM head, the tokenizer files). Qwen3 packages run
+unchanged under ANEMLL's own `chat.py`; Qwen3.5 / 3.6 / 3.8 dense models (Gated DeltaNet
+recurrent state kept as Core ML states, chunked delta rule in the prefill function) and Gemma 4
+E2B / E4B (per-layer embeddings, KV sharing, local and global caches) extend the format as
+described in [docs/coreml-format.md](docs/coreml-format.md) (oxinfer's Core ML runtime above
+runs the ANEMLL layouts; the Qwen3.5 and Gemma 4 extensions are not loaded by it yet). Weights are 6-bit LUT-palettized by default (ANEMLL's recommended setting);
+`tools/coreml_check.py` runs a package with coremltools, compares it with transformers in float32
+over a few hundred teacher-forced tokens, benchmarks it and lists which ops land on the ANE.
+
+```sh
+python3 -m venv venv && venv/bin/pip install coremltools==9.0 torch transformers safetensors \
+    scikit-learn pyyaml "numpy<2.3"
+venv/bin/python tools/coreml_convert.py --model ~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B --output out/qwen35
+venv/bin/python tools/coreml_check.py out/qwen35 --hf ~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B --bench --plan
+```
+
+Measured on an M5 Max with coremltools (context 512, batch 64; quality = the Core ML logits
+against transformers float32 over 300 teacher-forced tokens of a 135-token chat prompt; speed =
+best of 5, 256-token prefill and 64-token decode including the Python calls; package sizes are
+embeddings + decoder chunks + LM head):
+
+| Model | Weights | Size (MB) | Logit cosine | Top-1 agreement | Prefill ANE / CPU | Decode ANE / CPU |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | fp16 | 311 + 884 + 311 | 0.99999 | 98.7% | 2680 tok/s | 79 tok/s |
+| Qwen3-0.6B | LUT6 (default) | 311 + 338 + 119 | 0.9972 | 93.0% | 5131 / 1949 tok/s | 114 / 56 tok/s |
+| Qwen3-0.6B, ANEMLL's release | LUT6 | 311 + 339 + 119 | 0.9971 | 92.3% | 4409 / 1824 tok/s | 114 / 59 tok/s |
+| Qwen3-0.6B | LUT4 | 311 + 224 + 119 | 0.954 | 72.0% | 4836 tok/s | 103 tok/s |
+| Qwen3.5-0.8B | fp16 | 509 + 1000 + 509 | 0.9998 | 97.0% | 4002 tok/s | 62 tok/s |
+| Qwen3.5-0.8B | LUT6 (default) | 509 + 385 + 195 | 0.9974 | 93.0% | 5176 / 1608 tok/s | 118 / 37 tok/s |
+| Qwen3.5-0.8B | LUT4 | 509 + 254 + 195 | 0.959 | 78.3% | 5035 tok/s | 113 tok/s |
+| Gemma 4 E2B | fp16 | 5530 + 3740 + 805 | 1.00000 | 99.3% | | |
+| Gemma 4 E2B | LUT6 (default) | 5530 + 1419 + 306 | 0.99986 | 97.0% | 1905 / 623 tok/s | 45 / 14 tok/s |
+| Gemma 4 E4B | LUT6 (default) | 7034 + 2992 + 508 | 0.99945 | 96.7% | 1060 / 333 tok/s | 25 / 6 tok/s |
+
+Everything but the embedding lookups and the RoPE-table gathers runs on the ANE (MLComputePlan),
+including the Gated DeltaNet recurrence and its chunked prefill. The Gemma embeddings model is
+large because the per-layer embedding table stays fp16: Core ML memory-maps it and pages in only
+the rows it reads, while a palettized table would be decompressed at load time (16.7 GB for E2B).
+"CPU" is Core ML's CPU_ONLY path, whose outputs are NaN for these stateful fp16 graphs (ANEMLL's
+packages too), so it only shows what the ANE saves. On a Max-class Mac, oxinfer's own CPU path
+decodes faster (Qwen3.5-0.8B Q8: 184 tok/s); what the Neural Engine brings is prefill throughput
+and power, with the CPU and GPU left free.
+
 ## How it works
 
 - `safetensors.rs`: parses the header, exposes bf16 tensors as `&[u16]` (single file or sharded).
