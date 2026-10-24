@@ -922,7 +922,6 @@ impl PendingTurn {
                 }
             }
         };
-        drop(cb);
         // Flush text held back for an incomplete character.
         let shown = match d.tokens.last() {
             Some(t) if stop.contains(t) => &d.tokens[..d.tokens.len() - 1],

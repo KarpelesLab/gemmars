@@ -446,8 +446,9 @@ fn run(mut args: Args) -> Result<()> {
     if anemll_cli::detect(&args.model) {
         return anemll_cli::run(&args);
     }
-    let mlmodelc =
-        |d: &Path| std::fs::read_dir(d).is_ok_and(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".mlmodelc")));
+    let mlmodelc = |d: &std::path::Path| {
+        std::fs::read_dir(d).is_ok_and(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".mlmodelc")))
+    };
     if args.model.join("meta.yaml").is_file() && mlmodelc(&args.model) {
         bail!(
             "{}: an ANEMLL Core ML model; these run only in Apple Silicon macOS / iOS builds with the `gpu` feature",
