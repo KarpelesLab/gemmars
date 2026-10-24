@@ -622,7 +622,12 @@ pub fn decode_i8(kind: GgmlType, b: &[u8], q: &mut [i8], s: &mut [f32], m: &mut 
             }
             s[..2].fill(d);
             if matches!(kind, Q4_1 | Q5_1) {
-                m[..2].fill(f16at(b, 2));
+                // Centered like Q4_0 / Q5_0 (smaller products with the rounded activations).
+                let c = if kind == Q4_1 { 8 } else { 16 };
+                for v in q[..32].iter_mut() {
+                    *v -= c as i8;
+                }
+                m[..2].fill(f16at(b, 2) + d * c as f32);
                 return true;
             }
             false
@@ -640,10 +645,11 @@ pub fn decode_i8(kind: GgmlType, b: &[u8], q: &mut [i8], s: &mut [f32], m: &mut 
                 for j in 0..4 {
                     for h in 0..2 {
                         let g = 8 * n + 2 * j + h;
+                        // Centered: q - 2, the offset 2 * s moves into m.
                         s[g] = d * (b[g] & 0xF) as f32;
-                        m[g] = -(min * (b[g] >> 4) as f32);
+                        m[g] = 2.0 * s[g] - min * (b[g] >> 4) as f32;
                         for l in 0..16 {
-                            q[16 * g + l] = ((b[16 + 32 * n + 16 * h + l] >> (2 * j)) & 3) as i8;
+                            q[16 * g + l] = ((b[16 + 32 * n + 16 * h + l] >> (2 * j)) & 3) as i8 - 2;
                         }
                     }
                 }
@@ -680,16 +686,18 @@ pub fn decode_i8(kind: GgmlType, b: &[u8], q: &mut [i8], s: &mut [f32], m: &mut 
                 for h in 0..2 {
                     let (sc, mn) = scale_min_k4(2 * j + h, &b[4..16]);
                     let g = 2 * (2 * j + h);
+                    // Centered: q - 8 (q - 16 for Q5_K), the offset moves into m.
+                    let off = if kind == Q5_K { 16 } else { 8 };
                     s[g] = d * sc as f32;
                     s[g + 1] = s[g];
-                    m[g] = -(min * mn as f32);
+                    m[g] = off as f32 * s[g] - min * mn as f32;
                     m[g + 1] = m[g];
                     for l in 0..32 {
                         let mut v = (qs[32 * j + l] >> (4 * h)) & 0xF;
                         if kind == Q5_K && qh[l] & (1 << (2 * j + h)) != 0 {
                             v += 16;
                         }
-                        q[64 * j + 32 * h + l] = v as i8;
+                        q[64 * j + 32 * h + l] = v as i8 - off;
                     }
                 }
             }
@@ -1109,6 +1117,54 @@ mod tests {
             let mut y = vec![0f32; FIXTURE_ELEMS];
             dequantize_row(kind, &fixture(kind), &mut y);
             assert_eq!(fnv(&y), want, "{kind}: dequantized values differ from ggml");
+        }
+    }
+
+    /// Real tensors (`OXINFER_GGML_REAL=dir` of NAME.bin raw rows, NAME.ref gguf-py values and
+    /// NAME.meta "type rows n_in"): bit-exact rows, and matmuls against the f64 product.
+    #[test]
+    fn real_gguf_tensors() {
+        let Ok(dir) = std::env::var("OXINFER_GGML_REAL") else { return };
+        crate::pool::init(4);
+        let mut seed = 3u64;
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_none_or(|x| x != "meta") {
+                continue;
+            }
+            let meta = std::fs::read_to_string(&p).unwrap();
+            let v: Vec<usize> = meta.split_whitespace().map(|x| x.parse().unwrap()).collect();
+            let kind = GgmlType::from_id(v[0] as u32).unwrap();
+            let (rows, n_in) = (v[1], v[2]);
+            let raw = std::fs::read(p.with_extension("bin")).unwrap();
+            let want: Vec<f32> = std::fs::read(p.with_extension("ref"))
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            let m = GgufMatrix::from_bytes(kind, &raw, rows, n_in).unwrap();
+            let mut wf = vec![0f32; rows * n_in];
+            m.dequantize_rows(0, rows, &mut wf);
+            assert!(
+                wf.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{p:?}: dequantization differs"
+            );
+            for t in [1usize, 3, 9] {
+                let x: Vec<f32> = (0..t * n_in).map(|_| (lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0).collect();
+                let mut y = vec![0f32; t * rows];
+                matmul_quant_multi(&mut [(&m, &mut y[..])], &x, t);
+                let yr = f32_reference(&wf, rows, n_in, &x, t);
+                let rms = (yr.iter().map(|v| v * v).sum::<f32>() / yr.len() as f32).sqrt();
+                let err = (y.iter().zip(&yr).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / yr.len() as f32).sqrt();
+                eprintln!(
+                    "{} {kind} t={t}: rms error {:.2e} of rms {rms:.3e}",
+                    p.file_stem().unwrap().to_string_lossy(),
+                    err / rms
+                );
+                assert!(err <= 2e-2 * rms, "{p:?} t={t}");
+            }
         }
     }
 
