@@ -488,13 +488,53 @@ inline void load(IQ1_MW w, uint row, uint b, thread float4* out) {
         grid1(iq1s_grid[idx], dl, delta, out + 2 * l);
     }
 }
+// Q4_1 / Q5_0 / Q5_1: blocks of 32 with an f16 min (`MIN`) and/or a fifth bit per element (`HB`).
+inline void load_q45(device const uchar* B, bool MIN, bool HB, thread float4* out) {
+    float d = h2f(B), m = MIN ? h2f(B + 2) : 0.f;
+    uint qh = HB ? rd32(B + (MIN ? 4 : 2)) : 0;
+    device const uchar* q = B + 2 + (MIN ? 2 : 0) + (HB ? 4 : 0);
+    float off = (HB && !MIN) ? 16.f : 0.f;
+    for (uint i = 0; i < 4; i++) {
+        uchar4 v = ld4(q + 4 * i);
+        float4 lo = f4(v & uchar(15)), hi = f4(v >> uchar(4));
+        if (HB) {
+            uint e = 4 * i;
+            lo += float4(float((qh >> e) & 1), float((qh >> (e + 1)) & 1), float((qh >> (e + 2)) & 1), float((qh >> (e + 3)) & 1)) * 16.f;
+            hi += float4(float((qh >> (e + 16)) & 1), float((qh >> (e + 17)) & 1), float((qh >> (e + 18)) & 1), float((qh >> (e + 19)) & 1)) * 16.f;
+        }
+        out[i] = (lo - off) * d + m;
+        out[i + 4] = (hi - off) * d + m;
+    }
+}
+struct Q4_1W { GgW g; };
+inline void load(Q4_1W w, uint row, uint b, thread float4* out) { load_q45(w.g.q + (ulong)row * w.g.rb + b * 20, true, false, out); }
+struct Q5_0W { GgW g; };
+inline void load(Q5_0W w, uint row, uint b, thread float4* out) { load_q45(w.g.q + (ulong)row * w.g.rb + b * 22, false, true, out); }
+struct Q5_1W { GgW g; };
+inline void load(Q5_1W w, uint row, uint b, thread float4* out) { load_q45(w.g.q + (ulong)row * w.g.rb + b * 24, true, true, out); }
+struct F16W { GgW g; };
+inline void load(F16W w, uint row, uint b, thread float4* out) {
+    device const packed_half4* p = (device const packed_half4*)(w.g.q + (ulong)row * w.g.rb + b * 64);
+    for (uint i = 0; i < 8; i++) out[i] = float4(half4(p[i]));
+}
+struct F32W2 { GgW g; };
+inline void load(F32W2 w, uint row, uint b, thread float4* out) {
+    device const packed_float4* p = (device const packed_float4*)(w.g.q + (ulong)row * w.g.rb + b * 128);
+    for (uint i = 0; i < 8; i++) out[i] = float4(p[i]);
+}
 #define GG(T) GEMM(gemm_##T, T##W, MK_GG(T##W))
+GEMM(gemm_F32, F32W2, MK_GG(F32W2)) GG(F16) GG(Q4_1) GG(Q5_0) GG(Q5_1)
 GG(Q4_0) GG(IQ4_NL) GG(Q8_0) GG(Q4_K) GG(Q5_K) GG(Q6_K) GG(Q3_K) GG(Q2_K) GG(IQ4_XS)
 GG(IQ2_XXS) GG(IQ2_XS) GG(IQ2_S) GG(IQ3_XXS) GG(IQ3_S) GG(IQ1_S) GG(IQ1_M)
 "#;
 
 /// GGUF types with a Metal GEMM (`gemm_<TYPE>` in `GGUF_SHADER_SRC`).
-const GGUF_GPU_TYPES: [GgmlType; 16] = [
+const GGUF_GPU_TYPES: [GgmlType; 21] = [
+    GgmlType::F32,
+    GgmlType::F16,
+    GgmlType::Q4_1,
+    GgmlType::Q5_0,
+    GgmlType::Q5_1,
     GgmlType::Q4_0,
     GgmlType::IQ4_NL,
     GgmlType::Q8_0,
