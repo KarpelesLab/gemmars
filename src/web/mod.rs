@@ -339,7 +339,10 @@ impl Engine {
 
     /// The visible reply: up to the first tool call, without special tokens.
     fn decoded(&self) -> String {
-        let end = self.call_token.and_then(|c| self.out.iter().position(|&t| t == c)).unwrap_or(self.out.len());
+        let end = self
+            .call_token
+            .and_then(|c| self.out.iter().position(|&t| t == c))
+            .unwrap_or(self.out.len());
         let shown: Vec<u32> = self.out[..end].iter().copied().filter(|t| !self.eos.contains(t)).collect();
         self.tok.decode(&shown, true).unwrap_or_default()
     }
@@ -354,7 +357,12 @@ impl Engine {
     /// (`web_next`) with a new reply segment. Returns the number of tokens fed.
     fn tool_results(&mut self, results: &[crate::tools::ToolResult]) -> Result<usize> {
         let text = self.lm.fmt().tool_results(results, self.think);
-        let ids = self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec();
+        let ids = self
+            .tok
+            .encode(text.as_str(), false)
+            .map_err(|e| anyhow!("encode: {e}"))?
+            .get_ids()
+            .to_vec();
         self.out.clear();
         self.logits.clear();
         for c in ids.chunks(self.prefill_chunk) {
